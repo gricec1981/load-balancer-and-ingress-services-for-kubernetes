@@ -191,9 +191,14 @@ ako-gateway-api-docker: glob-vars
 
 # ---------------------------------------------------------------------------
 # Developer build targets — use public base images, no internal registry needed.
-# Usage:
+# Usage (public Docker Hub):
 #   make dev-docker-gateway-api REGISTRY=ghcr.io/gricec1981 TAG=inference-ext
 #   make dev-push-gateway-api   REGISTRY=ghcr.io/gricec1981 TAG=inference-ext
+#
+# Usage (corporate/air-gapped — same GOLANG_SRC_REPO var as upstream AKO builds):
+#   make dev-docker-gateway-api \
+#     REGISTRY=ghcr.io/gricec1981 TAG=inference-ext \
+#     GOLANG_SRC_REPO=harbor.internal.company.com/proxy/golang:1.24-bookworm
 # ---------------------------------------------------------------------------
 REGISTRY ?= ghcr.io/gricec1981
 TAG      ?= inference-ext
@@ -202,6 +207,7 @@ TAG      ?= inference-ext
 dev-docker-gateway-api:
 	docker build \
 	--platform linux/amd64 \
+	$(if $(GOLANG_SRC_REPO),--build-arg golang_src_repo=$(GOLANG_SRC_REPO),) \
 	-t $(REGISTRY)/ako-gateway-api:$(TAG) \
 	-f Dockerfile.ako-gateway-api-dev \
 	.

@@ -21,6 +21,9 @@ set -euo pipefail
 
 REGISTRY="${1:-ghcr.io/gricec1981}"
 TAG="${2:-inference-ext}"
+# Optional: set GOLANG_SRC_REPO to an internal mirror if Docker Hub is blocked.
+# e.g. GOLANG_SRC_REPO=harbor.internal.company.com/proxy/golang:1.24-bookworm
+GOLANG_SRC_REPO="${GOLANG_SRC_REPO:-}"
 IMAGE="${REGISTRY}/ako-gateway-api:${TAG}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -41,11 +44,17 @@ echo ""
 
 # Build
 echo ">>> Building image..."
+GOLANG_ARG=""
+if [[ -n "${GOLANG_SRC_REPO}" ]]; then
+  GOLANG_ARG="--build-arg golang_src_repo=${GOLANG_SRC_REPO}"
+  echo "  Golang mirror: ${GOLANG_SRC_REPO}"
+fi
 docker build \
   --platform linux/amd64 \
   --label "git.branch=${BRANCH}" \
   --label "git.commit=${COMMIT}" \
   --build-arg AKO_LDFLAGS="-X 'main.version=dev-${COMMIT}'" \
+  ${GOLANG_ARG} \
   -t "${IMAGE}" \
   -f "${REPO_ROOT}/Dockerfile.ako-gateway-api-dev" \
   "${REPO_ROOT}"
