@@ -98,7 +98,7 @@ L4Settings:
   defaultLBController: false
 
 L7Settings:
-  defaultIngController: false
+  defaultIngController: "false"
   serviceType: "ClusterIP"
   shardVSSize: "LARGE"
   passthroughShardSize: "SMALL"
