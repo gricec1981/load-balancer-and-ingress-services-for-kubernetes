@@ -28,17 +28,33 @@ const (
 // ComputeWeights converts a slice of PodMetrics into Avi pool group member
 // ratios using an inverse-load scoring function:
 //
-//	score(pod) = 1 / (waiting + alpha * kv_cache_perc + epsilon)
-//	ratio(pod) = round(100 * score(pod) / sum(scores))
+//	load(pod)  = waiting
+//	           + alpha * kv_cache_perc
+//	           + beta  * (totalTokensPerSec / maxTokensPerSec_across_pods)
+//	score(pod) = 1 / (load + epsilon)
+//	ratio(pod) = round(100 * score / sum(scores))
+//
+// The token throughput term is normalised by the highest observed rate in the
+// pool so the contribution is always in [0, 1], making beta directly
+// comparable to alpha and the waiting queue depth.
 //
 // Pods that are unreachable receive the minimum ratio (1) so they still
 // receive some traffic while health monitors decide whether to remove them.
 //
 // The ratios always sum to 100 (with rounding adjustment on the highest-score
 // pod to absorb any remainder).
-func ComputeWeights(metrics []PodMetrics, alpha float64) []WeightedPod {
+func ComputeWeights(metrics []PodMetrics, alpha, beta float64) []WeightedPod {
 	if len(metrics) == 0 {
 		return nil
+	}
+
+	// Find the maximum token rate across reachable pods for normalisation.
+	// If all pods are idle (rate = 0) normalisation is skipped (div-by-zero guard).
+	maxTokenRate := 0.0
+	for _, m := range metrics {
+		if m.Reachable && m.TotalTokensPerSec > maxTokenRate {
+			maxTokenRate = m.TotalTokensPerSec
+		}
 	}
 
 	scores := make([]float64, len(metrics))
@@ -46,12 +62,19 @@ func ComputeWeights(metrics []PodMetrics, alpha float64) []WeightedPod {
 
 	for i, m := range metrics {
 		if !m.Reachable {
-			// Unreachable pods get a tiny score so they still appear in the PG
-			// until Avi's health monitor marks them down.
+			// Unreachable pods get a zero score so they still appear in the PG
+			// at minRatio until Avi's health monitor marks them down.
 			scores[i] = 0
 			continue
 		}
-		load := m.NumRequestsWaiting + alpha*m.KVCacheUsagePerc
+
+		// Normalised token throughput: high throughput → high load → lower score.
+		tokenLoad := 0.0
+		if beta > 0 && maxTokenRate > 0 {
+			tokenLoad = beta * (m.TotalTokensPerSec / maxTokenRate)
+		}
+
+		load := m.NumRequestsWaiting + alpha*m.KVCacheUsagePerc + tokenLoad
 		scores[i] = 1.0 / (load + epsilon)
 		totalScore += scores[i]
 	}

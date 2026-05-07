@@ -19,6 +19,8 @@
 package inference
 
 import (
+	"time"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -84,14 +86,38 @@ type InferencePoolList struct {
 type PodMetrics struct {
 	// PodIP is the IP address of the pod.
 	PodIP string
+
+	// --- Gauge metrics (instantaneous) ---
+
 	// NumRequestsRunning is the vllm:num_requests_running gauge value.
 	NumRequestsRunning float64
 	// NumRequestsWaiting is the vllm:num_requests_waiting gauge value.
 	NumRequestsWaiting float64
 	// KVCacheUsagePerc is the vllm:kv_cache_usage_perc gauge value (0.0–1.0).
 	KVCacheUsagePerc float64
+
+	// --- Token throughput rates (tokens/sec, derived from counter deltas) ---
+
+	// GenerationTokensPerSec is the rate of output tokens generated.
+	// Derived from vllm:generation_tokens_total counter.
+	GenerationTokensPerSec float64
+	// PromptTokensPerSec is the rate of prompt tokens processed.
+	// Derived from vllm:prompt_tokens_total counter.
+	PromptTokensPerSec float64
+	// TotalTokensPerSec is the combined prompt + generation token rate.
+	// Used as the primary token-load signal in weight scoring.
+	TotalTokensPerSec float64
+
 	// Reachable is false when the scrape failed for this pod.
 	Reachable bool
+}
+
+// podCounterSnapshot holds raw Prometheus counter values and the time they
+// were recorded, used to compute per-interval token throughput rates.
+type podCounterSnapshot struct {
+	generationTokensTotal float64
+	promptTokensTotal     float64
+	scrapeTime            time.Time
 }
 
 // WeightedPod associates a pod IP with its computed Avi pool member ratio.

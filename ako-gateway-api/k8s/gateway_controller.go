@@ -489,6 +489,7 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 			numWorkers,
 			lib.GetInferenceScrapeInterval(),
 			lib.GetInferenceAlphaKVCache(),
+			lib.GetInferenceBetaTokenRate(),
 		)
 		inferenceCtrl.SetupEventHandlers()
 		utils.AviLog.Infof("Inference extension controller initialised (scrape interval=%ds)", lib.GetInferenceScrapeInterval())

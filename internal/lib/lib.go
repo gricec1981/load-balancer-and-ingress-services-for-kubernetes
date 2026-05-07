@@ -901,6 +901,18 @@ func GetInferenceAlphaKVCache() float64 {
 	return v
 }
 
+// GetInferenceBetaTokenRate returns the beta parameter that weights the normalised
+// token throughput rate signal relative to the waiting queue depth.
+// A pod generating many tokens/sec is under heavier load and receives less traffic.
+// Defaults to 1.0 if not set or invalid. Set to 0 to disable the token-rate signal.
+func GetInferenceBetaTokenRate() float64 {
+	v, err := strconv.ParseFloat(os.Getenv("INFERENCE_BETA_TOKEN_RATE"), 64)
+	if err != nil || v < 0 {
+		return 1.0
+	}
+	return v
+}
+
 var VipNetworkList []akov1beta1.AviInfraSettingVipNetwork
 var VipInfraNetworkList map[string][]akov1beta1.AviInfraSettingVipNetwork
 

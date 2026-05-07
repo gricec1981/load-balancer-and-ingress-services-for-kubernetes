@@ -461,6 +461,8 @@ spec:
             value: "{{ .Values.inferenceExtension.scrapeIntervalSeconds }}"
           - name: INFERENCE_ALPHA_KV_CACHE
             value: "{{ .Values.inferenceExtension.alphaKVCache }}"
+          - name: INFERENCE_BETA_TOKEN_RATE
+            value: "{{ .Values.inferenceExtension.betaTokenRate }}"
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
         {{ end }}

@@ -75,6 +75,7 @@ func InitController(
 	numWorkers uint32,
 	scrapeIntervalSeconds int,
 	alphaKVCache float64,
+	betaTokenRate float64,
 ) *Controller {
 	once.Do(func() {
 		ctrl := &Controller{
@@ -84,7 +85,7 @@ func InitController(
 			numWorkers:    numWorkers,
 			poolToRoutes:  make(map[string][]string),
 		}
-		ctrl.scraper = NewScraper(scrapeIntervalSeconds, alphaKVCache, ctrl.onWeightsUpdated)
+		ctrl.scraper = NewScraper(scrapeIntervalSeconds, alphaKVCache, betaTokenRate, ctrl.onWeightsUpdated)
 		controllerInstance = ctrl
 	})
 	return controllerInstance
