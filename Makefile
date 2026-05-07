@@ -189,6 +189,40 @@ ako-gateway-api-docker: glob-vars
 	$(BUILD_ARG_GOLANG) $(BUILD_ARG_PHOTON) $(BUILD_ARG_AKO_LDFLAGS) \
 	-f Dockerfile.ako-gateway-api .
 
+# ---------------------------------------------------------------------------
+# Developer build targets — use public base images, no internal registry needed.
+# Usage:
+#   make dev-docker-gateway-api REGISTRY=ghcr.io/gricec1981 TAG=inference-ext
+#   make dev-push-gateway-api   REGISTRY=ghcr.io/gricec1981 TAG=inference-ext
+# ---------------------------------------------------------------------------
+REGISTRY ?= ghcr.io/gricec1981
+TAG      ?= inference-ext
+
+.PHONY: dev-docker-gateway-api
+dev-docker-gateway-api:
+	docker build \
+	--platform linux/amd64 \
+	-t $(REGISTRY)/ako-gateway-api:$(TAG) \
+	-f Dockerfile.ako-gateway-api-dev \
+	.
+	@echo ""
+	@echo "Built: $(REGISTRY)/ako-gateway-api:$(TAG)"
+	@echo "Run:   make dev-push-gateway-api REGISTRY=$(REGISTRY) TAG=$(TAG)"
+
+.PHONY: dev-push-gateway-api
+dev-push-gateway-api:
+	docker push $(REGISTRY)/ako-gateway-api:$(TAG)
+	@echo ""
+	@echo "Pushed: $(REGISTRY)/ako-gateway-api:$(TAG)"
+	@echo "Update values.yaml:"
+	@echo "  GatewayAPI:"
+	@echo "    image:"
+	@echo "      repository: $(REGISTRY)/ako-gateway-api"
+	@echo "      tag: $(TAG)"
+
+.PHONY: dev-build-and-push-gateway-api
+dev-build-and-push-gateway-api: dev-docker-gateway-api dev-push-gateway-api
+
 # tests
 .PHONY: k8stest
 k8stest:

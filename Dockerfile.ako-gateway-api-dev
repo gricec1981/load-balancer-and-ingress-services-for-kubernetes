@@ -1,0 +1,34 @@
+# Dev-friendly Dockerfile for ako-gateway-api using public base images.
+# Replaces the upstream Dockerfile.ako-gateway-api which requires internal
+# VMware Photon OS and Golang mirror registries.
+#
+# Usage:
+#   docker build -t <registry>/ako-gateway-api:<tag> -f Dockerfile.ako-gateway-api-dev .
+#
+# Or via make:
+#   make dev-docker-gateway-api REGISTRY=ghcr.io/gricec1981 TAG=inference-ext
+
+ARG golang_src_repo=golang:1.24-bookworm
+FROM ${golang_src_repo} AS build
+
+ARG AKO_LDFLAGS="-X 'main.version=dev'"
+ENV BUILD_PATH="github.com/vmware/load-balancer-and-ingress-services-for-kubernetes"
+
+RUN mkdir -p $GOPATH/src/$BUILD_PATH
+COPY . $GOPATH/src/$BUILD_PATH
+WORKDIR $GOPATH/src/$BUILD_PATH
+
+RUN GOARCH=amd64 \
+    CGO_ENABLED=0 \
+    GOOS=linux \
+    go build -buildvcs=false \
+    -o /go/bin/agc \
+    -ldflags "$AKO_LDFLAGS" \
+    -mod=vendor \
+    $BUILD_PATH/cmd/gateway-api
+
+# Minimal runtime image — distroless has no shell, reducing attack surface.
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /go/bin/agc /usr/bin/agc
+EXPOSE 8080
+ENTRYPOINT ["/usr/bin/agc"]
