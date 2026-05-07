@@ -63,6 +63,14 @@ rules:
     resources: ["gatewayclasses", "gatewayclasses/status","gateways","gateways/status","httproutes","httproutes/status"]
     verbs: ["get","watch","list","patch","update"]
 {{- end }}
+{{- if and (eq .Values.featureGates.GatewayAPI true) .Values.inferenceExtension.enabled }}
+  - apiGroups: ["gateway.inference.x-k8s.io"]
+    resources: ["inferencepools","inferencepools/status"]
+    verbs: ["get","watch","list","patch","update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get","watch","list"]
+{{- end }}
 {{- if .Values.rbac.pspEnable }}
   - apiGroups: ["policy", "extensions"]
     resources: ["podsecuritypolicies"]

@@ -45,6 +45,8 @@ Each `InferencePool` becomes a set of individual Avi Pools — one per matched p
 
 ## Prerequisites
 
+> For a complete fresh-install walkthrough including Gateway API CRDs, image build, and mock LLM deployment, see [inference-install.md](inference-install.md).
+
 - `featureGates.GatewayAPI: true` must be set in `values.yaml`
 - The InferencePool CRD must be installed on the cluster:
   ```bash

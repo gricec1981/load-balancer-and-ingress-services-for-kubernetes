@@ -1,0 +1,144 @@
+# values-inference-dev.yaml
+#
+# Complete values override for a fresh AKO install with the Inference Extension
+# enabled. Fill in the REQUIRED fields marked with <CHANGE ME> before installing.
+#
+# Install command:
+#   helm install ako ./helm/ako \
+#     -n avi-system --create-namespace \
+#     -f helm/ako/values-inference-dev.yaml
+#
+# Upgrade command (after image push):
+#   helm upgrade ako ./helm/ako \
+#     -n avi-system \
+#     -f helm/ako/values-inference-dev.yaml
+
+# -----------------------------------------------------------------------
+# Feature Gates — both GatewayAPI and InferenceExtension must be enabled
+# -----------------------------------------------------------------------
+featureGates:
+  GatewayAPI: true
+  EnablePrometheus: false
+
+# -----------------------------------------------------------------------
+# Inference Extension — native LLM load balancing
+# -----------------------------------------------------------------------
+inferenceExtension:
+  enabled: true
+  scrapeIntervalSeconds: 15   # lower to 5 for faster demo reaction
+  alphaKVCache: 1.0           # weight of kv_cache_usage_perc signal
+  betaTokenRate: 1.0          # weight of token throughput rate signal
+
+# -----------------------------------------------------------------------
+# Image — point at your dev build pushed to GHCR
+# Change repository/tag to match what you pushed with hack/build-dev-image.sh
+# -----------------------------------------------------------------------
+GatewayAPI:
+  image:
+    repository: ghcr.io/gricec1981/ako-gateway-api   # <CHANGE ME if different>
+    tag: inference-ext                                  # <CHANGE ME if different>
+    pullPolicy: Always
+
+# -----------------------------------------------------------------------
+# Avi Controller connection — REQUIRED
+# -----------------------------------------------------------------------
+ControllerSettings:
+  controllerHost: ""          # <CHANGE ME> Avi Controller IP or FQDN
+  controllerVersion: ""       # <CHANGE ME> e.g. "22.1.6" — leave blank to auto-detect
+  cloudName: "Default-Cloud"  # <CHANGE ME> Avi Cloud name
+  serviceEngineGroupName: "Default-Group"  # <CHANGE ME>
+  tenantName: "admin"
+  vrfName: ""
+  dedicatedTenantMode: false
+
+# -----------------------------------------------------------------------
+# Cluster identity — REQUIRED
+# -----------------------------------------------------------------------
+AKOSettings:
+  clusterName: "inference-demo"  # <CHANGE ME> unique name for this cluster in Avi
+  primaryInstance: true
+  enableEvents: "true"
+  logLevel: "INFO"               # use DEBUG during initial setup
+  fullSyncFrequency: "1800"
+  apiServerPort: 8080
+  deleteConfig: "false"
+  disableStaticRouteSync: "false"
+  enableEVH: true                # required for Gateway API child VS model
+  layer7Only: false
+  cniPlugin: ""                  # set to "calico", "antrea", etc. if needed
+  istioEnabled: false
+  namespaceSelector:
+    labelKey: ""
+    labelValue: ""
+  servicesAPI: false
+  vipPerNamespace: "false"
+  ipFamily: "V4"
+  useDefaultSecretsOnly: false
+  vpcMode: false
+  blockedNamespaceList: []
+
+# -----------------------------------------------------------------------
+# Networking — REQUIRED
+# -----------------------------------------------------------------------
+NetworkSettings:
+  vipNetworkList:
+    - networkName: ""           # <CHANGE ME> Avi VIP network name
+  nodeNetworkList: []
+  enableRHI: false
+  nsxtT1LR: ""
+  bgpPeerLabels: []
+  defaultDomain: ""
+
+# -----------------------------------------------------------------------
+# L4 / L7 settings
+# -----------------------------------------------------------------------
+L4Settings:
+  defaultDomain: ""
+  autoFQDN: "default"
+  defaultLBController: false
+
+L7Settings:
+  defaultIngController: false
+  serviceType: "ClusterIP"
+  shardVSSize: "LARGE"
+  passthroughShardSize: "SMALL"
+  noPGForSNI: false
+  enableMCI: false
+
+# -----------------------------------------------------------------------
+# AKO main container image
+# Leave as upstream unless you've also rebuilt the main AKO container
+# -----------------------------------------------------------------------
+replicaCount: 1
+
+image:
+  repository: projects.registry.vmware.com/ako/ako
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# -----------------------------------------------------------------------
+# RBAC
+# -----------------------------------------------------------------------
+rbac:
+  pspEnable: false
+
+# -----------------------------------------------------------------------
+# Resources (tune for your cluster size)
+# -----------------------------------------------------------------------
+resources:
+  limits:
+    cpu: 250m
+    memory: 300Mi
+  requests:
+    cpu: 100m
+    memory: 75Mi
+
+nodeSelector: {}
+tolerations: []
+
+# -----------------------------------------------------------------------
+# Node port selector (only needed if serviceType: NodePort)
+# -----------------------------------------------------------------------
+nodePortSelector:
+  key: ""
+  value: ""
