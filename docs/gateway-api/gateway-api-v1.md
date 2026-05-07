@@ -611,3 +611,10 @@ AKO Gateway API is supported on `Kubernetes` platform.
 #### Cloud Service Providers
 
 AKO Gateway API claims support for `VMware vCenter/vSphere ESX` and `NSX-T` Cloud.
+---
+
+## LLM Inference Extension
+
+AKO supports intelligent load balancing for LLM inference workloads via a native implementation of the Gateway API Inference Extension, without requiring ext-proc or an Endpoint Picker sidecar.
+
+See [AKO Native Inference Extension](inference-extension.md) for full documentation.
