@@ -36,12 +36,23 @@ kubectl get crd gateways.gateway.networking.k8s.io
 ## Step 2 — Install InferencePool CRD
 
 ```bash
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/latest/download/manifests.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/download/v1.1.0/manifests.yaml
 ```
 
 Verify:
 ```bash
-kubectl get crd inferencepools.gateway.inference.x-k8s.io
+kubectl get crd | grep inference
+```
+
+You should see:
+```
+inferencepools.gateway.inference.x-k8s.io
+inferenceobjectives.gateway.inference.x-k8s.io
+```
+
+If the CRD is still not found, try the kustomize path instead:
+```bash
+kubectl kustomize "github.com/kubernetes-sigs/gateway-api-inference-extension/config/crd?ref=v1.1.0" | kubectl apply -f -
 ```
 
 ---
@@ -359,5 +370,5 @@ helm upgrade ako ./helm/ako \
 ```bash
 helm uninstall ako -n avi-system
 kubectl delete namespace inference
-kubectl delete -f https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/latest/download/manifests.yaml
+kubectl delete -f https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/download/v1.1.0/manifests.yaml
 ```
