@@ -871,6 +871,36 @@ func IsAKOCRDOperatorEnabled() bool {
 	return false
 }
 
+// IsInferenceExtensionEnabled returns true when AKO should watch InferencePool
+// CRDs and use its built-in Prometheus scraper for LLM-aware load balancing.
+// Controlled by the INFERENCE_EXTENSION_ENABLED environment variable, which is
+// set from values.yaml → inferenceExtension.enabled.
+func IsInferenceExtensionEnabled() bool {
+	ok, _ := strconv.ParseBool(os.Getenv("INFERENCE_EXTENSION_ENABLED"))
+	return ok
+}
+
+// GetInferenceScrapeInterval returns the Prometheus scrape interval in seconds
+// for the inference extension. Defaults to 15 if not set or invalid.
+func GetInferenceScrapeInterval() int {
+	v, err := strconv.Atoi(os.Getenv("INFERENCE_SCRAPE_INTERVAL_SECONDS"))
+	if err != nil || v <= 0 {
+		return 15
+	}
+	return v
+}
+
+// GetInferenceAlphaKVCache returns the alpha parameter that weights the KV-cache
+// usage signal relative to the waiting queue depth in the load scoring formula.
+// Defaults to 1.0 if not set or invalid.
+func GetInferenceAlphaKVCache() float64 {
+	v, err := strconv.ParseFloat(os.Getenv("INFERENCE_ALPHA_KV_CACHE"), 64)
+	if err != nil || v < 0 {
+		return 1.0
+	}
+	return v
+}
+
 var VipNetworkList []akov1beta1.AviInfraSettingVipNetwork
 var VipInfraNetworkList map[string][]akov1beta1.AviInfraSettingVipNetwork
 

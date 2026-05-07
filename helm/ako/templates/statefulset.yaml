@@ -455,6 +455,12 @@ spec:
               configMapKeyRef:
                 name: avi-k8s-config
                 key: akoCRDOperatorEnabled
+          - name: INFERENCE_EXTENSION_ENABLED
+            value: "{{ .Values.inferenceExtension.enabled }}"
+          - name: INFERENCE_SCRAPE_INTERVAL_SECONDS
+            value: "{{ .Values.inferenceExtension.scrapeIntervalSeconds }}"
+          - name: INFERENCE_ALPHA_KV_CACHE
+            value: "{{ .Values.inferenceExtension.alphaKVCache }}"
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
         {{ end }}

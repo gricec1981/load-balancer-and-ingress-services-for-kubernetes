@@ -30,6 +30,7 @@ import (
 	gatewayclientset "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
 	gatewayexternalversions "sigs.k8s.io/gateway-api/pkg/client/informers/externalversions"
 
+	akogatewayapiinference "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/inference"
 	akogatewayapilib "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/lib"
 	akogatewayapiobjects "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/objects"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/internal/k8s"
@@ -140,6 +141,12 @@ func (c *GatewayController) Start(stopCh <-chan struct{}) {
 		}
 	} else {
 		utils.AviLog.Warnf("Skipping CRD informers setup as AKO CRD Operator is not enabled")
+	}
+
+	// Start InferencePool informer when the inference extension is enabled.
+	if lib.IsInferenceExtensionEnabled() && c.dynamicInformers.InferencePoolInformer != nil {
+		go c.dynamicInformers.InferencePoolInformer.Informer().Run(stopCh)
+		informersList = append(informersList, c.dynamicInformers.InferencePoolInformer.Informer().HasSynced)
 	}
 
 	if !cache.WaitForCacheSync(stopCh, informersList...) {
@@ -470,6 +477,21 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 	if c.informers.NSInformer != nil {
 		namespaceEventHandler := addNamespaceAnnotationEventHandler(numWorkers, c)
 		c.informers.NSInformer.Informer().AddEventHandler(namespaceEventHandler)
+	}
+
+	// Initialise the InferencePool controller and its event handlers when the
+	// inference extension feature flag is enabled.
+	if lib.IsInferenceExtensionEnabled() && c.dynamicInformers.InferencePoolInformer != nil {
+		inferenceCtrl := akogatewayapiinference.InitController(
+			akogatewayapilib.GetDynamicClientSet(),
+			c.dynamicInformers.InferencePoolInformer,
+			c.workqueue,
+			numWorkers,
+			lib.GetInferenceScrapeInterval(),
+			lib.GetInferenceAlphaKVCache(),
+		)
+		inferenceCtrl.SetupEventHandlers()
+		utils.AviLog.Infof("Inference extension controller initialised (scrape interval=%ds)", lib.GetInferenceScrapeInterval())
 	}
 }
 

@@ -89,7 +89,7 @@ func validateBackendReference(key string, backend Backend, backendFilters []*Fil
 	routeConditionResolvedRef := akogatewayapistatus.NewCondition().
 		Type(string(gatewayv1.RouteConditionResolvedRefs)).
 		Status(metav1.ConditionFalse)
-	if backend.Kind != "" && backend.Kind != "Service" {
+	if backend.Kind != "" && backend.Kind != "Service" && backend.Kind != lib.InferencePool {
 		utils.AviLog.Errorf("key: %s, msg: BackendRef %s has invalid kind %s.", key, backend.Name, backend.Kind)
 		err := fmt.Errorf("backendRef %s has invalid kind %s", backend.Name, backend.Kind)
 		routeConditionResolvedRef.

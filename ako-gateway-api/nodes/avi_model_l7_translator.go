@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	akogatewayapilib "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/lib"
+	akogatewayapiinference "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/inference"
 	akogatewayapiobjects "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/objects"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/internal/lib"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/internal/nodes"
@@ -429,6 +430,14 @@ func (o *AviObjectGraph) BuildPGPool(key, parentNsName string, childVsNode *node
 		}
 	}
 	for _, httpbackend := range rule.Backends {
+		// InferencePool backends are expanded into one pool per pod with
+		// metric-derived weights rather than using a Kubernetes Service.
+		if httpbackend.Backend.Kind == lib.InferencePool && lib.IsInferenceExtensionEnabled() {
+			routeKey := lib.HTTPRoute + "/" + routeModel.GetNamespace() + "/" + routeModel.GetName()
+			o.buildInferencePoolMembers(key, routeKey, httpbackend, parentNs, parentName, rule, PG, childVsNode, listenerProtocol, parentNsName)
+			continue
+		}
+
 		var poolName string
 		if rule.Name == "" {
 			poolName = akogatewayapilib.GetPoolName(parentNs, parentName,
@@ -788,6 +797,100 @@ func (o *AviObjectGraph) BuildHTTPPolicySetHTTPRequestUrlRewriteRules(key, httpP
 }
 
 // getApplicationProfileUUID retrieves the UUID of an ApplicationProfile from its status
+// buildInferencePoolMembers creates one AviPoolNode per pod in an InferencePool
+// and adds each as a PoolGroupMember with the metric-derived ratio from the
+// WeightStore. If no weights are available yet (first cycle) all pods get
+// equal weight (100 / N).
+func (o *AviObjectGraph) buildInferencePoolMembers(
+	key, routeKey string,
+	httpbackend *HTTPBackend,
+	parentNs, parentName string,
+	rule *Rule,
+	PG *nodes.AviPoolGroupNode,
+	childVsNode *nodes.AviEvhVsNode,
+	listenerProtocol string,
+	parentNsName string,
+) {
+	poolNsName := httpbackend.Backend.Namespace + "/" + httpbackend.Backend.Name
+
+	// Register this HTTPRoute as a consumer of the InferencePool so the
+	// scraper can re-enqueue it after each weight update.
+	if ctrl := akogatewayapiinference.SharedInferenceController(); ctrl != nil {
+		ctrl.RegisterRouteForPool(poolNsName, routeKey)
+	}
+
+	weightedPods := akogatewayapiinference.GlobalWeightStore().GetWeights(poolNsName)
+	if len(weightedPods) == 0 {
+		utils.AviLog.Debugf("key: %s, msg: no inference weights available yet for pool %s, skipping pool group members", key, poolNsName)
+		return
+	}
+
+	t1LR := lib.GetT1LRPath()
+	if found, infraSettingName := akogatewayapiobjects.GatewayApiLister().GetGatewayToAviInfraSetting(parentNsName); found {
+		if infraSetting, err := akogatewayapilib.AKOControlConfig().AviInfraSettingInformer().Lister().Get(infraSettingName); err != nil {
+			utils.AviLog.Warnf("key: %s, msg: failed to retrieve AviInfraSetting %s, err: %s", key, infraSettingName, err.Error())
+		} else if infraSetting != nil && infraSetting.Status.Status == lib.StatusAccepted && infraSetting.Spec.NSXSettings.T1LR != nil {
+			t1LR = *infraSetting.Spec.NSXSettings.T1LR
+		}
+	}
+
+	for _, wp := range weightedPods {
+		// Pool name encodes the pod IP so each pod gets its own Avi Pool.
+		podPoolName := akogatewayapilib.GetPoolName(
+			parentNs, parentName,
+			httpbackend.Backend.Namespace, httpbackend.Backend.Name,
+			utils.Stringify(rule.Matches),
+			httpbackend.Backend.Namespace, wp.PodIP, strconv.Itoa(int(httpbackend.Backend.Port)),
+		)
+
+		podPoolNode := &nodes.AviPoolNode{
+			Name:     podPoolName,
+			Tenant:   childVsNode.Tenant,
+			Protocol: listenerProtocol,
+			Port:     httpbackend.Backend.Port,
+			ServiceMetadata: lib.ServiceMetadataObj{
+				NamespaceServiceName: []string{poolNsName},
+			},
+			VrfContext: lib.GetVrf(),
+		}
+		podPoolNode.AviMarkers = utils.AviObjectMarkers{
+			GatewayName:        parentName,
+			GatewayNamespace:   parentNs,
+			HTTPRouteName:      httpbackend.Backend.Name,
+			HTTPRouteNamespace: httpbackend.Backend.Namespace,
+			BackendNs:          httpbackend.Backend.Namespace,
+			BackendName:        wp.PodIP,
+		}
+		if t1LR != "" {
+			podPoolNode.T1Lr = t1LR
+			podPoolNode.VrfContext = ""
+		}
+		podPoolNode.NetworkPlacementSettings = lib.GetNodeNetworkMap()
+
+		// Direct pod IP server — bypasses Service and Endpoint discovery.
+		podIP := wp.PodIP
+		addrType := "V4"
+		enabled := true
+		podPoolNode.Servers = []nodes.AviPoolMetaServer{
+			{
+				Ip: models.IPAddr{
+					Addr: &podIP,
+					Type: &addrType,
+				},
+				Enabled: &enabled,
+			},
+		}
+
+		if childVsNode.CheckPoolNChecksum(podPoolNode.Name, podPoolNode.GetCheckSum()) {
+			childVsNode.ReplaceEvhPoolInEVHNode(podPoolNode, key)
+		}
+
+		pool_ref := fmt.Sprintf("/api/pool?name=%s", podPoolNode.Name)
+		ratio := wp.Ratio
+		PG.Members = append(PG.Members, &models.PoolGroupMember{PoolRef: &pool_ref, Ratio: &ratio})
+	}
+}
+
 func getApplicationProfileUUID(namespace, name string) (string, error) {
 	clientSet := akogatewayapilib.GetDynamicClientSet()
 	obj, err := clientSet.Resource(akogatewayapilib.AppProfileCRDGVR).Namespace(namespace).Get(context.Background(), name, metav1.GetOptions{})
