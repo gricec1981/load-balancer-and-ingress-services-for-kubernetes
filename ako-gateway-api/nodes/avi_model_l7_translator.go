@@ -16,6 +16,7 @@ package nodes
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strconv"
@@ -28,6 +29,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	akogatewayapilib "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/lib"
@@ -796,6 +798,51 @@ func (o *AviObjectGraph) BuildHTTPPolicySetHTTPRequestUrlRewriteRules(key, httpP
 	}
 }
 
+// nplEntry mirrors one entry in the nodeportlocal.antrea.io pod annotation.
+type nplEntry struct {
+	PodPort  int32  `json:"podPort"`
+	NodeIP   string `json:"nodeIP"`
+	NodePort int32  `json:"nodePort"`
+}
+
+// resolveNPLServer looks up the Antrea NodePortLocal (NPL) address for a given
+// pod IP and target port. If NPL is configured the SE-reachable nodeIP:nodePort
+// is returned; otherwise the pod IP and original port are returned as a fallback.
+func resolveNPLServer(podIP string, targetPort int32, namespace string) (serverIP string, serverPort int32) {
+	serverIP = podIP
+	serverPort = targetPort
+
+	podInformer := utils.GetInformers().PodInformer
+	if podInformer == nil {
+		return
+	}
+	pods, err := podInformer.Lister().Pods(namespace).List(labels.Everything())
+	if err != nil {
+		return
+	}
+	for _, pod := range pods {
+		if pod.Status.PodIP != podIP {
+			continue
+		}
+		nplRaw := pod.Annotations["nodeportlocal.antrea.io"]
+		if nplRaw == "" {
+			return
+		}
+		var entries []nplEntry
+		if err := json.Unmarshal([]byte(nplRaw), &entries); err != nil {
+			utils.AviLog.Warnf("inference: failed to parse NPL annotation for pod %s: %v", podIP, err)
+			return
+		}
+		for _, e := range entries {
+			if e.PodPort == targetPort {
+				utils.AviLog.Infof("inference: NPL resolved pod %s:%d → %s:%d", podIP, targetPort, e.NodeIP, e.NodePort)
+				return e.NodeIP, e.NodePort
+			}
+		}
+	}
+	return
+}
+
 // getApplicationProfileUUID retrieves the UUID of an ApplicationProfile from its status
 // buildInferencePoolMembers creates one AviPoolNode per pod in an InferencePool
 // and adds each as a PoolGroupMember with the metric-derived ratio from the
@@ -880,16 +927,19 @@ func (o *AviObjectGraph) buildInferencePoolMembers(
 		}
 		podPoolNode.NetworkPlacementSettings = lib.GetNodeNetworkMap()
 
-		// Direct pod IP server — bypasses Service and Endpoint discovery.
-		podIP := wp.PodIP
+		// Resolve NPL address (nodeIP:nodePort) so Avi SEs can reach the pod
+		// via the Kubernetes node rather than the unreachable pod overlay IP.
+		serverIP, serverPort := resolveNPLServer(wp.PodIP, httpbackend.Backend.Port, httpbackend.Backend.Namespace)
+		podPoolNode.Port = serverPort
 		addrType := "V4"
 		enabled := true
 		podPoolNode.Servers = []nodes.AviPoolMetaServer{
 			{
 				Ip: models.IPAddr{
-					Addr: &podIP,
+					Addr: &serverIP,
 					Type: &addrType,
 				},
+				Port:    &serverPort,
 				Enabled: &enabled,
 			},
 		}

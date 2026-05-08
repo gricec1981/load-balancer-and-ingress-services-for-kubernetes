@@ -19,6 +19,8 @@ spec:
       labels:
         app: vllm
         pod: "1"
+      annotations:
+        nodeportlocal.antrea.io/enabled: "true"
     spec:
       containers:
       - name: mock-vllm
@@ -64,6 +66,8 @@ spec:
       labels:
         app: vllm
         pod: "2"
+      annotations:
+        nodeportlocal.antrea.io/enabled: "true"
     spec:
       containers:
       - name: mock-vllm
