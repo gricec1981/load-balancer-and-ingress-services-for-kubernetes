@@ -22,33 +22,23 @@ spec:
     spec:
       containers:
       - name: mock-vllm
-        image: python:3.11-slim
+        image: busybox:1.36
         command: ["/bin/sh", "-c"]
         args:
           - |
-            python3 -c "
-            import os
-            from http.server import HTTPServer, BaseHTTPRequestHandler
-            gen_tokens = 0
-            class H(BaseHTTPRequestHandler):
-              def do_GET(self):
-                global gen_tokens
-                waiting = int(os.environ.get('WAITING', '0'))
-                kv = float(os.environ.get('KV_CACHE', '0.1'))
-                gen_tokens += int(os.environ.get('TOKEN_RATE', '100'))
-                body = (
-                  'vllm:num_requests_waiting ' + str(waiting) + '\n'
-                  'vllm:kv_cache_usage_perc ' + str(kv) + '\n'
-                  'vllm:num_requests_running 1\n'
-                  'vllm:generation_tokens_total ' + str(gen_tokens) + '\n'
-                  'vllm:prompt_tokens_total 0\n'
-                ).encode()
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(body)
-              def log_message(self, *a): pass
-            HTTPServer(('0.0.0.0', 8000), H).serve_forever()
-            "
+            WAITING=${WAITING:-0}
+            KV=${KV_CACHE:-0.1}
+            GEN=0
+            while true; do
+              GEN=$((GEN + ${TOKEN_RATE:-100}))
+              BODY="vllm:num_requests_waiting ${WAITING}
+            vllm:kv_cache_usage_perc ${KV}
+            vllm:num_requests_running 1
+            vllm:generation_tokens_total ${GEN}
+            vllm:prompt_tokens_total 0"
+              LEN=$(echo -n "$BODY" | wc -c)
+              { echo -e "HTTP/1.1 200 OK\r\nContent-Length: ${LEN}\r\nContent-Type: text/plain\r\n\r\n${BODY}"; } | nc -l -p 8000 -q 1
+            done
         env:
         - name: WAITING
           value: "0"
@@ -78,33 +68,23 @@ spec:
     spec:
       containers:
       - name: mock-vllm
-        image: python:3.11-slim
+        image: busybox:1.36
         command: ["/bin/sh", "-c"]
         args:
           - |
-            python3 -c "
-            import os
-            from http.server import HTTPServer, BaseHTTPRequestHandler
-            gen_tokens = 0
-            class H(BaseHTTPRequestHandler):
-              def do_GET(self):
-                global gen_tokens
-                waiting = int(os.environ.get('WAITING', '0'))
-                kv = float(os.environ.get('KV_CACHE', '0.1'))
-                gen_tokens += int(os.environ.get('TOKEN_RATE', '100'))
-                body = (
-                  'vllm:num_requests_waiting ' + str(waiting) + '\n'
-                  'vllm:kv_cache_usage_perc ' + str(kv) + '\n'
-                  'vllm:num_requests_running 1\n'
-                  'vllm:generation_tokens_total ' + str(gen_tokens) + '\n'
-                  'vllm:prompt_tokens_total 0\n'
-                ).encode()
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(body)
-              def log_message(self, *a): pass
-            HTTPServer(('0.0.0.0', 8000), H).serve_forever()
-            "
+            WAITING=${WAITING:-5}
+            KV=${KV_CACHE:-0.8}
+            GEN=0
+            while true; do
+              GEN=$((GEN + ${TOKEN_RATE:-50}))
+              BODY="vllm:num_requests_waiting ${WAITING}
+            vllm:kv_cache_usage_perc ${KV}
+            vllm:num_requests_running 1
+            vllm:generation_tokens_total ${GEN}
+            vllm:prompt_tokens_total 0"
+              LEN=$(echo -n "$BODY" | wc -c)
+              { echo -e "HTTP/1.1 200 OK\r\nContent-Length: ${LEN}\r\nContent-Type: text/plain\r\n\r\n${BODY}"; } | nc -l -p 8000 -q 1
+            done
         env:
         - name: WAITING
           value: "5"
