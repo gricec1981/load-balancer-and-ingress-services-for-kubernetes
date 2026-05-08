@@ -852,10 +852,9 @@ func resolveNPLServer(podIP string, targetPort int32, namespace string) (serverI
 		}
 
 		// 3. Fall back to NodePort service — look for a NodePort service in the
-		// same namespace whose endpoints include this pod IP.
+		// same namespace that exposes the target port.
 		svcInformer := utils.GetInformers().ServiceInformer
-		epInformer := utils.GetInformers().EpSlicesInformer
-		if svcInformer != nil && epInformer != nil {
+		if svcInformer != nil {
 			svcs, _ := svcInformer.Lister().Services(namespace).List(labels.Everything())
 			for _, svc := range svcs {
 				if svc.Spec.Type != "NodePort" {
