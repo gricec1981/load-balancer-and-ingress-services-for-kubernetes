@@ -68,10 +68,10 @@ var (
 		Resource: "pkiprofiles",
 	}
 	// InferencePoolGVR is the GroupVersionResource for the Gateway API Inference
-	// Extension InferencePool CRD (gateway.inference.x-k8s.io/v1).
+	// Extension InferencePool CRD (inference.networking.x-k8s.io/v1alpha2).
 	InferencePoolGVR = schema.GroupVersionResource{
-		Group:    "gateway.inference.x-k8s.io",
-		Version:  "v1",
+		Group:    "inference.networking.x-k8s.io",
+		Version:  "v1alpha2",
 		Resource: "inferencepools",
 	}
 )
@@ -110,7 +110,7 @@ type DynamicInformers struct {
 	HealthMonitorInformer            informers.GenericInformer
 	RouteBackendExtensionCRDInformer informers.GenericInformer
 	AppProfileCRDInformer            informers.GenericInformer
-	// InferencePoolInformer watches InferencePool CRs from gateway.inference.x-k8s.io.
+	// InferencePoolInformer watches InferencePool CRs from inference.networking.x-k8s.io.
 	// Only initialised when InferenceExtension is enabled in AKO config.
 	InferencePoolInformer informers.GenericInformer
 }
