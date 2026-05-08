@@ -327,7 +327,7 @@ spec:
           {{ end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
-          image: "{{ .Values.GatewayAPI.image.repository }}:{{ .Chart.AppVersion }}"
+          image: "{{ .Values.GatewayAPI.image.repository }}:{{ .Values.GatewayAPI.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.GatewayAPI.image.pullPolicy }}
           env:
           - name: CTRL_IPADDRESS
