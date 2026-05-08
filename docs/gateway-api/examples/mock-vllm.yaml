@@ -1,0 +1,142 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: inference
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-pod-1
+  namespace: inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+      pod: "1"
+  template:
+    metadata:
+      labels:
+        app: vllm
+        pod: "1"
+    spec:
+      containers:
+      - name: mock-vllm
+        image: python:3.11-slim
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            python3 -c "
+            import os
+            from http.server import HTTPServer, BaseHTTPRequestHandler
+            gen_tokens = 0
+            class H(BaseHTTPRequestHandler):
+              def do_GET(self):
+                global gen_tokens
+                waiting = int(os.environ.get('WAITING', '0'))
+                kv = float(os.environ.get('KV_CACHE', '0.1'))
+                gen_tokens += int(os.environ.get('TOKEN_RATE', '100'))
+                body = (
+                  'vllm:num_requests_waiting ' + str(waiting) + '\n'
+                  'vllm:kv_cache_usage_perc ' + str(kv) + '\n'
+                  'vllm:num_requests_running 1\n'
+                  'vllm:generation_tokens_total ' + str(gen_tokens) + '\n'
+                  'vllm:prompt_tokens_total 0\n'
+                ).encode()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(body)
+              def log_message(self, *a): pass
+            HTTPServer(('0.0.0.0', 8000), H).serve_forever()
+            "
+        env:
+        - name: WAITING
+          value: "0"
+        - name: KV_CACHE
+          value: "0.1"
+        - name: TOKEN_RATE
+          value: "100"
+        ports:
+        - containerPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-pod-2
+  namespace: inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+      pod: "2"
+  template:
+    metadata:
+      labels:
+        app: vllm
+        pod: "2"
+    spec:
+      containers:
+      - name: mock-vllm
+        image: python:3.11-slim
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            python3 -c "
+            import os
+            from http.server import HTTPServer, BaseHTTPRequestHandler
+            gen_tokens = 0
+            class H(BaseHTTPRequestHandler):
+              def do_GET(self):
+                global gen_tokens
+                waiting = int(os.environ.get('WAITING', '0'))
+                kv = float(os.environ.get('KV_CACHE', '0.1'))
+                gen_tokens += int(os.environ.get('TOKEN_RATE', '100'))
+                body = (
+                  'vllm:num_requests_waiting ' + str(waiting) + '\n'
+                  'vllm:kv_cache_usage_perc ' + str(kv) + '\n'
+                  'vllm:num_requests_running 1\n'
+                  'vllm:generation_tokens_total ' + str(gen_tokens) + '\n'
+                  'vllm:prompt_tokens_total 0\n'
+                ).encode()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(body)
+              def log_message(self, *a): pass
+            HTTPServer(('0.0.0.0', 8000), H).serve_forever()
+            "
+        env:
+        - name: WAITING
+          value: "5"
+        - name: KV_CACHE
+          value: "0.8"
+        - name: TOKEN_RATE
+          value: "50"
+        ports:
+        - containerPort: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-pod-1
+  namespace: inference
+spec:
+  selector:
+    app: vllm
+    pod: "1"
+  ports:
+  - port: 8000
+    targetPort: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-pod-2
+  namespace: inference
+spec:
+  selector:
+    app: vllm
+    pod: "2"
+  ports:
+  - port: 8000
+    targetPort: 8000
