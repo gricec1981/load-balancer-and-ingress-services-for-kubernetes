@@ -821,8 +821,21 @@ func (o *AviObjectGraph) buildInferencePoolMembers(
 
 	weightedPods := akogatewayapiinference.GlobalWeightStore().GetWeights(poolNsName)
 	if len(weightedPods) == 0 {
-		utils.AviLog.Debugf("key: %s, msg: no inference weights available yet for pool %s, skipping pool group members", key, poolNsName)
-		return
+		// Weight store not yet populated — fall back to equal-weight pod listing
+		// so the VS has members immediately. The scraper will update weights after
+		// the first scrape interval.
+		utils.AviLog.Infof("key: %s, msg: no inference weights yet for pool %s, bootstrapping with equal weights", key, poolNsName)
+		if ctrl := akogatewayapiinference.SharedInferenceController(); ctrl != nil {
+			podIPs := ctrl.GetPoolPodIPs(poolNsName)
+			ratio := int32(100)
+			for _, ip := range podIPs {
+				weightedPods = append(weightedPods, akogatewayapiinference.WeightedPod{PodIP: ip, Ratio: ratio})
+			}
+		}
+		if len(weightedPods) == 0 {
+			utils.AviLog.Warnf("key: %s, msg: inference pool %s has no pods yet, skipping", key, poolNsName)
+			return
+		}
 	}
 
 	t1LR := lib.GetT1LRPath()

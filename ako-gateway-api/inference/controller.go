@@ -193,6 +193,12 @@ func (c *Controller) RegisterRouteForPool(poolNsName, routeKey string) {
 	c.poolToRoutes[poolNsName] = append(c.poolToRoutes[poolNsName], routeKey)
 }
 
+// GetPoolPodIPs returns the currently resolved pod IPs for a pool, used as a
+// bootstrap fallback when the weight store has not yet been populated.
+func (c *Controller) GetPoolPodIPs(poolNsName string) []string {
+	return c.scraper.GetPodIPs(poolNsName)
+}
+
 // onWeightsUpdated is the Scraper callback. It stores the new weights and
 // re-enqueues all HTTPRoutes that reference this pool.
 func (c *Controller) onWeightsUpdated(poolNsName string, weights []WeightedPod) {

@@ -133,6 +133,20 @@ func (s *Scraper) DeregisterPool(nsName string) {
 	}
 }
 
+// GetPodIPs returns a snapshot of the current pod IPs for a pool.
+// Returns nil if the pool is not registered yet.
+func (s *Scraper) GetPodIPs(nsName string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, ok := s.pools[nsName]
+	if !ok {
+		return nil
+	}
+	ips := make([]string, len(state.podIPs))
+	copy(ips, state.podIPs)
+	return ips
+}
+
 // UpdatePods refreshes the pod IP list for an already-registered pool.
 func (s *Scraper) UpdatePods(nsName string, podIPs []string) {
 	s.mu.Lock()
