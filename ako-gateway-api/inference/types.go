@@ -49,7 +49,8 @@ type InferencePoolSpec struct {
 
 	// TargetPort is the port on the pod that the model server listens on.
 	// This port is also where Prometheus metrics are scraped from (via /metrics).
-	TargetPort int32 `json:"targetPort"`
+	// Mapped from targetPortNumber in v1alpha2.
+	TargetPort int32 `json:"targetPortNumber"`
 
 	// ExtensionRef is optional. When omitted, AKO acts as the native
 	// endpoint picker using its built-in Prometheus scraper.

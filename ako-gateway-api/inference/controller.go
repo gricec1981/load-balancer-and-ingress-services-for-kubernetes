@@ -287,7 +287,11 @@ func parseInferencePool(obj *unstructured.Unstructured) (*InferencePool, error) 
 		return nil, fmt.Errorf("spec not found")
 	}
 
-	port, _, _ := unstructured.NestedInt64(spec, "targetPort")
+	// v1alpha2 uses "targetPortNumber"; fall back to "targetPort" for forward compat.
+	port, _, _ := unstructured.NestedInt64(spec, "targetPortNumber")
+	if port == 0 {
+		port, _, _ = unstructured.NestedInt64(spec, "targetPort")
+	}
 	pool.Spec.TargetPort = int32(port)
 
 	selectorMap, _, _ := unstructured.NestedStringMap(spec, "selector", "matchLabels")
