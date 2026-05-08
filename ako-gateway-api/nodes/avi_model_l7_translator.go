@@ -805,9 +805,10 @@ type nplEntry struct {
 	NodePort int32  `json:"nodePort"`
 }
 
-// resolveNPLServer looks up the Antrea NodePortLocal (NPL) address for a given
-// pod IP and target port. If NPL is configured the SE-reachable nodeIP:nodePort
-// is returned; otherwise the pod IP and original port are returned as a fallback.
+// resolveNPLServer resolves a pod IP to an SE-reachable address using:
+//  1. Antrea NodePortLocal annotation (nodeportlocal.antrea.io) if present
+//  2. hostPort on the pod spec if configured
+//  3. Falls back to pod IP + target port (works if SE has pod network access)
 func resolveNPLServer(podIP string, targetPort int32, namespace string) (serverIP string, serverPort int32) {
 	serverIP = podIP
 	serverPort = targetPort
@@ -824,21 +825,32 @@ func resolveNPLServer(podIP string, targetPort int32, namespace string) (serverI
 		if pod.Status.PodIP != podIP {
 			continue
 		}
+
+		// 1. Try Antrea NPL annotation
 		nplRaw := pod.Annotations["nodeportlocal.antrea.io"]
-		if nplRaw == "" {
-			return
-		}
-		var entries []nplEntry
-		if err := json.Unmarshal([]byte(nplRaw), &entries); err != nil {
-			utils.AviLog.Warnf("inference: failed to parse NPL annotation for pod %s: %v", podIP, err)
-			return
-		}
-		for _, e := range entries {
-			if e.PodPort == targetPort {
-				utils.AviLog.Infof("inference: NPL resolved pod %s:%d → %s:%d", podIP, targetPort, e.NodeIP, e.NodePort)
-				return e.NodeIP, e.NodePort
+		if nplRaw != "" {
+			var entries []nplEntry
+			if err := json.Unmarshal([]byte(nplRaw), &entries); err == nil {
+				for _, e := range entries {
+					if e.PodPort == targetPort {
+						utils.AviLog.Infof("inference: NPL resolved pod %s:%d → %s:%d", podIP, targetPort, e.NodeIP, e.NodePort)
+						return e.NodeIP, e.NodePort
+					}
+				}
 			}
 		}
+
+		// 2. Fall back to hostPort on the pod spec
+		for _, c := range pod.Spec.Containers {
+			for _, p := range c.Ports {
+				if p.ContainerPort == targetPort && p.HostPort > 0 {
+					nodeIP := pod.Status.HostIP
+					utils.AviLog.Infof("inference: hostPort resolved pod %s:%d → %s:%d", podIP, targetPort, nodeIP, p.HostPort)
+					return nodeIP, p.HostPort
+				}
+			}
+		}
+		return
 	}
 	return
 }

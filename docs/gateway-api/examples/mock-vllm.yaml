@@ -49,6 +49,7 @@ spec:
           value: "100"
         ports:
         - containerPort: 8000
+          hostPort: 38000
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -96,6 +97,7 @@ spec:
           value: "50"
         ports:
         - containerPort: 8000
+          hostPort: 38001
 ---
 apiVersion: v1
 kind: Service
