@@ -36,7 +36,7 @@ spec:
             vllm:num_requests_running 1
             vllm:generation_tokens_total ${GEN}
             vllm:prompt_tokens_total 0"
-              printf "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n%s\r\n" "$BODY" | nc -l -p 8000
+              printf "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n%s\n" "$BODY" | nc -l -p 8000
             done
         env:
         - name: WAITING
@@ -81,7 +81,7 @@ spec:
             vllm:num_requests_running 1
             vllm:generation_tokens_total ${GEN}
             vllm:prompt_tokens_total 0"
-              printf "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n%s\r\n" "$BODY" | nc -l -p 8000
+              printf "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n%s\n" "$BODY" | nc -l -p 8000
             done
         env:
         - name: WAITING
