@@ -113,6 +113,7 @@ replicaCount: 1
 
 image:
   repository: projects.registry.vmware.com/ako/ako
+  tag: "1.12.1"
   pullPolicy: IfNotPresent
   pullSecrets: []
 
