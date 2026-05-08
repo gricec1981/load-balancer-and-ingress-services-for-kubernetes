@@ -25,7 +25,7 @@ import (
 )
 
 // InferencePoolGroup is the API group for inference extension resources.
-const InferencePoolGroup = "gateway.inference.x-k8s.io"
+const InferencePoolGroup = "inference.networking.x-k8s.io"
 
 // InferencePoolKind is the Kind string for InferencePool.
 const InferencePoolKind = "InferencePool"

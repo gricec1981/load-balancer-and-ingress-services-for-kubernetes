@@ -34,8 +34,8 @@ import (
 
 // InferencePoolGVR is the GroupVersionResource for the InferencePool CRD.
 var InferencePoolGVR = schema.GroupVersionResource{
-	Group:    "gateway.inference.x-k8s.io",
-	Version:  "v1",
+	Group:    "inference.networking.x-k8s.io",
+	Version:  "v1alpha2",
 	Resource: "inferencepools",
 }
 
