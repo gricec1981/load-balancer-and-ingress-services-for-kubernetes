@@ -166,9 +166,46 @@ func (c *Controller) Reconcile(key string) error {
 		utils.AviLog.Warnf("key: %s, msg: failed to resolve pods: %v", key, err)
 	}
 
+	// Annotate backing Services with nodeportlocal.antrea.io/enabled so Antrea
+	// allocates NPL ports, making pods reachable by Avi SEs via node IP.
+	c.annotateServicesForNPL(ns, pool.Spec.Selector)
+
 	c.scraper.RegisterPool(nsName, pool.Spec.TargetPort, podIPs)
 	utils.AviLog.Debugf("key: %s, msg: registered %d pods for scraping", key, len(podIPs))
 	return nil
+}
+
+// annotateServicesForNPL finds Services in the namespace whose selector matches
+// the InferencePool pod selector and adds the Antrea NPL annotation so that
+// Antrea allocates a host port on each node for the backing pods.
+func (c *Controller) annotateServicesForNPL(namespace string, selector metav1.LabelSelector) {
+	svcGVR := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "services"}
+	svcs, err := c.dynamicClient.Resource(svcGVR).Namespace(namespace).List(
+		context.TODO(), metav1.ListOptions{},
+	)
+	if err != nil {
+		utils.AviLog.Warnf("inference: failed to list services in %s: %v", namespace, err)
+		return
+	}
+	for _, svc := range svcs.Items {
+		annotations := svc.GetAnnotations()
+		if annotations == nil {
+			annotations = map[string]string{}
+		}
+		if annotations["nodeportlocal.antrea.io/enabled"] == "true" {
+			continue
+		}
+		annotations["nodeportlocal.antrea.io/enabled"] = "true"
+		svc.SetAnnotations(annotations)
+		_, err := c.dynamicClient.Resource(svcGVR).Namespace(namespace).Update(
+			context.TODO(), &svc, metav1.UpdateOptions{},
+		)
+		if err != nil {
+			utils.AviLog.Warnf("inference: failed to annotate service %s/%s for NPL: %v", namespace, svc.GetName(), err)
+		} else {
+			utils.AviLog.Infof("inference: annotated service %s/%s with nodeportlocal.antrea.io/enabled", namespace, svc.GetName())
+		}
+	}
 }
 
 // GetRoutesForPool returns the HTTPRoute keys that currently reference the pool.
