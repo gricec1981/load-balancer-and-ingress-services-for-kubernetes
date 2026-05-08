@@ -65,7 +65,7 @@ AKOSettings:
   disableStaticRouteSync: "false"
   enableEVH: true                # required for Gateway API child VS model
   layer7Only: false
-  cniPlugin: ""                  # set to "calico", "antrea", etc. if needed
+  cniPlugin: "antrea"
   istioEnabled: false
   namespaceSelector:
     labelKey: ""
