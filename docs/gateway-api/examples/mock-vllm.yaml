@@ -22,7 +22,7 @@ spec:
     spec:
       containers:
       - name: mock-vllm
-        image: busybox:1.36
+        image: ghcr.io/gricec1981/mock-vllm:latest
         command: ["/bin/sh", "-c"]
         args:
           - |
@@ -68,7 +68,7 @@ spec:
     spec:
       containers:
       - name: mock-vllm
-        image: busybox:1.36
+        image: ghcr.io/gricec1981/mock-vllm:latest
         command: ["/bin/sh", "-c"]
         args:
           - |
