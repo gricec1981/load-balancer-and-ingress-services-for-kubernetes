@@ -104,6 +104,8 @@ kind: Service
 metadata:
   name: vllm-pod-1
   namespace: inference
+  annotations:
+    nodeportlocal.antrea.io/enabled: "true"
 spec:
   selector:
     app: vllm
@@ -117,6 +119,8 @@ kind: Service
 metadata:
   name: vllm-pod-2
   namespace: inference
+  annotations:
+    nodeportlocal.antrea.io/enabled: "true"
 spec:
   selector:
     app: vllm
