@@ -827,7 +827,7 @@ func (o *AviObjectGraph) buildInferencePoolMembers(
 		utils.AviLog.Infof("key: %s, msg: no inference weights yet for pool %s, bootstrapping with equal weights", key, poolNsName)
 		if ctrl := akogatewayapiinference.SharedInferenceController(); ctrl != nil {
 			podIPs := ctrl.GetPoolPodIPs(poolNsName)
-			ratio := int32(100)
+			ratio := uint32(100)
 			for _, ip := range podIPs {
 				weightedPods = append(weightedPods, akogatewayapiinference.WeightedPod{PodIP: ip, Ratio: ratio})
 			}
