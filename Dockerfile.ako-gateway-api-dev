@@ -15,8 +15,13 @@ ARG AKO_LDFLAGS="-X 'main.version=dev'"
 ENV BUILD_PATH="github.com/vmware/load-balancer-and-ingress-services-for-kubernetes"
 
 RUN mkdir -p $GOPATH/src/$BUILD_PATH
-COPY . $GOPATH/src/$BUILD_PATH
 WORKDIR $GOPATH/src/$BUILD_PATH
+
+# Copy dependency files first so vendor layer is cached separately from source.
+COPY go.mod go.sum vendor/ $GOPATH/src/$BUILD_PATH/
+
+# Copy source — only this layer rebuilds on code changes.
+COPY . $GOPATH/src/$BUILD_PATH
 
 RUN GOARCH=amd64 \
     CGO_ENABLED=0 \
