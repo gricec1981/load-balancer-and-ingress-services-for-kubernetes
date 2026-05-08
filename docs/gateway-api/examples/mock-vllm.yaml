@@ -22,7 +22,7 @@ spec:
     spec:
       containers:
       - name: mock-vllm
-        image: ghcr.io/gricec1981/mock-vllm:latest
+        image: dockerhub.packages.vcfd.broadcom.net/alpine:3.19
         command: ["/bin/sh", "-c"]
         args:
           - |
@@ -68,7 +68,7 @@ spec:
     spec:
       containers:
       - name: mock-vllm
-        image: ghcr.io/gricec1981/mock-vllm:latest
+        image: dockerhub.packages.vcfd.broadcom.net/alpine:3.19
         command: ["/bin/sh", "-c"]
         args:
           - |
