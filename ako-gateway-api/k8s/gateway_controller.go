@@ -308,21 +308,29 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 					utils.AviLog.Warnf("key : %s, msg: 'nodeportlocal.antrea.io' annotation not found, ignoring the pod", key)
 					return
 				}
-				for _, container := range newPod.Status.ContainerStatuses {
-					if !container.Ready {
-						if container.State.Terminated != nil {
-							utils.AviLog.Warnf("key : %s, msg: Container %s is in terminated state, ignoring pod update", key, container.Name)
-							return
-						}
-						if container.State.Waiting != nil && container.State.Waiting.Reason == "CrashLoopBackOff" {
-							utils.AviLog.Warnf("key : %s, msg: Container %s is in CrashLoopBackOff state, ignoring pod update", key, container.Name)
-							return
-						}
+			for _, container := range newPod.Status.ContainerStatuses {
+				if !container.Ready {
+					if container.State.Terminated != nil {
+						utils.AviLog.Warnf("key : %s, msg: Container %s is in terminated state, ignoring pod update", key, container.Name)
+						return
+					}
+					if container.State.Waiting != nil && container.State.Waiting.Reason == "CrashLoopBackOff" {
+						utils.AviLog.Warnf("key : %s, msg: Container %s is in CrashLoopBackOff state, ignoring pod update", key, container.Name)
+						return
 					}
 				}
-				bkt := utils.Bkt(namespace, numWorkers)
-				c.workqueue[bkt].AddRateLimited(key)
-				utils.AviLog.Debugf("key: %s, msg: UPDATE", key)
+			}
+			// Re-enqueue InferencePool-backed routes when the NPL annotation
+			// changes so the translator can re-resolve the node IP/port mapping.
+			if newPod.Status.PodIP != "" &&
+				oldPod.GetAnnotations()[lib.NPLPodAnnotation] != newPod.GetAnnotations()[lib.NPLPodAnnotation] {
+				if inferenceCtrl := akogatewayapiinference.SharedInferenceController(); inferenceCtrl != nil {
+					inferenceCtrl.ReEnqueueRoutesForPodIP(newPod.Status.PodIP)
+				}
+			}
+			bkt := utils.Bkt(namespace, numWorkers)
+			c.workqueue[bkt].AddRateLimited(key)
+			utils.AviLog.Debugf("key: %s, msg: UPDATE", key)
 			},
 		}
 		c.informers.PodInformer.Informer().AddEventHandler(podEventHandler)

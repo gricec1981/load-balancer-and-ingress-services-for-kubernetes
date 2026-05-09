@@ -56,6 +56,12 @@ type Controller struct {
 	numWorkers      uint32
 	// poolToRoutes maps poolNsName → set of HTTPRoute ns/name keys that reference it.
 	poolToRoutes    map[string][]string
+	// poolTargetPort caches InferencePool.Spec.TargetPort per pool so the
+	// translator can use it for NPL lookups without re-fetching the CRD.
+	poolTargetPort  map[string]int32
+	// podIPToPools is a reverse index from pod IP to the set of pool ns/name
+	// keys containing that pod, used to re-enqueue routes on NPL annotation changes.
+	podIPToPools    map[string]map[string]struct{}
 }
 
 var controllerInstance *Controller
@@ -79,11 +85,13 @@ func InitController(
 ) *Controller {
 	once.Do(func() {
 		ctrl := &Controller{
-			dynamicClient: dynamicClient,
-			informer:      informer,
-			workqueue:     wq,
-			numWorkers:    numWorkers,
-			poolToRoutes:  make(map[string][]string),
+			dynamicClient:  dynamicClient,
+			informer:       informer,
+			workqueue:      wq,
+			numWorkers:     numWorkers,
+			poolToRoutes:   make(map[string][]string),
+			poolTargetPort: make(map[string]int32),
+			podIPToPools:   make(map[string]map[string]struct{}),
 		}
 		ctrl.scraper = NewScraper(scrapeIntervalSeconds, alphaKVCache, betaTokenRate, ctrl.onWeightsUpdated)
 		controllerInstance = ctrl
@@ -137,6 +145,15 @@ func (c *Controller) SetupEventHandlers() {
 			utils.AviLog.Infof("InferencePool DELETE: %s", nsName)
 			c.scraper.DeregisterPool(nsName)
 			GlobalWeightStore().Delete(nsName)
+			c.mu.Lock()
+			delete(c.poolTargetPort, nsName)
+			for ip, pools := range c.podIPToPools {
+				delete(pools, nsName)
+				if len(pools) == 0 {
+					delete(c.podIPToPools, ip)
+				}
+			}
+			c.mu.Unlock()
 			c.reEnqueueAssociatedRoutes(nsName)
 		},
 	}
@@ -171,6 +188,25 @@ func (c *Controller) Reconcile(key string) error {
 	c.annotateServicesForNPL(ns, pool.Spec.Selector)
 
 	c.scraper.RegisterPool(nsName, pool.Spec.TargetPort, podIPs)
+
+	c.mu.Lock()
+	c.poolTargetPort[nsName] = pool.Spec.TargetPort
+	// Rebuild the reverse pod-IP → pool index for this pool: remove stale
+	// entries first, then re-add the current pod set.
+	for ip, pools := range c.podIPToPools {
+		delete(pools, nsName)
+		if len(pools) == 0 {
+			delete(c.podIPToPools, ip)
+		}
+	}
+	for _, ip := range podIPs {
+		if c.podIPToPools[ip] == nil {
+			c.podIPToPools[ip] = make(map[string]struct{})
+		}
+		c.podIPToPools[ip][nsName] = struct{}{}
+	}
+	c.mu.Unlock()
+
 	utils.AviLog.Debugf("key: %s, msg: registered %d pods for scraping", key, len(podIPs))
 	return nil
 }
@@ -234,6 +270,30 @@ func (c *Controller) RegisterRouteForPool(poolNsName, routeKey string) {
 // bootstrap fallback when the weight store has not yet been populated.
 func (c *Controller) GetPoolPodIPs(poolNsName string) []string {
 	return c.scraper.GetPodIPs(poolNsName)
+}
+
+// GetPoolTargetPort returns the cached InferencePool.Spec.TargetPort for the
+// given pool ns/name. Returns 0 if the pool has not yet been reconciled.
+func (c *Controller) GetPoolTargetPort(poolNsName string) int32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.poolTargetPort[poolNsName]
+}
+
+// ReEnqueueRoutesForPodIP re-enqueues all HTTPRoutes that reference any
+// InferencePool containing podIP. Called when the NPL annotation on a pod
+// changes so the translator can re-resolve the node IP/port mapping.
+func (c *Controller) ReEnqueueRoutesForPodIP(podIP string) {
+	c.mu.Lock()
+	pools := make([]string, 0, len(c.podIPToPools[podIP]))
+	for poolName := range c.podIPToPools[podIP] {
+		pools = append(pools, poolName)
+	}
+	c.mu.Unlock()
+
+	for _, poolNsName := range pools {
+		c.reEnqueueAssociatedRoutes(poolNsName)
+	}
 }
 
 // onWeightsUpdated is the Scraper callback. It stores the new weights and

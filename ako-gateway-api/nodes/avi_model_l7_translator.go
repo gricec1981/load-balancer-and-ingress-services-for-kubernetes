@@ -806,9 +806,15 @@ type nplEntry struct {
 }
 
 // resolveNPLServer resolves a pod IP to an SE-reachable address using:
-//  1. Antrea NodePortLocal annotation (nodeportlocal.antrea.io) if present
+//  1. Antrea NodePortLocal annotation (nodeportlocal.antrea.io) if present —
+//     targetPort must be the pod container port (InferencePool.Spec.TargetPort),
+//     not the HTTPRoute BackendRef port, for the annotation lookup to match.
 //  2. hostPort on the pod spec if configured
 //  3. Falls back to pod IP + target port (works if SE has pod network access)
+//
+// A return of (podIP, targetPort) indicates that all resolution strategies
+// failed; the caller is responsible for logging a warning and triggering a
+// re-enqueue once the NPL annotation becomes available.
 func resolveNPLServer(podIP string, targetPort int32, namespace string) (serverIP string, serverPort int32) {
 	serverIP = podIP
 	serverPort = targetPort
@@ -960,7 +966,20 @@ func (o *AviObjectGraph) buildInferencePoolMembers(
 
 		// Resolve NPL address (nodeIP:nodePort) so Avi SEs can reach the pod
 		// via the Kubernetes node rather than the unreachable pod overlay IP.
-		serverIP, serverPort := resolveNPLServer(wp.PodIP, httpbackend.Backend.Port, httpbackend.Backend.Namespace)
+		// The NPL annotation is keyed by container port (InferencePool.Spec.TargetPort),
+		// not the HTTPRoute BackendRef.Port, so we fetch it from the controller cache.
+		targetPort := httpbackend.Backend.Port
+		if ctrl := akogatewayapiinference.SharedInferenceController(); ctrl != nil {
+			if tp := ctrl.GetPoolTargetPort(poolNsName); tp != 0 {
+				targetPort = tp
+			} else {
+				utils.AviLog.Warnf("key: %s, msg: InferencePool %s not yet reconciled, falling back to BackendRef port %d for NPL lookup", key, poolNsName, targetPort)
+			}
+		}
+		serverIP, serverPort := resolveNPLServer(wp.PodIP, targetPort, httpbackend.Backend.Namespace)
+		if serverIP == wp.PodIP && serverPort == targetPort {
+			utils.AviLog.Warnf("key: %s, msg: NPL resolution failed for pod %s in pool %s; pool will be programmed with unreachable pod overlay IP. Route will be re-enqueued once the NPL annotation appears.", key, wp.PodIP, poolNsName)
+		}
 		podPoolNode.Port = serverPort
 		addrType := "V4"
 		enabled := true
@@ -970,7 +989,7 @@ func (o *AviObjectGraph) buildInferencePoolMembers(
 					Addr: &serverIP,
 					Type: &addrType,
 				},
-				Port:    &serverPort,
+				Port:    serverPort,
 				Enabled: &enabled,
 			},
 		}
