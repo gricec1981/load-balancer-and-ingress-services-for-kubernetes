@@ -22,6 +22,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
@@ -62,6 +63,9 @@ type Controller struct {
 	// podIPToPools is a reverse index from pod IP to the set of pool ns/name
 	// keys containing that pod, used to re-enqueue routes on NPL annotation changes.
 	podIPToPools    map[string]map[string]struct{}
+	// poolSelectors caches the parsed pod label selector per pool so the pod
+	// event handler can match pods to pools without re-fetching the CRD.
+	poolSelectors   map[string]labels.Selector
 }
 
 var controllerInstance *Controller
@@ -92,6 +96,7 @@ func InitController(
 			poolToRoutes:   make(map[string][]string),
 			poolTargetPort: make(map[string]int32),
 			podIPToPools:   make(map[string]map[string]struct{}),
+			poolSelectors:  make(map[string]labels.Selector),
 		}
 		ctrl.scraper = NewScraper(scrapeIntervalSeconds, alphaKVCache, betaTokenRate, ctrl.onWeightsUpdated)
 		controllerInstance = ctrl
@@ -147,6 +152,7 @@ func (c *Controller) SetupEventHandlers() {
 			GlobalWeightStore().Delete(nsName)
 			c.mu.Lock()
 			delete(c.poolTargetPort, nsName)
+			delete(c.poolSelectors, nsName)
 			for ip, pools := range c.podIPToPools {
 				delete(pools, nsName)
 				if len(pools) == 0 {
@@ -191,6 +197,13 @@ func (c *Controller) Reconcile(key string) error {
 
 	c.mu.Lock()
 	c.poolTargetPort[nsName] = pool.Spec.TargetPort
+	// Cache the parsed selector so HandlePodEvent can match pods to this pool
+	// without re-fetching the CRD on every pod event.
+	if sel, err := metav1.LabelSelectorAsSelector(&pool.Spec.Selector); err == nil {
+		c.poolSelectors[nsName] = sel
+	} else {
+		utils.AviLog.Warnf("key: %s, msg: failed to parse selector for pool %s, pod events will not trigger reconcile: %v", key, nsName, err)
+	}
 	// Rebuild the reverse pod-IP → pool index for this pool: remove stale
 	// entries first, then re-add the current pod set.
 	for ip, pools := range c.podIPToPools {
@@ -294,6 +307,52 @@ func (c *Controller) ReEnqueueRoutesForPodIP(podIP string) {
 	for _, poolNsName := range pools {
 		c.reEnqueueAssociatedRoutes(poolNsName)
 	}
+}
+
+// HandlePodEvent is called by the gateway controller on pod Add/Update/Delete
+// events. It matches the pod against every cached InferencePool selector and
+// re-enqueues the pool for reconciliation so stale pod IPs and scraper
+// registrations are refreshed. Safe to call with a nil pod (no-op).
+func (c *Controller) HandlePodEvent(pod *corev1.Pod) {
+	if pod == nil {
+		return
+	}
+	podNs := pod.Namespace
+	podLabels := labels.Set(pod.Labels)
+
+	c.mu.Lock()
+	var matches []string
+	for nsName, sel := range c.poolSelectors {
+		ns, _, ok := splitNsName(nsName)
+		if !ok || ns != podNs {
+			continue
+		}
+		if sel.Matches(podLabels) {
+			matches = append(matches, nsName)
+		}
+	}
+	c.mu.Unlock()
+
+	for _, nsName := range matches {
+		ns, name, ok := splitNsName(nsName)
+		if !ok {
+			continue
+		}
+		key := lib.InferencePool + "/" + ns + "/" + name
+		c.enqueuePool(ns, key)
+		utils.AviLog.Debugf("inference: pod event for %s/%s re-enqueued pool %s", podNs, pod.Name, nsName)
+	}
+}
+
+// splitNsName splits a "namespace/name" string without allocating a slice.
+// Returns ok=false if no '/' separator is found.
+func splitNsName(nsName string) (ns, name string, ok bool) {
+	for i := 0; i < len(nsName); i++ {
+		if nsName[i] == '/' {
+			return nsName[:i], nsName[i+1:], true
+		}
+	}
+	return "", "", false
 }
 
 // onWeightsUpdated is the Scraper callback. It stores the new weights and

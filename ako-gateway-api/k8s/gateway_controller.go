@@ -241,6 +241,12 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 					return
 				}
 				pod := obj.(*corev1.Pod)
+				// Notify the inference controller about the new pod so it can
+				// re-reconcile any InferencePool whose selector matches, regardless
+				// of whether the NPL annotation is present yet.
+				if inferenceCtrl := akogatewayapiinference.SharedInferenceController(); inferenceCtrl != nil {
+					inferenceCtrl.HandlePodEvent(pod)
+				}
 				namespace, _, _ := cache.SplitMetaNamespaceKey(utils.ObjKey(pod))
 				key := utils.Pod + "/" + utils.ObjKey(pod)
 				if lib.IsNamespaceBlocked(namespace) {
@@ -277,6 +283,11 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 						return
 					}
 				}
+				// Notify the inference controller so deleted pods are removed from
+				// InferencePool membership before the NPL annotation check below.
+				if inferenceCtrl := akogatewayapiinference.SharedInferenceController(); inferenceCtrl != nil {
+					inferenceCtrl.HandlePodEvent(pod)
+				}
 				namespace, _, _ := cache.SplitMetaNamespaceKey(utils.ObjKey(pod))
 				key := utils.Pod + "/" + utils.ObjKey(pod)
 				if lib.IsNamespaceBlocked(namespace) {
@@ -298,6 +309,11 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 				}
 				oldPod := old.(*corev1.Pod)
 				newPod := cur.(*corev1.Pod)
+				// Notify the inference controller so any InferencePool matching
+				// this pod's labels is re-reconciled with the updated pod state.
+				if inferenceCtrl := akogatewayapiinference.SharedInferenceController(); inferenceCtrl != nil {
+					inferenceCtrl.HandlePodEvent(newPod)
+				}
 				key := utils.Pod + "/" + utils.ObjKey(oldPod)
 				namespace, _, _ := cache.SplitMetaNamespaceKey(utils.ObjKey(newPod))
 				if lib.IsNamespaceBlocked(namespace) {
