@@ -344,11 +344,16 @@ func getGaugeValue(families map[string]*dto.MetricFamily, name string) (float64,
 	if !ok || len(family.Metric) == 0 {
 		return 0, false
 	}
-	gauge := family.Metric[0].GetGauge()
-	if gauge == nil {
-		return 0, false
+	m := family.Metric[0]
+	// Check typed gauge first; fall back to untyped for scrapers that omit
+	// "# TYPE" declarations (e.g. the mock vLLM shell script).
+	if g := m.GetGauge(); g != nil {
+		return g.GetValue(), true
 	}
-	return gauge.GetValue(), true
+	if u := m.GetUntyped(); u != nil {
+		return u.GetValue(), true
+	}
+	return 0, false
 }
 
 func getCounterValue(families map[string]*dto.MetricFamily, name string) (float64, bool) {
@@ -356,9 +361,14 @@ func getCounterValue(families map[string]*dto.MetricFamily, name string) (float6
 	if !ok || len(family.Metric) == 0 {
 		return 0, false
 	}
-	counter := family.Metric[0].GetCounter()
-	if counter == nil {
-		return 0, false
+	m := family.Metric[0]
+	// Check typed counter first; fall back to untyped for scrapers that omit
+	// "# TYPE" declarations (e.g. the mock vLLM shell script).
+	if c := m.GetCounter(); c != nil {
+		return c.GetValue(), true
 	}
-	return counter.GetValue(), true
+	if u := m.GetUntyped(); u != nil {
+		return u.GetValue(), true
+	}
+	return 0, false
 }
