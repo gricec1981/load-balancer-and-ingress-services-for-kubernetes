@@ -12,32 +12,14 @@ This approach works with any gateway that AKO manages — no ext-proc support is
 
 ## How It Works
 
-```
-HTTPRoute (backendRef: InferencePool)
-        │
-        ▼
-AKO Inference Controller
-  ├── Watches InferencePool CRDs
-  ├── Resolves matching pod IPs via label selector
-  └── Starts per-pool Prometheus scraper goroutine
-              │  (every scrapeIntervalSeconds)
-              ▼
-        Pod /metrics endpoints (e.g. vLLM)
-          ├── Gauges:   num_requests_waiting, kv_cache_usage_perc
-          └── Counters: generation_tokens_total, prompt_tokens_total
-              │
-              ▼
-        Weight Calculator
-          load  = waiting + α·kv_cache + β·(tokens/sec ÷ max_in_pool)
-          score = 1 / (load + ε)
-          ratio = round(100 · score / Σscores)
-              │
-              ▼
-        Avi Pool Group Members
-          pod-1  Ratio=65   ←── low queue, low tokens/sec, low cache
-          pod-2  Ratio=25   ←── moderate queue
-          pod-3  Ratio=10   ←── high tokens/sec (processing large context)
-```
+![AKO Inference Extension — End-to-End Architecture](./ako-inference-architecture.svg)
+
+The diagram above shows the full end-to-end flow:
+
+- **Data path (blue):** Client request hits the Avi Virtual Service (VIP), is routed to a pool selected by the Pool Group using the computed ratio, then forwarded to the Kubernetes node via the Antrea NPL-mapped `nodeIP:nplPort`. Antrea NATs it to the pod overlay IP.
+- **Control path (dashed dark):** AKO programs the Virtual Service, Pool Group, and per-pod Pools via the Avi REST API after each reconcile cycle.
+- **Scrape path (orange):** The Inference Scraper goroutine polls each pod's `/metrics` endpoint every `scrapeIntervalSeconds`, feeds results into the WeightStore, and re-enqueues the HTTPRoute so the translator can update pool group member ratios.
+- **Watches (grey dashed):** AKO watches Gateway, HTTPRoute, InferencePool, and Pod events via the Kubernetes API. Pod add/update/delete events trigger pool re-reconciliation via `HandlePodEvent` so pod rolls and NPL annotation changes are picked up without waiting for a CRD change.
 
 Each `InferencePool` becomes a set of individual Avi Pools — one per matched pod — grouped under a single Pool Group. The Pool Group member `Ratio` values are updated after each scrape cycle by re-enqueuing the parent HTTPRoute through AKO's normal graph layer.
 

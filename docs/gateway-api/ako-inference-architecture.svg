@@ -1,0 +1,255 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 1000" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#37474f"/>
+    </marker>
+    <marker id="arrow-dashed" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#78909c"/>
+    </marker>
+    <marker id="arrow-scrape" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#e65100"/>
+    </marker>
+    <marker id="arrow-data" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1565c0"/>
+    </marker>
+    <filter id="soft-shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="2"/>
+      <feOffset dx="0" dy="2" result="offsetblur"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.15"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Title -->
+  <text x="700" y="32" text-anchor="middle" font-size="20" font-weight="600" fill="#102a43">AKO Inference Extension — End-to-End Architecture</text>
+  <text x="700" y="54" text-anchor="middle" font-size="12" fill="#627d98">Avi + Antrea NPL + Gateway API Inference Extension</text>
+
+  <!-- Client -->
+  <g filter="url(#soft-shadow)">
+    <rect x="50" y="100" width="160" height="60" rx="8" fill="#fff" stroke="#37474f" stroke-width="2"/>
+    <text x="130" y="125" text-anchor="middle" font-size="13" font-weight="600" fill="#102a43">Client</text>
+    <text x="130" y="145" text-anchor="middle" font-size="11" fill="#627d98">POST /v1/completions</text>
+  </g>
+
+  <!-- Avi Load Balancer cluster -->
+  <g>
+    <rect x="270" y="80" width="320" height="380" rx="10" fill="#e1f5ff" stroke="#0288d1" stroke-width="2" stroke-dasharray="4,3" opacity="0.4"/>
+    <text x="285" y="100" font-size="12" font-weight="600" fill="#01579b">Avi Load Balancer (external)</text>
+  </g>
+
+  <!-- Virtual Service -->
+  <g filter="url(#soft-shadow)">
+    <rect x="290" y="115" width="280" height="70" rx="6" fill="#fff" stroke="#0288d1" stroke-width="2"/>
+    <text x="430" y="138" text-anchor="middle" font-size="13" font-weight="600" fill="#01579b">Virtual Service</text>
+    <text x="430" y="156" text-anchor="middle" font-size="11" fill="#37474f">llm-inference.avilb.avidemo.net</text>
+    <text x="430" y="172" text-anchor="middle" font-size="11" fill="#627d98">VIP 172.16.2.4</text>
+  </g>
+
+  <!-- Pool Group -->
+  <g filter="url(#soft-shadow)">
+    <rect x="290" y="210" width="280" height="60" rx="6" fill="#fff" stroke="#0288d1" stroke-width="2"/>
+    <text x="430" y="233" text-anchor="middle" font-size="13" font-weight="600" fill="#01579b">Pool Group</text>
+    <text x="430" y="252" text-anchor="middle" font-size="11" fill="#627d98">per-request weighted pick · ratios vary</text>
+  </g>
+
+  <!-- Pool 1 -->
+  <g filter="url(#soft-shadow)">
+    <rect x="290" y="300" width="130" height="70" rx="6" fill="#fff" stroke="#0288d1" stroke-width="2"/>
+    <text x="355" y="322" text-anchor="middle" font-size="12" font-weight="600" fill="#01579b">Pool: pod-1</text>
+    <text x="355" y="340" text-anchor="middle" font-size="10" fill="#37474f">172.30.0.35:61006</text>
+    <text x="355" y="356" text-anchor="middle" font-size="10" fill="#78909c">ratio 50</text>
+  </g>
+
+  <!-- Pool 2 -->
+  <g filter="url(#soft-shadow)">
+    <rect x="440" y="300" width="130" height="70" rx="6" fill="#fff" stroke="#0288d1" stroke-width="2"/>
+    <text x="505" y="322" text-anchor="middle" font-size="12" font-weight="600" fill="#01579b">Pool: pod-2</text>
+    <text x="505" y="340" text-anchor="middle" font-size="10" fill="#37474f">172.30.0.35:61001</text>
+    <text x="505" y="356" text-anchor="middle" font-size="10" fill="#78909c">ratio 50</text>
+  </g>
+
+  <!-- Internal Avi arrows -->
+  <line x1="430" y1="185" x2="430" y2="208" stroke="#1565c0" stroke-width="2" marker-end="url(#arrow-data)"/>
+  <line x1="380" y1="270" x2="355" y2="298" stroke="#1565c0" stroke-width="2" marker-end="url(#arrow-data)"/>
+  <line x1="480" y1="270" x2="505" y2="298" stroke="#1565c0" stroke-width="2" marker-end="url(#arrow-data)"/>
+
+  <!-- K8s Node -->
+  <g filter="url(#soft-shadow)">
+    <rect x="640" y="300" width="170" height="80" rx="6" fill="#fffde7" stroke="#f9a825" stroke-width="2"/>
+    <text x="725" y="324" text-anchor="middle" font-size="12" font-weight="600" fill="#5d4037">K8s Node</text>
+    <text x="725" y="342" text-anchor="middle" font-size="11" fill="#37474f">172.30.0.35</text>
+    <text x="725" y="360" text-anchor="middle" font-size="10" fill="#78909c">Antrea NPL</text>
+    <text x="725" y="373" text-anchor="middle" font-size="10" fill="#78909c">nodePort → podIP:8000</text>
+  </g>
+
+  <!-- Kubernetes Cluster -->
+  <g>
+    <rect x="600" y="450" width="760" height="520" rx="10" fill="#f1f8e9" stroke="#558b2f" stroke-width="2" stroke-dasharray="4,3" opacity="0.4"/>
+    <text x="615" y="470" font-size="12" font-weight="600" fill="#33691e">Kubernetes Cluster</text>
+  </g>
+
+  <!-- namespace: inference -->
+  <g>
+    <rect x="620" y="485" width="360" height="470" rx="8" fill="#fff" stroke="#7cb342" stroke-width="1.5"/>
+    <text x="635" y="505" font-size="11" font-weight="600" fill="#558b2f">namespace: inference</text>
+  </g>
+
+  <!-- Gateway -->
+  <g filter="url(#soft-shadow)">
+    <rect x="640" y="520" width="320" height="50" rx="6" fill="#f3e5f5" stroke="#7b1fa2" stroke-width="2"/>
+    <text x="800" y="542" text-anchor="middle" font-size="12" font-weight="600" fill="#4a148c">Gateway: llm-gateway</text>
+    <text x="800" y="558" text-anchor="middle" font-size="10" fill="#78909c">listener http · attachedRoutes</text>
+  </g>
+
+  <!-- HTTPRoute -->
+  <g filter="url(#soft-shadow)">
+    <rect x="640" y="590" width="320" height="55" rx="6" fill="#f3e5f5" stroke="#7b1fa2" stroke-width="2"/>
+    <text x="800" y="612" text-anchor="middle" font-size="12" font-weight="600" fill="#4a148c">HTTPRoute: llm-route</text>
+    <text x="800" y="628" text-anchor="middle" font-size="10" fill="#78909c">parentRef llm-gateway · backendRef InferencePool</text>
+  </g>
+
+  <!-- InferencePool -->
+  <g filter="url(#soft-shadow)">
+    <rect x="640" y="665" width="320" height="55" rx="6" fill="#f3e5f5" stroke="#7b1fa2" stroke-width="2"/>
+    <text x="800" y="687" text-anchor="middle" font-size="12" font-weight="600" fill="#4a148c">InferencePool: llm-pool</text>
+    <text x="800" y="703" text-anchor="middle" font-size="10" fill="#78909c">podSelector · targetPort 8000</text>
+  </g>
+
+  <!-- vLLM Pod 1 -->
+  <g filter="url(#soft-shadow)">
+    <rect x="640" y="745" width="155" height="95" rx="6" fill="#fff" stroke="#388e3c" stroke-width="2"/>
+    <text x="717" y="767" text-anchor="middle" font-size="12" font-weight="600" fill="#1b5e20">vllm-pod-1</text>
+    <text x="717" y="783" text-anchor="middle" font-size="10" fill="#37474f">192.168.145.50:8000</text>
+    <text x="717" y="800" text-anchor="middle" font-size="9" fill="#78909c">NPL annotation</text>
+    <text x="717" y="813" text-anchor="middle" font-size="9" fill="#78909c">nodePort: 61006</text>
+    <text x="717" y="830" text-anchor="middle" font-size="9" fill="#e65100">exposes /metrics</text>
+  </g>
+
+  <!-- vLLM Pod 2 -->
+  <g filter="url(#soft-shadow)">
+    <rect x="805" y="745" width="155" height="95" rx="6" fill="#fff" stroke="#388e3c" stroke-width="2"/>
+    <text x="882" y="767" text-anchor="middle" font-size="12" font-weight="600" fill="#1b5e20">vllm-pod-2</text>
+    <text x="882" y="783" text-anchor="middle" font-size="10" fill="#37474f">192.168.145.42:8000</text>
+    <text x="882" y="800" text-anchor="middle" font-size="9" fill="#78909c">NPL annotation</text>
+    <text x="882" y="813" text-anchor="middle" font-size="9" fill="#78909c">nodePort: 61001</text>
+    <text x="882" y="830" text-anchor="middle" font-size="9" fill="#e65100">exposes /metrics</text>
+  </g>
+
+  <!-- namespace: avi-system -->
+  <g>
+    <rect x="1000" y="485" width="340" height="470" rx="8" fill="#fff" stroke="#fb8c00" stroke-width="1.5"/>
+    <text x="1015" y="505" font-size="11" font-weight="600" fill="#e65100">namespace: avi-system</text>
+  </g>
+
+  <!-- AKO Pod -->
+  <g filter="url(#soft-shadow)">
+    <rect x="1020" y="525" width="300" height="60" rx="6" fill="#fff3e0" stroke="#f57c00" stroke-width="2"/>
+    <text x="1170" y="548" text-anchor="middle" font-size="12" font-weight="600" fill="#bf360c">AKO Pod (ako-0)</text>
+    <text x="1170" y="567" text-anchor="middle" font-size="10" fill="#78909c">container: ako-gateway-api</text>
+  </g>
+
+  <!-- Translator -->
+  <g filter="url(#soft-shadow)">
+    <rect x="1020" y="600" width="300" height="65" rx="6" fill="#fff3e0" stroke="#f57c00" stroke-width="2"/>
+    <text x="1170" y="622" text-anchor="middle" font-size="12" font-weight="600" fill="#bf360c">Translator</text>
+    <text x="1170" y="638" text-anchor="middle" font-size="10" fill="#37474f">buildInferencePoolMembers</text>
+    <text x="1170" y="654" text-anchor="middle" font-size="9" fill="#78909c">resolveNPLServer · uses InferencePool.TargetPort</text>
+  </g>
+
+  <!-- Scraper -->
+  <g filter="url(#soft-shadow)">
+    <rect x="1020" y="680" width="300" height="65" rx="6" fill="#fff3e0" stroke="#f57c00" stroke-width="2"/>
+    <text x="1170" y="702" text-anchor="middle" font-size="12" font-weight="600" fill="#bf360c">Inference Scraper</text>
+    <text x="1170" y="718" text-anchor="middle" font-size="10" fill="#37474f">15s interval · DisableKeepAlives</text>
+    <text x="1170" y="734" text-anchor="middle" font-size="9" fill="#78909c">GET /metrics on each pod</text>
+  </g>
+
+  <!-- Weights -->
+  <g filter="url(#soft-shadow)">
+    <rect x="1020" y="760" width="300" height="65" rx="6" fill="#fff3e0" stroke="#f57c00" stroke-width="2"/>
+    <text x="1170" y="782" text-anchor="middle" font-size="12" font-weight="600" fill="#bf360c">WeightStore + ComputeWeights</text>
+    <text x="1170" y="798" text-anchor="middle" font-size="10" fill="#37474f">load = waiting + α·kv_cache + β·tokens</text>
+    <text x="1170" y="814" text-anchor="middle" font-size="9" fill="#78909c">ratio = round(100 · 1/load / Σ scores)</text>
+  </g>
+
+  <!-- Pod-event handler -->
+  <g filter="url(#soft-shadow)">
+    <rect x="1020" y="840" width="300" height="65" rx="6" fill="#fff3e0" stroke="#f57c00" stroke-width="2"/>
+    <text x="1170" y="862" text-anchor="middle" font-size="12" font-weight="600" fill="#bf360c">Pod Event Handler</text>
+    <text x="1170" y="878" text-anchor="middle" font-size="10" fill="#37474f">HandlePodEvent · ReEnqueueRoutesForPodIP</text>
+    <text x="1170" y="894" text-anchor="middle" font-size="9" fill="#78909c">add/update/delete → re-reconcile pool</text>
+  </g>
+
+  <!-- DATA PATH ARROWS (solid blue) -->
+  <line x1="210" y1="130" x2="287" y2="148" stroke="#1565c0" stroke-width="2.5" marker-end="url(#arrow-data)"/>
+  <text x="232" y="125" font-size="10" fill="#1565c0" font-weight="600">1. HTTP request</text>
+
+  <!-- Pool to Node -->
+  <line x1="430" y1="372" x2="638" y2="330" stroke="#1565c0" stroke-width="2.5" marker-end="url(#arrow-data)"/>
+  <text x="500" y="370" font-size="10" fill="#1565c0" font-weight="600">2. forward to nodeIP:nplPort</text>
+
+  <!-- Node to pods -->
+  <line x1="725" y1="382" x2="717" y2="743" stroke="#1565c0" stroke-width="2.5" marker-end="url(#arrow-data)" stroke-dasharray="6,3"/>
+  <line x1="755" y1="382" x2="850" y2="743" stroke="#1565c0" stroke-width="2.5" marker-end="url(#arrow-data)" stroke-dasharray="6,3"/>
+  <text x="780" y="430" font-size="10" fill="#1565c0" font-weight="600">3. Antrea NAT</text>
+  <text x="780" y="443" font-size="10" fill="#1565c0" font-weight="600">   → podIP:8000</text>
+
+  <!-- CONTROL PATH: AKO REST API to Avi -->
+  <path d="M 1020 555 Q 850 60 460 100" stroke="#37474f" stroke-width="2" fill="none" marker-end="url(#arrow)" stroke-dasharray="8,4"/>
+  <text x="850" y="80" text-anchor="middle" font-size="10" fill="#37474f" font-weight="600">REST API · programs VS / Pool / PG</text>
+
+  <!-- AKO watches HTTPRoute/Gateway/InferencePool (control plane) -->
+  <line x1="1020" y1="555" x2="965" y2="615" stroke="#78909c" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow-dashed)"/>
+  <text x="980" y="582" font-size="9" fill="#78909c">watches</text>
+
+  <!-- Pod event handler watches pods -->
+  <line x1="1020" y1="870" x2="965" y2="800" stroke="#78909c" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow-dashed)"/>
+
+  <!-- Scraper to pods (orange) -->
+  <line x1="1020" y1="720" x2="965" y2="780" stroke="#e65100" stroke-width="2" stroke-dasharray="5,3" marker-end="url(#arrow-scrape)"/>
+  <text x="970" y="755" font-size="10" fill="#e65100" font-weight="600">GET /metrics</text>
+
+  <!-- HTTPRoute → InferencePool -->
+  <line x1="800" y1="645" x2="800" y2="663" stroke="#78909c" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow-dashed)"/>
+
+  <!-- InferencePool → pods (selector matches) -->
+  <line x1="730" y1="720" x2="717" y2="743" stroke="#78909c" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow-dashed)"/>
+  <line x1="870" y1="720" x2="882" y2="743" stroke="#78909c" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow-dashed)"/>
+  <text x="800" y="738" text-anchor="middle" font-size="9" fill="#78909c">selector matches</text>
+
+  <!-- Gateway → HTTPRoute -->
+  <line x1="800" y1="570" x2="800" y2="588" stroke="#78909c" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow-dashed)"/>
+
+  <!-- Internal AKO wiring -->
+  <line x1="1170" y1="745" x2="1170" y2="758" stroke="#bf360c" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="1170" y1="665" x2="1170" y2="678" stroke="#bf360c" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="1170" y1="585" x2="1170" y2="598" stroke="#bf360c" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="1170" y1="825" x2="1170" y2="838" stroke="#bf360c" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Legend -->
+  <g transform="translate(50, 870)">
+    <rect x="0" y="0" width="500" height="110" rx="6" fill="#fff" stroke="#cfd8dc" stroke-width="1"/>
+    <text x="15" y="22" font-size="11" font-weight="600" fill="#37474f">Legend</text>
+
+    <line x1="15" y1="40" x2="55" y2="40" stroke="#1565c0" stroke-width="2.5"/>
+    <text x="65" y="44" font-size="10" fill="#37474f">Data path (user request)</text>
+
+    <line x1="15" y1="60" x2="55" y2="60" stroke="#37474f" stroke-width="2" stroke-dasharray="8,4"/>
+    <text x="65" y="64" font-size="10" fill="#37474f">AKO → Avi REST API (control)</text>
+
+    <line x1="15" y1="80" x2="55" y2="80" stroke="#e65100" stroke-width="2" stroke-dasharray="5,3"/>
+    <text x="65" y="84" font-size="10" fill="#37474f">Scrape (pod /metrics)</text>
+
+    <line x1="260" y1="40" x2="300" y2="40" stroke="#78909c" stroke-width="1.5" stroke-dasharray="4,3"/>
+    <text x="310" y="44" font-size="10" fill="#37474f">Watches / references (K8s API)</text>
+
+    <text x="260" y="64" font-size="10" font-weight="600" fill="#1b5e20">Green</text>
+    <text x="295" y="64" font-size="10" fill="#37474f">Workload pods (vLLM)</text>
+
+    <text x="260" y="84" font-size="10" font-weight="600" fill="#4a148c">Purple</text>
+    <text x="295" y="84" font-size="10" fill="#37474f">Gateway API CRDs</text>
+
+    <text x="260" y="104" font-size="10" font-weight="600" fill="#bf360c">Orange</text>
+    <text x="295" y="104" font-size="10" fill="#37474f">AKO controller components</text>
+  </g>
+</svg>
