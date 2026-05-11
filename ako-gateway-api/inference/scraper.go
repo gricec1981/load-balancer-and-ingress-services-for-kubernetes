@@ -93,6 +93,9 @@ func NewScraper(intervalSeconds int, alpha, beta float64, onUpdate OnWeightsUpda
 		onUpdate: onUpdate,
 		client: &http.Client{
 			Timeout: scrapeTimeout,
+			Transport: &http.Transport{
+				DisableKeepAlives: true,
+			},
 		},
 	}
 }
