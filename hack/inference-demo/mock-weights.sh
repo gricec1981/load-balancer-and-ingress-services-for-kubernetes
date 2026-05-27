@@ -1,30 +1,23 @@
 #!/usr/bin/env bash
-# mock-weights.sh — quickly change the simulated load profile of a demo vLLM pod
-# so the AKO inference scraper picks up different metrics and re-weights the Avi
-# Pool Group members within one scrape interval (~15 s).
+# mock-weights.sh — change the simulated load profile of a demo vLLM pod
+# WITHOUT restarting it, by POSTing to the pod's /admin HTTP endpoint.
 #
 # Usage:
 #   mock-weights.sh <preset> <pod-number>
 #   mock-weights.sh show
 #   mock-weights.sh reset [pod-number]
 #
-# Presets (all values are env-vars read by the pod's mock-vllm container):
+# Presets:
+#   idle      waiting=0  kv_cache=0.05  token_rate=200   → best score, highest ratio
+#   normal    waiting=3  kv_cache=0.40  token_rate=100   → mid score
+#   overload  waiting=20 kv_cache=0.80  token_rate=50    → worst score, lowest ratio
 #
-#   idle      WAITING=0  KV_CACHE=0.05  TOKEN_RATE=200   → best score, highest ratio
-#   normal    WAITING=3  KV_CACHE=0.40  TOKEN_RATE=100   → mid score
-#   overload  WAITING=20 KV_CACHE=0.80  TOKEN_RATE=50    → worst score, lowest ratio
+# reset pushes the env-var defaults from the Deployment spec back into the
+# running pod so the runtime state matches the declared spec (no restart).
 #
-# reset restores the original demo defaults per pod:
-#   mock-1  WAITING=20  KV_CACHE=0.80  TOKEN_RATE=100
-#   mock-2  WAITING=5   KV_CACHE=0.80  TOKEN_RATE=50
-#   mock-3  WAITING=0   KV_CACHE=0.10  TOKEN_RATE=200
-#
-# Expected approximate ratios (3 pods, alpha=0.5 beta=0.3 epsilon=1):
+# Expected approximate ratios (3 pods, alpha=1.0 beta=1.0 epsilon=1):
 #   idle / normal / overload  →  ~83 / 12 / 5
-#   overload / normal / idle  →  ~5  / 12 / 83
-#   demo defaults (1/2/3)     →  ~7  / 21 / 72
-#
-# Requirements: kubectl, access to the cluster, and KUBECONFIG set if non-default.
+#   demo defaults (1/2/3)     →  varies with each pod's env vars
 
 set -euo pipefail
 
@@ -38,38 +31,66 @@ usage() {
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
-# Preset definitions
+# Helper — POST JSON to a pod's /admin endpoint via kubectl exec (no direct
+# network access to pod overlay IPs required from the jump box).
 # ---------------------------------------------------------------------------
-preset_env() {
-  local preset="$1"
-  case "$preset" in
-    idle)     echo "WAITING=0  KV_CACHE=0.05 TOKEN_RATE=200" ;;
-    normal)   echo "WAITING=3  KV_CACHE=0.40 TOKEN_RATE=100" ;;
-    overload) echo "WAITING=20 KV_CACHE=0.80 TOKEN_RATE=50"  ;;
-    *) die "unknown preset '$preset'. Choose: idle | normal | overload" ;;
+admin_post() {
+  local pod_num="$1"
+  local json="$2"
+
+  local pod_name
+  pod_name="$(kubectl get pod -n "${NAMESPACE}" \
+    -l "app=vllm-mock,pod=${pod_num}" \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+  [[ -z "$pod_name" ]] && die "no running pod found for vllm-mock-${pod_num} in namespace '${NAMESPACE}'"
+
+  local result
+  result=$(kubectl exec -n "${NAMESPACE}" "${pod_name}" -- \
+    python3 -c "
+import urllib.request, json, sys
+req = urllib.request.Request(
+    'http://127.0.0.1:8000/admin',
+    data=json.dumps(${json}).encode(),
+    headers={'Content-Type': 'application/json'},
+    method='POST')
+resp = urllib.request.urlopen(req, timeout=5)
+print(resp.read().decode())
+" 2>&1) || die "admin POST failed for ${pod_name}: ${result}"
+
+  echo "  → ${pod_name}: ${json}"
+  echo "  → ${result}"
+}
+
+# ---------------------------------------------------------------------------
+# Preset definitions (Python dict literals passed directly into the exec)
+# ---------------------------------------------------------------------------
+preset_dict() {
+  case "$1" in
+    idle)     echo '{"waiting":0,"kv_cache":0.05,"token_rate":200}' ;;
+    normal)   echo '{"waiting":3,"kv_cache":0.40,"token_rate":100}' ;;
+    overload) echo '{"waiting":20,"kv_cache":0.80,"token_rate":50}' ;;
+    *) die "unknown preset '$1'. Choose: idle | normal | overload" ;;
   esac
 }
 
-# Original demo defaults per pod (used by 'reset')
-reset_env() {
-  local pod="$1"
-  case "$pod" in
-    1) echo "WAITING=20 KV_CACHE=0.80 TOKEN_RATE=100" ;;
-    2) echo "WAITING=5  KV_CACHE=0.80 TOKEN_RATE=50"  ;;
-    3) echo "WAITING=0  KV_CACHE=0.10 TOKEN_RATE=200" ;;
-    *) die "unknown pod number '$pod'. Choose: 1 | 2 | 3" ;;
-  esac
-}
+# reset_dict reads the env vars from the Deployment spec so the running state
+# matches what's declared (no need to hardcode defaults here).
+reset_dict() {
+  local pod_num="$1"
+  local dep="vllm-mock-${pod_num}"
 
-# Apply env vars from a space-separated KEY=VALUE string to a deployment.
-apply_env() {
-  local deployment="$1"
-  local env_str="$2"
-  # Convert "WAITING=0 KV_CACHE=0.05 TOKEN_RATE=200" → separate args
-  # shellcheck disable=SC2086
-  kubectl set env "deployment/${deployment}" -n "${NAMESPACE}" ${env_str}
-  echo "  → ${deployment}: ${env_str}"
-  echo "  (pod will roll; new metrics picked up within the next scrape interval)"
+  local waiting kv rate
+  waiting=$(kubectl get deployment "${dep}" -n "${NAMESPACE}" \
+    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="WAITING")].value}' 2>/dev/null)
+  kv=$(kubectl get deployment "${dep}" -n "${NAMESPACE}" \
+    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="KV_CACHE")].value}' 2>/dev/null)
+  rate=$(kubectl get deployment "${dep}" -n "${NAMESPACE}" \
+    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="TOKEN_RATE")].value}' 2>/dev/null)
+
+  [[ -z "$waiting" || -z "$kv" || -z "$rate" ]] && \
+    die "could not read env vars from deployment/${dep}"
+
+  echo "{\"waiting\":${waiting},\"kv_cache\":${kv},\"token_rate\":${rate}}"
 }
 
 # ---------------------------------------------------------------------------
@@ -80,15 +101,21 @@ cmd_show() {
   kubectl get pods -n "${NAMESPACE}" \
     -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,IP:.status.podIP,NODE:.status.hostIP,READY:.status.containerStatuses[0].ready'
   echo
-  echo "=== Deployment env vars ==="
+  echo "=== Live runtime state (from /admin) ==="
   for i in 1 2 3; do
-    local dep="vllm-mock-${i}"
-    if kubectl get deployment "${dep}" -n "${NAMESPACE}" &>/dev/null; then
-      printf "%-14s  " "${dep}"
-      kubectl set env deployment/"${dep}" -n "${NAMESPACE}" --list 2>/dev/null \
-        | grep -E 'WAITING|KV_CACHE|TOKEN_RATE' | tr '\n' '  '
-      echo
-    fi
+    local pod_name
+    pod_name="$(kubectl get pod -n "${NAMESPACE}" \
+      -l "app=vllm-mock,pod=${i}" \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+    [[ -z "$pod_name" ]] && { printf "vllm-mock-%-2s  (not found)\n" "${i}"; continue; }
+    local state
+    state=$(kubectl exec -n "${NAMESPACE}" "${pod_name}" -- \
+      python3 -c "
+import urllib.request
+resp = urllib.request.urlopen('http://127.0.0.1:8000/admin', timeout=3)
+print(resp.read().decode())
+" 2>/dev/null || echo '{"error":"unreachable"}')
+    printf "vllm-mock-%-2s  %s\n" "${i}" "${state}"
   done
 }
 
@@ -96,24 +123,24 @@ cmd_preset() {
   local preset="$1"
   local pod_num="$2"
   [[ "$pod_num" =~ ^[123]$ ]] || die "pod number must be 1, 2, or 3 (got '$pod_num')"
-  local env_str
-  env_str="$(preset_env "$preset")"
-  echo "Setting mock-${pod_num} → preset '${preset}'"
-  apply_env "vllm-mock-${pod_num}" "${env_str}"
+  echo "Setting mock-${pod_num} → preset '${preset}' (no restart)"
+  admin_post "${pod_num}" "$(preset_dict "$preset")"
+  echo "  (takes effect on next scrape cycle, ~15 s)"
 }
 
 cmd_reset() {
   local pod_num="${1:-}"
   if [[ -z "$pod_num" ]]; then
-    echo "Resetting all pods to demo defaults…"
+    echo "Resetting all pods to their Deployment env-var defaults (no restart)…"
     for i in 1 2 3; do
-      apply_env "vllm-mock-${i}" "$(reset_env "$i")"
+      admin_post "${i}" "$(reset_dict "$i")"
     done
   else
     [[ "$pod_num" =~ ^[123]$ ]] || die "pod number must be 1, 2, or 3 (got '$pod_num')"
-    echo "Resetting mock-${pod_num} to demo default…"
-    apply_env "vllm-mock-${pod_num}" "$(reset_env "$pod_num")"
+    echo "Resetting mock-${pod_num} to its Deployment env-var default (no restart)…"
+    admin_post "${pod_num}" "$(reset_dict "$pod_num")"
   fi
+  echo "  (takes effect on next scrape cycle, ~15 s)"
 }
 
 # ---------------------------------------------------------------------------
