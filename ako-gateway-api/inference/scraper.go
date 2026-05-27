@@ -73,6 +73,15 @@ type poolScrapeState struct {
 	// snapshots holds the previous counter values per pod IP, used to compute
 	// token throughput rates as (Δcounter / Δtime).
 	snapshots map[string]podCounterSnapshot
+	// podJitter holds a stable random delay per pod IP, assigned once when the
+	// pod first appears in the pool. Keeping it stable across scrape cycles
+	// ensures the dt denominator in token-rate calculations is not perturbed
+	// by re-rolling the offset on every cycle.
+	podJitter map[string]time.Duration
+	// lastEmittedWeights is the weights slice most recently passed to onUpdate.
+	// nil means onUpdate has not yet been called for this pool. Used to suppress
+	// redundant Avi PoolGroup writes when computed weights are unchanged.
+	lastEmittedWeights []WeightedPod
 }
 
 // NewScraper creates a Scraper with the given interval (seconds), alpha, and beta.
@@ -111,6 +120,7 @@ func (s *Scraper) RegisterPool(nsName string, port int32, podIPs []string) {
 		// Update pod list in-place; the running goroutine picks it up on next cycle.
 		existing.podIPs = podIPs
 		existing.port = port
+		syncPodJitter(existing.podJitter, podIPs)
 		return
 	}
 
@@ -121,7 +131,9 @@ func (s *Scraper) RegisterPool(nsName string, port int32, podIPs []string) {
 		podIPs:    podIPs,
 		cancel:    cancel,
 		snapshots: make(map[string]podCounterSnapshot),
+		podJitter: make(map[string]time.Duration),
 	}
+	syncPodJitter(state.podJitter, podIPs)
 	s.pools[nsName] = state
 	go s.scrapeLoop(ctx, state)
 }
@@ -156,6 +168,7 @@ func (s *Scraper) UpdatePods(nsName string, podIPs []string) {
 	defer s.mu.Unlock()
 	if state, ok := s.pools[nsName]; ok {
 		state.podIPs = podIPs
+		syncPodJitter(state.podJitter, podIPs)
 	}
 }
 
@@ -180,13 +193,19 @@ func (s *Scraper) scrapeLoop(ctx context.Context, state *poolScrapeState) {
 			for k, v := range state.snapshots {
 				snapshots[k] = v
 			}
+			// Copy jitter map so goroutines in scrapeAllPods can read it without
+			// holding s.mu across the HTTP scrape.
+			jitterByPod := make(map[string]time.Duration, len(state.podJitter))
+			for k, v := range state.podJitter {
+				jitterByPod[k] = v
+			}
 			s.mu.Unlock()
 
 			if len(podIPs) == 0 {
 				continue
 			}
 
-			results, newSnapshots := s.scrapeAllPods(ctx, podIPs, port, snapshots)
+			results, newSnapshots := s.scrapeAllPods(ctx, podIPs, port, snapshots, jitterByPod)
 
 			// Persist updated snapshots back into state.
 			s.mu.Lock()
@@ -196,8 +215,22 @@ func (s *Scraper) scrapeLoop(ctx context.Context, state *poolScrapeState) {
 			s.mu.Unlock()
 
 			weights := ComputeWeights(results, s.alpha, s.beta)
-			utils.AviLog.Debugf("inference scraper: pool %s weights updated: %+v", nsName, weights)
-			s.onUpdate(nsName, weights)
+
+			// Only call onUpdate when weights actually changed to avoid
+			// redundant Avi PoolGroup writes on every scrape cycle.
+			s.mu.Lock()
+			changed := !weightsEqual(weights, state.lastEmittedWeights)
+			if changed {
+				state.lastEmittedWeights = weights
+			}
+			s.mu.Unlock()
+
+			if changed {
+				utils.AviLog.Debugf("inference scraper: pool %s weights updated: %+v", nsName, weights)
+				s.onUpdate(nsName, weights)
+			} else {
+				utils.AviLog.Debugf("inference scraper: pool %s weights unchanged, skipping update", nsName)
+			}
 		}
 	}
 }
@@ -207,6 +240,7 @@ func (s *Scraper) scrapeAllPods(
 	podIPs []string,
 	port int32,
 	prevSnapshots map[string]podCounterSnapshot,
+	jitterByPod map[string]time.Duration,
 ) ([]PodMetrics, map[string]podCounterSnapshot) {
 	type result struct {
 		idx      int
@@ -223,8 +257,9 @@ func (s *Scraper) scrapeAllPods(
 		wg.Add(1)
 		go func(idx int, podIP string) {
 			defer wg.Done()
-			// Add random jitter to avoid thundering herd across pods.
-			jitter := time.Duration(rand.Intn(maxJitterMs)) * time.Millisecond //nolint:gosec
+			// Use the stable per-pod jitter offset to spread scrapes across
+			// the interval without re-randomising dt on each cycle.
+			jitter := jitterByPod[podIP]
 			select {
 			case <-time.After(jitter):
 			case <-ctx.Done():
@@ -332,6 +367,40 @@ func max0(v float64) float64 {
 		return 0
 	}
 	return v
+}
+
+// weightsEqual reports whether a and b represent identical weight assignments.
+// Comparison is order-sensitive: ComputeWeights always returns results in the
+// same order as its input slice (which mirrors podIPs, stable between cycles
+// for a given pool). A multiset comparison is therefore not needed.
+func weightsEqual(a, b []WeightedPod) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].PodIP != b[i].PodIP || a[i].Ratio != b[i].Ratio {
+			return false
+		}
+	}
+	return true
+}
+
+// syncPodJitter assigns a stable random jitter to every IP in podIPs that does
+// not already have an entry, and prunes entries for IPs no longer present.
+// Must be called with s.mu held.
+func syncPodJitter(jitter map[string]time.Duration, podIPs []string) {
+	seen := make(map[string]struct{}, len(podIPs))
+	for _, ip := range podIPs {
+		seen[ip] = struct{}{}
+		if _, ok := jitter[ip]; !ok {
+			jitter[ip] = time.Duration(rand.Intn(maxJitterMs)) * time.Millisecond //nolint:gosec
+		}
+	}
+	for ip := range jitter {
+		if _, ok := seen[ip]; !ok {
+			delete(jitter, ip)
+		}
+	}
 }
 
 func parsePrometheusMetrics(r io.Reader) (map[string]*dto.MetricFamily, error) {
