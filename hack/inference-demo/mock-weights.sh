@@ -15,9 +15,9 @@
 #   overload  WAITING=20 KV_CACHE=0.80  TOKEN_RATE=50    → worst score, lowest ratio
 #
 # reset restores the original demo defaults per pod:
-#   pod-1  WAITING=20  KV_CACHE=0.80  TOKEN_RATE=100
-#   pod-2  WAITING=5   KV_CACHE=0.80  TOKEN_RATE=50
-#   pod-3  WAITING=0   KV_CACHE=0.10  TOKEN_RATE=200
+#   mock-1  WAITING=20  KV_CACHE=0.80  TOKEN_RATE=100
+#   mock-2  WAITING=5   KV_CACHE=0.80  TOKEN_RATE=50
+#   mock-3  WAITING=0   KV_CACHE=0.10  TOKEN_RATE=200
 #
 # Expected approximate ratios (3 pods, alpha=0.5 beta=0.3 epsilon=1):
 #   idle / normal / overload  →  ~83 / 12 / 5
@@ -77,12 +77,12 @@ apply_env() {
 # ---------------------------------------------------------------------------
 cmd_show() {
   echo "=== Inference pods in namespace '${NAMESPACE}' ==="
-  kubectl get pods -n "${NAMESPACE}" -l app=vllm \
+  kubectl get pods -n "${NAMESPACE}" \
     -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,IP:.status.podIP,NODE:.status.hostIP,READY:.status.containerStatuses[0].ready'
   echo
   echo "=== Deployment env vars ==="
   for i in 1 2 3; do
-    local dep="vllm-pod-${i}"
+    local dep="vllm-mock-${i}"
     if kubectl get deployment "${dep}" -n "${NAMESPACE}" &>/dev/null; then
       printf "%-14s  " "${dep}"
       kubectl set env deployment/"${dep}" -n "${NAMESPACE}" --list 2>/dev/null \
@@ -98,8 +98,8 @@ cmd_preset() {
   [[ "$pod_num" =~ ^[123]$ ]] || die "pod number must be 1, 2, or 3 (got '$pod_num')"
   local env_str
   env_str="$(preset_env "$preset")"
-  echo "Setting pod-${pod_num} → preset '${preset}'"
-  apply_env "vllm-pod-${pod_num}" "${env_str}"
+  echo "Setting mock-${pod_num} → preset '${preset}'"
+  apply_env "vllm-mock-${pod_num}" "${env_str}"
 }
 
 cmd_reset() {
@@ -107,12 +107,12 @@ cmd_reset() {
   if [[ -z "$pod_num" ]]; then
     echo "Resetting all pods to demo defaults…"
     for i in 1 2 3; do
-      apply_env "vllm-pod-${i}" "$(reset_env "$i")"
+      apply_env "vllm-mock-${i}" "$(reset_env "$i")"
     done
   else
     [[ "$pod_num" =~ ^[123]$ ]] || die "pod number must be 1, 2, or 3 (got '$pod_num')"
-    echo "Resetting pod-${pod_num} to demo default…"
-    apply_env "vllm-pod-${pod_num}" "$(reset_env "$pod_num")"
+    echo "Resetting mock-${pod_num} to demo default…"
+    apply_env "vllm-mock-${pod_num}" "$(reset_env "$pod_num")"
   fi
 }
 
