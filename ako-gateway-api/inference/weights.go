@@ -28,15 +28,20 @@ const (
 // ComputeWeights converts a slice of PodMetrics into Avi pool group member
 // ratios using an inverse-load scoring function:
 //
-//	load(pod)  = waiting
+//	load(pod)  = (waiting / maxWaiting_across_pods)
 //	           + alpha * kv_cache_perc
 //	           + beta  * (totalTokensPerSec / maxTokensPerSec_across_pods)
 //	score(pod) = 1 / (load + epsilon)
 //	ratio(pod) = round(100 * score / sum(scores))
 //
-// The token throughput term is normalised by the highest observed rate in the
-// pool so the contribution is always in [0, 1], making beta directly
-// comparable to alpha and the waiting queue depth.
+// All three terms are normalised against the pool maximum so each lives on
+// [0, 1]. This makes alpha and beta directly comparable to the queue-depth
+// signal: a value of 1.0 for any coefficient weights that signal equally with
+// a fully-saturated waiting queue or a fully-loaded token pipeline.
+//
+// When the pool-wide maximum of a signal is zero (e.g. no pod has any queued
+// requests) that term contributes 0 to avoid division by zero, matching the
+// idle-pool behaviour of the previous formula.
 //
 // Pods that are unreachable receive the minimum ratio (1) so they still
 // receive some traffic while health monitors decide whether to remove them.
@@ -48,12 +53,20 @@ func ComputeWeights(metrics []PodMetrics, alpha, beta float64) []WeightedPod {
 		return nil
 	}
 
-	// Find the maximum token rate across reachable pods for normalisation.
-	// If all pods are idle (rate = 0) normalisation is skipped (div-by-zero guard).
+	// Single pass: find the per-signal pool maxima across reachable pods for
+	// normalisation. When a maximum is zero the corresponding term is zeroed
+	// (div-by-zero guard) so idle pools still produce near-equal ratios.
 	maxTokenRate := 0.0
+	maxWaiting := 0.0
 	for _, m := range metrics {
-		if m.Reachable && m.TotalTokensPerSec > maxTokenRate {
+		if !m.Reachable {
+			continue
+		}
+		if m.TotalTokensPerSec > maxTokenRate {
 			maxTokenRate = m.TotalTokensPerSec
+		}
+		if m.NumRequestsWaiting > maxWaiting {
+			maxWaiting = m.NumRequestsWaiting
 		}
 	}
 
@@ -68,13 +81,19 @@ func ComputeWeights(metrics []PodMetrics, alpha, beta float64) []WeightedPod {
 			continue
 		}
 
+		// Normalised waiting queue depth: high queue → high load → lower score.
+		waitingLoad := 0.0
+		if maxWaiting > 0 {
+			waitingLoad = m.NumRequestsWaiting / maxWaiting
+		}
+
 		// Normalised token throughput: high throughput → high load → lower score.
 		tokenLoad := 0.0
 		if beta > 0 && maxTokenRate > 0 {
 			tokenLoad = beta * (m.TotalTokensPerSec / maxTokenRate)
 		}
 
-		load := m.NumRequestsWaiting + alpha*m.KVCacheUsagePerc + tokenLoad
+		load := waitingLoad + alpha*m.KVCacheUsagePerc + tokenLoad
 		scores[i] = 1.0 / (load + epsilon)
 		totalScore += scores[i]
 	}
