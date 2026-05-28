@@ -30,6 +30,7 @@ import (
 	gatewayclientset "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
 	gatewayexternalversions "sigs.k8s.io/gateway-api/pkg/client/informers/externalversions"
 
+	akogatewayapiinference "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/inference"
 	akogatewayapilib "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/lib"
 	akogatewayapiobjects "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/objects"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/internal/k8s"
@@ -142,6 +143,12 @@ func (c *GatewayController) Start(stopCh <-chan struct{}) {
 		utils.AviLog.Warnf("Skipping CRD informers setup as AKO CRD Operator is not enabled")
 	}
 
+	// Start InferencePool informer when the inference extension is enabled.
+	if lib.IsInferenceExtensionEnabled() && c.dynamicInformers.InferencePoolInformer != nil {
+		go c.dynamicInformers.InferencePoolInformer.Informer().Run(stopCh)
+		informersList = append(informersList, c.dynamicInformers.InferencePoolInformer.Informer().HasSynced)
+	}
+
 	if !cache.WaitForCacheSync(stopCh, informersList...) {
 		runtime.HandleError(fmt.Errorf("timed out waiting for caches to sync"))
 	} else {
@@ -234,6 +241,12 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 					return
 				}
 				pod := obj.(*corev1.Pod)
+				// Notify the inference controller about the new pod so it can
+				// re-reconcile any InferencePool whose selector matches, regardless
+				// of whether the NPL annotation is present yet.
+				if inferenceCtrl := akogatewayapiinference.SharedInferenceController(); inferenceCtrl != nil {
+					inferenceCtrl.HandlePodEvent(pod)
+				}
 				namespace, _, _ := cache.SplitMetaNamespaceKey(utils.ObjKey(pod))
 				key := utils.Pod + "/" + utils.ObjKey(pod)
 				if lib.IsNamespaceBlocked(namespace) {
@@ -270,6 +283,11 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 						return
 					}
 				}
+				// Notify the inference controller so deleted pods are removed from
+				// InferencePool membership before the NPL annotation check below.
+				if inferenceCtrl := akogatewayapiinference.SharedInferenceController(); inferenceCtrl != nil {
+					inferenceCtrl.HandlePodEvent(pod)
+				}
 				namespace, _, _ := cache.SplitMetaNamespaceKey(utils.ObjKey(pod))
 				key := utils.Pod + "/" + utils.ObjKey(pod)
 				if lib.IsNamespaceBlocked(namespace) {
@@ -291,6 +309,11 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 				}
 				oldPod := old.(*corev1.Pod)
 				newPod := cur.(*corev1.Pod)
+				// Notify the inference controller so any InferencePool matching
+				// this pod's labels is re-reconciled with the updated pod state.
+				if inferenceCtrl := akogatewayapiinference.SharedInferenceController(); inferenceCtrl != nil {
+					inferenceCtrl.HandlePodEvent(newPod)
+				}
 				key := utils.Pod + "/" + utils.ObjKey(oldPod)
 				namespace, _, _ := cache.SplitMetaNamespaceKey(utils.ObjKey(newPod))
 				if lib.IsNamespaceBlocked(namespace) {
@@ -301,21 +324,29 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 					utils.AviLog.Warnf("key : %s, msg: 'nodeportlocal.antrea.io' annotation not found, ignoring the pod", key)
 					return
 				}
-				for _, container := range newPod.Status.ContainerStatuses {
-					if !container.Ready {
-						if container.State.Terminated != nil {
-							utils.AviLog.Warnf("key : %s, msg: Container %s is in terminated state, ignoring pod update", key, container.Name)
-							return
-						}
-						if container.State.Waiting != nil && container.State.Waiting.Reason == "CrashLoopBackOff" {
-							utils.AviLog.Warnf("key : %s, msg: Container %s is in CrashLoopBackOff state, ignoring pod update", key, container.Name)
-							return
-						}
+			for _, container := range newPod.Status.ContainerStatuses {
+				if !container.Ready {
+					if container.State.Terminated != nil {
+						utils.AviLog.Warnf("key : %s, msg: Container %s is in terminated state, ignoring pod update", key, container.Name)
+						return
+					}
+					if container.State.Waiting != nil && container.State.Waiting.Reason == "CrashLoopBackOff" {
+						utils.AviLog.Warnf("key : %s, msg: Container %s is in CrashLoopBackOff state, ignoring pod update", key, container.Name)
+						return
 					}
 				}
-				bkt := utils.Bkt(namespace, numWorkers)
-				c.workqueue[bkt].AddRateLimited(key)
-				utils.AviLog.Debugf("key: %s, msg: UPDATE", key)
+			}
+			// Re-enqueue InferencePool-backed routes when the NPL annotation
+			// changes so the translator can re-resolve the node IP/port mapping.
+			if newPod.Status.PodIP != "" &&
+				oldPod.GetAnnotations()[lib.NPLPodAnnotation] != newPod.GetAnnotations()[lib.NPLPodAnnotation] {
+				if inferenceCtrl := akogatewayapiinference.SharedInferenceController(); inferenceCtrl != nil {
+					inferenceCtrl.ReEnqueueRoutesForPodIP(newPod.Status.PodIP)
+				}
+			}
+			bkt := utils.Bkt(namespace, numWorkers)
+			c.workqueue[bkt].AddRateLimited(key)
+			utils.AviLog.Debugf("key: %s, msg: UPDATE", key)
 			},
 		}
 		c.informers.PodInformer.Informer().AddEventHandler(podEventHandler)
@@ -470,6 +501,22 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 	if c.informers.NSInformer != nil {
 		namespaceEventHandler := addNamespaceAnnotationEventHandler(numWorkers, c)
 		c.informers.NSInformer.Informer().AddEventHandler(namespaceEventHandler)
+	}
+
+	// Initialise the InferencePool controller and its event handlers when the
+	// inference extension feature flag is enabled.
+	if lib.IsInferenceExtensionEnabled() && c.dynamicInformers.InferencePoolInformer != nil {
+		inferenceCtrl := akogatewayapiinference.InitController(
+			akogatewayapilib.GetDynamicClientSet(),
+			c.dynamicInformers.InferencePoolInformer,
+			c.workqueue,
+			numWorkers,
+			lib.GetInferenceScrapeInterval(),
+			lib.GetInferenceAlphaKVCache(),
+			lib.GetInferenceBetaTokenRate(),
+		)
+		inferenceCtrl.SetupEventHandlers()
+		utils.AviLog.Infof("Inference extension controller initialised (scrape interval=%ds)", lib.GetInferenceScrapeInterval())
 	}
 }
 

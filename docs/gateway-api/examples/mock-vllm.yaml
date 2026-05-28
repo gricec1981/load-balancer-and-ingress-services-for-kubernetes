@@ -1,0 +1,130 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: inference
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-pod-1
+  namespace: inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+      pod: "1"
+  template:
+    metadata:
+      labels:
+        app: vllm
+        pod: "1"
+      annotations:
+        nodeportlocal.antrea.io/enabled: "true"
+    spec:
+      containers:
+      - name: mock-vllm
+        image: dockerhub.packages.vcfd.broadcom.net/alpine:3.19
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            WAITING=${WAITING:-0}
+            KV=${KV_CACHE:-0.1}
+            GEN=0
+            while true; do
+              GEN=$((GEN + ${TOKEN_RATE:-100}))
+              BODY="vllm:num_requests_waiting ${WAITING}
+            vllm:kv_cache_usage_perc ${KV}
+            vllm:num_requests_running 1
+            vllm:generation_tokens_total ${GEN}
+            vllm:prompt_tokens_total 0"
+              printf "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n%s\n" "$BODY" | nc -l -p 8000
+            done
+        env:
+        - name: WAITING
+          value: "0"
+        - name: KV_CACHE
+          value: "0.1"
+        - name: TOKEN_RATE
+          value: "100"
+        ports:
+        - containerPort: 8000
+          hostPort: 38000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-pod-2
+  namespace: inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+      pod: "2"
+  template:
+    metadata:
+      labels:
+        app: vllm
+        pod: "2"
+      annotations:
+        nodeportlocal.antrea.io/enabled: "true"
+    spec:
+      containers:
+      - name: mock-vllm
+        image: dockerhub.packages.vcfd.broadcom.net/alpine:3.19
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            WAITING=${WAITING:-5}
+            KV=${KV_CACHE:-0.8}
+            GEN=0
+            while true; do
+              GEN=$((GEN + ${TOKEN_RATE:-50}))
+              BODY="vllm:num_requests_waiting ${WAITING}
+            vllm:kv_cache_usage_perc ${KV}
+            vllm:num_requests_running 1
+            vllm:generation_tokens_total ${GEN}
+            vllm:prompt_tokens_total 0"
+              printf "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n%s\n" "$BODY" | nc -l -p 8000
+            done
+        env:
+        - name: WAITING
+          value: "5"
+        - name: KV_CACHE
+          value: "0.8"
+        - name: TOKEN_RATE
+          value: "50"
+        ports:
+        - containerPort: 8000
+          hostPort: 38001
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-pod-1
+  namespace: inference
+  annotations:
+    nodeportlocal.antrea.io/enabled: "true"
+spec:
+  selector:
+    app: vllm
+    pod: "1"
+  ports:
+  - port: 8000
+    targetPort: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-pod-2
+  namespace: inference
+  annotations:
+    nodeportlocal.antrea.io/enabled: "true"
+spec:
+  selector:
+    app: vllm
+    pod: "2"
+  ports:
+  - port: 8000
+    targetPort: 8000

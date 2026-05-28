@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
+	akogatewayapiinference "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/inference"
 	akogatewayapilib "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/lib"
 	akogatewayapiobjects "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/objects"
 	akogatewayapistatus "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/status"
@@ -93,6 +94,14 @@ var (
 		GetGateways: PodToGateway,
 		GetRoutes:   PodToHTTPRoute,
 	}
+	// InferencePoolSchema handles dequeued InferencePool keys. It reconciles the
+	// pool (updating pod IPs in the scraper) and returns the associated HTTPRoute
+	// keys so the graph layer rebuilds affected virtual services with new weights.
+	InferencePoolSchema = GraphSchema{
+		Type:        lib.InferencePool,
+		GetGateways: InferencePoolToGateways,
+		GetRoutes:   InferencePoolToRoutes,
+	}
 	SupportedGraphTypes = GraphDescriptor{
 		Gateway,
 		GatewayClass,
@@ -101,6 +110,7 @@ var (
 		EndpointSlices,
 		HTTPRoute,
 		Pod,
+		InferencePoolSchema,
 	}
 )
 
@@ -697,6 +707,43 @@ func PodToHTTPRoute(namespace, name, key string) ([]string, bool) {
 func NoOperation(namespace, name, key string) ([]string, bool) {
 	// No-op
 	return []string{}, true
+}
+
+// InferencePoolToGateways reconciles an InferencePool and returns the gateways
+// that are affected via the associated HTTPRoutes. This is called when an
+// InferencePool Add/Update event is dequeued from the ingestion layer.
+func InferencePoolToGateways(namespace, name, key string) ([]string, bool) {
+	if !lib.IsInferenceExtensionEnabled() {
+		return []string{}, true
+	}
+	ctrl := akogatewayapiinference.SharedInferenceController()
+	if ctrl == nil {
+		utils.AviLog.Warnf("key: %s, msg: inference controller not initialised", key)
+		return []string{}, true
+	}
+	if err := ctrl.Reconcile(key); err != nil {
+		utils.AviLog.Warnf("key: %s, msg: inference pool reconcile error: %v", key, err)
+	}
+	// Gateway resolution happens via the route → gateway mapping already stored
+	// in the GatewayApiLister, driven by InferencePoolToRoutes below.
+	return []string{}, true
+}
+
+// InferencePoolToRoutes returns the HTTPRoute keys that reference the given
+// InferencePool so the graph layer can rebuild their virtual services.
+func InferencePoolToRoutes(namespace, name, key string) ([]string, bool) {
+	if !lib.IsInferenceExtensionEnabled() {
+		return []string{}, true
+	}
+	ctrl := akogatewayapiinference.SharedInferenceController()
+	if ctrl == nil {
+		return []string{}, true
+	}
+	// The controller tracks which HTTPRoutes reference each pool.
+	poolNsName := namespace + "/" + name
+	routes := ctrl.GetRoutesForPool(poolNsName)
+	utils.AviLog.Debugf("key: %s, msg: InferencePool routes %v", key, routes)
+	return routes, true
 }
 
 func parentRefGatewayMappings(parentRef gatewayv1.ParentReference,

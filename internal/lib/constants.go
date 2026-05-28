@@ -118,6 +118,7 @@ const (
 	Gateway                                    = "Gateway"
 	GatewayClass                               = "GatewayClass"
 	HTTPRoute                                  = "HTTPRoute"
+	InferencePool                              = "InferencePool"
 	TCPRoute                                   = "TCPRoute"
 	TLSRoute                                   = "TLSRoute"
 	UDPRoute                                   = "UDPRoute"

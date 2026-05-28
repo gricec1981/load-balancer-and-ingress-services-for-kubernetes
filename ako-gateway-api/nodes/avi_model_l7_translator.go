@@ -16,6 +16,7 @@ package nodes
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strconv"
@@ -28,9 +29,11 @@ import (
 	"google.golang.org/protobuf/proto"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	akogatewayapilib "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/lib"
+	akogatewayapiinference "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/inference"
 	akogatewayapiobjects "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/objects"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/internal/lib"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/internal/nodes"
@@ -429,6 +432,14 @@ func (o *AviObjectGraph) BuildPGPool(key, parentNsName string, childVsNode *node
 		}
 	}
 	for _, httpbackend := range rule.Backends {
+		// InferencePool backends are expanded into one pool per pod with
+		// metric-derived weights rather than using a Kubernetes Service.
+		if httpbackend.Backend.Kind == lib.InferencePool && lib.IsInferenceExtensionEnabled() {
+			routeKey := lib.HTTPRoute + "/" + routeModel.GetNamespace() + "/" + routeModel.GetName()
+			o.buildInferencePoolMembers(key, routeKey, httpbackend, parentNs, parentName, rule, PG, childVsNode, listenerProtocol, parentNsName)
+			continue
+		}
+
 		var poolName string
 		if rule.Name == "" {
 			poolName = akogatewayapilib.GetPoolName(parentNs, parentName,
@@ -787,7 +798,212 @@ func (o *AviObjectGraph) BuildHTTPPolicySetHTTPRequestUrlRewriteRules(key, httpP
 	}
 }
 
+// nplEntry mirrors one entry in the nodeportlocal.antrea.io pod annotation.
+type nplEntry struct {
+	PodPort  int32  `json:"podPort"`
+	NodeIP   string `json:"nodeIP"`
+	NodePort int32  `json:"nodePort"`
+}
+
+// resolveNPLServer resolves a pod IP to an SE-reachable address using:
+//  1. Antrea NodePortLocal annotation (nodeportlocal.antrea.io) if present —
+//     targetPort must be the pod container port (InferencePool.Spec.TargetPort),
+//     not the HTTPRoute BackendRef port, for the annotation lookup to match.
+//  2. hostPort on the pod spec if configured
+//  3. Falls back to pod IP + target port (works if SE has pod network access)
+//
+// A return of (podIP, targetPort) indicates that all resolution strategies
+// failed; the caller is responsible for logging a warning and triggering a
+// re-enqueue once the NPL annotation becomes available.
+func resolveNPLServer(podIP string, targetPort int32, namespace string) (serverIP string, serverPort int32) {
+	serverIP = podIP
+	serverPort = targetPort
+
+	podInformer := utils.GetInformers().PodInformer
+	if podInformer == nil {
+		return
+	}
+	pods, err := podInformer.Lister().Pods(namespace).List(labels.Everything())
+	if err != nil {
+		return
+	}
+	for _, pod := range pods {
+		if pod.Status.PodIP != podIP {
+			continue
+		}
+
+		// 1. Try Antrea NPL annotation
+		nplRaw := pod.Annotations["nodeportlocal.antrea.io"]
+		if nplRaw != "" {
+			var entries []nplEntry
+			if err := json.Unmarshal([]byte(nplRaw), &entries); err == nil {
+				for _, e := range entries {
+					if e.PodPort == targetPort {
+						utils.AviLog.Infof("inference: NPL resolved pod %s:%d → %s:%d", podIP, targetPort, e.NodeIP, e.NodePort)
+						return e.NodeIP, e.NodePort
+					}
+				}
+			}
+		}
+
+		// 2. Fall back to hostPort on the pod spec
+		for _, c := range pod.Spec.Containers {
+			for _, p := range c.Ports {
+				if p.ContainerPort == targetPort && p.HostPort > 0 {
+					nodeIP := pod.Status.HostIP
+					utils.AviLog.Infof("inference: hostPort resolved pod %s:%d → %s:%d", podIP, targetPort, nodeIP, p.HostPort)
+					return nodeIP, p.HostPort
+				}
+			}
+		}
+
+		// 3. Fall back to NodePort service — look for a NodePort service in the
+		// same namespace that exposes the target port.
+		svcInformer := utils.GetInformers().ServiceInformer
+		if svcInformer != nil {
+			svcs, _ := svcInformer.Lister().Services(namespace).List(labels.Everything())
+			for _, svc := range svcs {
+				if svc.Spec.Type != "NodePort" {
+					continue
+				}
+				for _, port := range svc.Spec.Ports {
+					if port.TargetPort.IntVal == targetPort && port.NodePort > 0 {
+						nodeIP := pod.Status.HostIP
+						utils.AviLog.Infof("inference: NodePort resolved pod %s:%d → %s:%d via svc %s", podIP, targetPort, nodeIP, port.NodePort, svc.Name)
+						return nodeIP, port.NodePort
+					}
+				}
+			}
+		}
+		return
+	}
+	return
+}
+
 // getApplicationProfileUUID retrieves the UUID of an ApplicationProfile from its status
+// buildInferencePoolMembers creates one AviPoolNode per pod in an InferencePool
+// and adds each as a PoolGroupMember with the metric-derived ratio from the
+// WeightStore. If no weights are available yet (first cycle) all pods get
+// equal weight (100 / N).
+func (o *AviObjectGraph) buildInferencePoolMembers(
+	key, routeKey string,
+	httpbackend *HTTPBackend,
+	parentNs, parentName string,
+	rule *Rule,
+	PG *nodes.AviPoolGroupNode,
+	childVsNode *nodes.AviEvhVsNode,
+	listenerProtocol string,
+	parentNsName string,
+) {
+	poolNsName := httpbackend.Backend.Namespace + "/" + httpbackend.Backend.Name
+
+	// Register this HTTPRoute as a consumer of the InferencePool so the
+	// scraper can re-enqueue it after each weight update.
+	if ctrl := akogatewayapiinference.SharedInferenceController(); ctrl != nil {
+		ctrl.RegisterRouteForPool(poolNsName, routeKey)
+	}
+
+	weightedPods := akogatewayapiinference.GlobalWeightStore().GetWeights(poolNsName)
+	if len(weightedPods) == 0 {
+		// Weight store not yet populated — fall back to equal-weight pod listing
+		// so the VS has members immediately. The scraper will update weights after
+		// the first scrape interval.
+		utils.AviLog.Infof("key: %s, msg: no inference weights yet for pool %s, bootstrapping with equal weights", key, poolNsName)
+		if ctrl := akogatewayapiinference.SharedInferenceController(); ctrl != nil {
+			podIPs := ctrl.GetPoolPodIPs(poolNsName)
+			ratio := uint32(100)
+			for _, ip := range podIPs {
+				weightedPods = append(weightedPods, akogatewayapiinference.WeightedPod{PodIP: ip, Ratio: ratio})
+			}
+		}
+		if len(weightedPods) == 0 {
+			utils.AviLog.Warnf("key: %s, msg: inference pool %s has no pods yet, skipping", key, poolNsName)
+			return
+		}
+	}
+
+	t1LR := lib.GetT1LRPath()
+	if found, infraSettingName := akogatewayapiobjects.GatewayApiLister().GetGatewayToAviInfraSetting(parentNsName); found {
+		if infraSetting, err := akogatewayapilib.AKOControlConfig().AviInfraSettingInformer().Lister().Get(infraSettingName); err != nil {
+			utils.AviLog.Warnf("key: %s, msg: failed to retrieve AviInfraSetting %s, err: %s", key, infraSettingName, err.Error())
+		} else if infraSetting != nil && infraSetting.Status.Status == lib.StatusAccepted && infraSetting.Spec.NSXSettings.T1LR != nil {
+			t1LR = *infraSetting.Spec.NSXSettings.T1LR
+		}
+	}
+
+	for _, wp := range weightedPods {
+		// Pool name encodes the pod IP so each pod gets its own Avi Pool.
+		podPoolName := akogatewayapilib.GetPoolName(
+			parentNs, parentName,
+			httpbackend.Backend.Namespace, httpbackend.Backend.Name,
+			utils.Stringify(rule.Matches),
+			httpbackend.Backend.Namespace, wp.PodIP, strconv.Itoa(int(httpbackend.Backend.Port)),
+		)
+
+		podPoolNode := &nodes.AviPoolNode{
+			Name:     podPoolName,
+			Tenant:   childVsNode.Tenant,
+			Protocol: listenerProtocol,
+			Port:     httpbackend.Backend.Port,
+			ServiceMetadata: lib.ServiceMetadataObj{
+				NamespaceServiceName: []string{poolNsName},
+			},
+			VrfContext: lib.GetVrf(),
+		}
+		podPoolNode.AviMarkers = utils.AviObjectMarkers{
+			GatewayName:        parentName,
+			GatewayNamespace:   parentNs,
+			HTTPRouteName:      httpbackend.Backend.Name,
+			HTTPRouteNamespace: httpbackend.Backend.Namespace,
+			BackendNs:          httpbackend.Backend.Namespace,
+			BackendName:        wp.PodIP,
+		}
+		if t1LR != "" {
+			podPoolNode.T1Lr = t1LR
+			podPoolNode.VrfContext = ""
+		}
+		podPoolNode.NetworkPlacementSettings = lib.GetNodeNetworkMap()
+
+		// Resolve NPL address (nodeIP:nodePort) so Avi SEs can reach the pod
+		// via the Kubernetes node rather than the unreachable pod overlay IP.
+		// The NPL annotation is keyed by container port (InferencePool.Spec.TargetPort),
+		// not the HTTPRoute BackendRef.Port, so we fetch it from the controller cache.
+		targetPort := httpbackend.Backend.Port
+		if ctrl := akogatewayapiinference.SharedInferenceController(); ctrl != nil {
+			if tp := ctrl.GetPoolTargetPort(poolNsName); tp != 0 {
+				targetPort = tp
+			} else {
+				utils.AviLog.Warnf("key: %s, msg: InferencePool %s not yet reconciled, falling back to BackendRef port %d for NPL lookup", key, poolNsName, targetPort)
+			}
+		}
+		serverIP, serverPort := resolveNPLServer(wp.PodIP, targetPort, httpbackend.Backend.Namespace)
+		if serverIP == wp.PodIP && serverPort == targetPort {
+			utils.AviLog.Warnf("key: %s, msg: NPL resolution failed for pod %s in pool %s; pool will be programmed with unreachable pod overlay IP. Route will be re-enqueued once the NPL annotation appears.", key, wp.PodIP, poolNsName)
+		}
+		podPoolNode.Port = serverPort
+		addrType := "V4"
+		enabled := true
+		podPoolNode.Servers = []nodes.AviPoolMetaServer{
+			{
+				Ip: models.IPAddr{
+					Addr: &serverIP,
+					Type: &addrType,
+				},
+				Port:    serverPort,
+				Enabled: &enabled,
+			},
+		}
+
+		if childVsNode.CheckPoolNChecksum(podPoolNode.Name, podPoolNode.GetCheckSum()) {
+			childVsNode.ReplaceEvhPoolInEVHNode(podPoolNode, key)
+		}
+
+		pool_ref := fmt.Sprintf("/api/pool?name=%s", podPoolNode.Name)
+		ratio := wp.Ratio
+		PG.Members = append(PG.Members, &models.PoolGroupMember{PoolRef: &pool_ref, Ratio: &ratio})
+	}
+}
+
 func getApplicationProfileUUID(namespace, name string) (string, error) {
 	clientSet := akogatewayapilib.GetDynamicClientSet()
 	obj, err := clientSet.Resource(akogatewayapilib.AppProfileCRDGVR).Namespace(namespace).Get(context.Background(), name, metav1.GetOptions{})

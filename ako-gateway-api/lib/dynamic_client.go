@@ -67,6 +67,13 @@ var (
 		Version:  "v1alpha1",
 		Resource: "pkiprofiles",
 	}
+	// InferencePoolGVR is the GroupVersionResource for the Gateway API Inference
+	// Extension InferencePool CRD (inference.networking.x-k8s.io/v1alpha2).
+	InferencePoolGVR = schema.GroupVersionResource{
+		Group:    "inference.networking.x-k8s.io",
+		Version:  "v1alpha2",
+		Resource: "inferencepools",
+	}
 )
 
 // NewDynamicClientSet initializes dynamic client set instance
@@ -103,6 +110,9 @@ type DynamicInformers struct {
 	HealthMonitorInformer            informers.GenericInformer
 	RouteBackendExtensionCRDInformer informers.GenericInformer
 	AppProfileCRDInformer            informers.GenericInformer
+	// InferencePoolInformer watches InferencePool CRs from inference.networking.x-k8s.io.
+	// Only initialised when InferenceExtension is enabled in AKO config.
+	InferencePoolInformer informers.GenericInformer
 }
 
 // NewDynamicInformers initializes the DynamicInformers struct
@@ -119,6 +129,10 @@ func NewDynamicInformers(client dynamic.Interface, akoInfra bool) *DynamicInform
 		informers.HealthMonitorInformer = f.ForResource(HealthMonitorGVR)
 		informers.AppProfileCRDInformer = f.ForResource(AppProfileCRDGVR)
 		informers.RouteBackendExtensionCRDInformer = f.ForResource(RouteBackendExtensionCRDGVR)
+	}
+	// Initialize InferencePool informer when the inference extension is enabled.
+	if lib.IsInferenceExtensionEnabled() {
+		informers.InferencePoolInformer = f.ForResource(InferencePoolGVR)
 	}
 	dynamicInformerInstance = informers
 	return dynamicInformerInstance

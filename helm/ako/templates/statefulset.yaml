@@ -73,7 +73,7 @@ spec:
           {{ end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
-          image: "{{ .Values.image.repository }}:{{ .Chart.AppVersion }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{ if .Values.featureGates.EnablePrometheus }}
           ports:
@@ -327,7 +327,7 @@ spec:
           {{ end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
-          image: "{{ .Values.GatewayAPI.image.repository }}:{{ .Chart.AppVersion }}"
+          image: "{{ .Values.GatewayAPI.image.repository }}:{{ .Values.GatewayAPI.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.GatewayAPI.image.pullPolicy }}
           env:
           - name: CTRL_IPADDRESS
@@ -455,6 +455,14 @@ spec:
               configMapKeyRef:
                 name: avi-k8s-config
                 key: akoCRDOperatorEnabled
+          - name: INFERENCE_EXTENSION_ENABLED
+            value: "{{ .Values.inferenceExtension.enabled }}"
+          - name: INFERENCE_SCRAPE_INTERVAL_SECONDS
+            value: "{{ .Values.inferenceExtension.scrapeIntervalSeconds }}"
+          - name: INFERENCE_ALPHA_KV_CACHE
+            value: "{{ .Values.inferenceExtension.alphaKVCache }}"
+          - name: INFERENCE_BETA_TOKEN_RATE
+            value: "{{ .Values.inferenceExtension.betaTokenRate }}"
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
         {{ end }}

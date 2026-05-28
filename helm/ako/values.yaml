@@ -7,6 +7,24 @@ featureGates:
   GatewayAPI: false # Enables/disables processing of Kubernetes Gateway API CRDs.
   EnablePrometheus: false # Enable/Disable prometheus scraping for AKO container
 
+### InferenceExtension enables AKO-native load balancing for LLM inference workloads
+### using the Gateway API Inference Extension (gateway.inference.x-k8s.io).
+### When enabled, AKO watches InferencePool CRDs and scrapes LLM Prometheus endpoints
+### to dynamically adjust Avi Pool Group member weights without requiring ext-proc/EPP.
+inferenceExtension:
+  enabled: false
+  # scrapeIntervalSeconds controls how often AKO scrapes each pod's /metrics endpoint.
+  # Lower values give faster weight convergence at the cost of more HTTP requests.
+  scrapeIntervalSeconds: 15
+  # alphaKVCache weights the kv_cache_usage_perc metric relative to the waiting queue
+  # depth in the inverse-load scoring formula: score = 1/(waiting + alpha*kv_cache + beta*tokens + ε)
+  # Set to 0 to disable KV-cache signal.
+  alphaKVCache: 1.0
+  # betaTokenRate weights the normalised token throughput rate (tokens/sec) relative
+  # to the waiting queue depth. Pods generating more tokens are treated as more loaded.
+  # Set to 0 to disable token-rate signal.
+  betaTokenRate: 1.0
+
 replicaCount: 1
 
 image:
