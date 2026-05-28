@@ -19,6 +19,7 @@ import (
 
 	akogatewayapilib "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/lib"
 	akogatewayapiobjects "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/objects"
+	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/aigateway"
 
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/internal/lib"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/pkg/utils"
@@ -35,11 +36,32 @@ func (c *GatewayController) SetupCRDEventHandlers(numWorkers uint32) {
 	// Skip setup if AKO CRD Operator is not enabled
 	if !lib.IsAKOCRDOperatorEnabled() {
 		utils.AviLog.Warnf("Skipping event handler setup for AKO CRD Operator managed CRDs as it is not enabled")
-		return
+	} else {
+		c.setupHealthMonitorEventHandlers(numWorkers)
+		c.setupRouteBackendExtensionEventHandler(numWorkers)
+		c.setupApplicationProfileEventHandlers(numWorkers)
 	}
-	c.setupHealthMonitorEventHandlers(numWorkers)
-	c.setupRouteBackendExtensionEventHandler(numWorkers)
-	c.setupApplicationProfileEventHandlers(numWorkers)
+
+	// Wire AI gateway policy event handlers when the feature is enabled.
+	if lib.IsAIGatewayEnabled() {
+		dynClient := akogatewayapilib.GetDynamicClientSet()
+		if c.dynamicInformers.AIGatewayAuthPolicyInformer != nil {
+			aigateway.SetupAuthPolicyEventHandlers(
+				c.dynamicInformers.AIGatewayAuthPolicyInformer,
+				dynClient,
+				c.workqueue,
+				numWorkers,
+			)
+		}
+		if c.dynamicInformers.AITokenRateLimitPolicyInformer != nil {
+			aigateway.SetupTokenRateLimitPolicyEventHandlers(
+				c.dynamicInformers.AITokenRateLimitPolicyInformer,
+				dynClient,
+				c.workqueue,
+				numWorkers,
+			)
+		}
+	}
 }
 
 func (c *GatewayController) setupL7CRDEventHandlers(numWorkers uint32) {

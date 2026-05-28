@@ -149,6 +149,18 @@ func (c *GatewayController) Start(stopCh <-chan struct{}) {
 		informersList = append(informersList, c.dynamicInformers.InferencePoolInformer.Informer().HasSynced)
 	}
 
+	// Start AI gateway policy informers when the AI gateway feature is enabled.
+	if lib.IsAIGatewayEnabled() {
+		if c.dynamicInformers.AIGatewayAuthPolicyInformer != nil {
+			go c.dynamicInformers.AIGatewayAuthPolicyInformer.Informer().Run(stopCh)
+			informersList = append(informersList, c.dynamicInformers.AIGatewayAuthPolicyInformer.Informer().HasSynced)
+		}
+		if c.dynamicInformers.AITokenRateLimitPolicyInformer != nil {
+			go c.dynamicInformers.AITokenRateLimitPolicyInformer.Informer().Run(stopCh)
+			informersList = append(informersList, c.dynamicInformers.AITokenRateLimitPolicyInformer.Informer().HasSynced)
+		}
+	}
+
 	if !cache.WaitForCacheSync(stopCh, informersList...) {
 		runtime.HandleError(fmt.Errorf("timed out waiting for caches to sync"))
 	} else {

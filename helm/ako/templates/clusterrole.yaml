@@ -71,6 +71,11 @@ rules:
     resources: ["pods"]
     verbs: ["get","watch","list"]
 {{- end }}
+{{- if and (eq .Values.featureGates.GatewayAPI true) .Values.aiGateway.enabled }}
+  - apiGroups: ["ai.ako.vmware.com"]
+    resources: ["aigatewayauthpolicies","aigatewayauthpolicies/status","aitokenratelimitpolicies","aitokenratelimitpolicies/status"]
+    verbs: ["get","watch","list","patch","update"]
+{{- end }}
 {{- if .Values.rbac.pspEnable }}
   - apiGroups: ["policy", "extensions"]
     resources: ["podsecuritypolicies"]

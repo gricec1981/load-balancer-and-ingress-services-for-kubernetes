@@ -664,6 +664,14 @@ func (v *AviVsNode) GetPaths() []string {
 	return v.Paths
 }
 
+func (v *AviVsNode) GetHTTPDSrefs() []*AviHTTPDataScriptNode {
+	return v.HTTPDSrefs
+}
+
+func (v *AviVsNode) SetHTTPDSrefs(refs []*AviHTTPDataScriptNode) {
+	v.HTTPDSrefs = refs
+}
+
 func (o *AviObjectGraph) GetAviVS() []*AviVsNode {
 	var aviVs []*AviVsNode
 	for _, model := range o.modelNodes {

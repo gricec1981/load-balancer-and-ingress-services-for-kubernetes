@@ -463,6 +463,8 @@ spec:
             value: "{{ .Values.inferenceExtension.alphaKVCache }}"
           - name: INFERENCE_BETA_TOKEN_RATE
             value: "{{ .Values.inferenceExtension.betaTokenRate }}"
+          - name: AI_GATEWAY_ENABLED
+            value: "{{ .Values.aiGateway.enabled }}"
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
         {{ end }}

@@ -35,6 +35,7 @@ import (
 	akogatewayapilib "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/lib"
 	akogatewayapiinference "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/inference"
 	akogatewayapiobjects "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/objects"
+	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/aigateway"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/internal/lib"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/internal/nodes"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/pkg/utils"
@@ -169,6 +170,18 @@ func (o *AviObjectGraph) BuildChildVS(key string, routeModel RouteModel, parentN
 	o.BuildHTTPPolicySet(key, childNode, routeModel, rule, 0, childVSName)
 	// Apply Extension Ref
 	o.ApplyRuleExtensionRefs(key, childNode, routeModel, rule)
+
+	// Apply AI Gateway policies (auth + token rate limiting) when the feature is enabled.
+	if lib.IsAIGatewayEnabled() {
+		routeNsName := routeModel.GetNamespace() + "/" + routeModel.GetName()
+		ps := aigateway.SharedPolicyStore()
+		for _, authPolicy := range ps.GetAuthPoliciesForRoute(routeNsName) {
+			aigateway.ApplyAuthPolicy(key, authPolicy, childNode)
+		}
+		for _, tokenPolicy := range ps.GetTokenRateLimitPoliciesForRoute(routeNsName) {
+			aigateway.ApplyTokenRateLimitPolicy(key, tokenPolicy, childNode)
+		}
+	}
 
 	foundEvhModel := nodes.FindAndReplaceEvhInModel(childNode, parentNode, key)
 	if !foundEvhModel {

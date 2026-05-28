@@ -74,6 +74,22 @@ var (
 		Version:  "v1alpha2",
 		Resource: "inferencepools",
 	}
+
+	// AIGatewayAuthPolicyGVR is the GroupVersionResource for AIGatewayAuthPolicy
+	// (ai.ako.vmware.com/v1alpha1).
+	AIGatewayAuthPolicyGVR = schema.GroupVersionResource{
+		Group:    "ai.ako.vmware.com",
+		Version:  "v1alpha1",
+		Resource: "aigatewayauthpolicies",
+	}
+
+	// AITokenRateLimitPolicyGVR is the GroupVersionResource for AITokenRateLimitPolicy
+	// (ai.ako.vmware.com/v1alpha1).
+	AITokenRateLimitPolicyGVR = schema.GroupVersionResource{
+		Group:    "ai.ako.vmware.com",
+		Version:  "v1alpha1",
+		Resource: "aitokenratelimitpolicies",
+	}
 )
 
 // NewDynamicClientSet initializes dynamic client set instance
@@ -113,6 +129,12 @@ type DynamicInformers struct {
 	// InferencePoolInformer watches InferencePool CRs from inference.networking.x-k8s.io.
 	// Only initialised when InferenceExtension is enabled in AKO config.
 	InferencePoolInformer informers.GenericInformer
+	// AIGatewayAuthPolicyInformer watches AIGatewayAuthPolicy CRs from ai.ako.vmware.com.
+	// Only initialised when AIGateway is enabled in AKO config.
+	AIGatewayAuthPolicyInformer informers.GenericInformer
+	// AITokenRateLimitPolicyInformer watches AITokenRateLimitPolicy CRs from ai.ako.vmware.com.
+	// Only initialised when AIGateway is enabled in AKO config.
+	AITokenRateLimitPolicyInformer informers.GenericInformer
 }
 
 // NewDynamicInformers initializes the DynamicInformers struct
@@ -133,6 +155,11 @@ func NewDynamicInformers(client dynamic.Interface, akoInfra bool) *DynamicInform
 	// Initialize InferencePool informer when the inference extension is enabled.
 	if lib.IsInferenceExtensionEnabled() {
 		informers.InferencePoolInformer = f.ForResource(InferencePoolGVR)
+	}
+	// Initialize AI gateway policy informers when the AI gateway feature is enabled.
+	if lib.IsAIGatewayEnabled() {
+		informers.AIGatewayAuthPolicyInformer = f.ForResource(AIGatewayAuthPolicyGVR)
+		informers.AITokenRateLimitPolicyInformer = f.ForResource(AITokenRateLimitPolicyGVR)
 	}
 	dynamicInformerInstance = informers
 	return dynamicInformerInstance

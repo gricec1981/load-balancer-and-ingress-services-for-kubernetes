@@ -112,6 +112,12 @@ type AviVsEvhSniModel interface {
 	SetStringGroupRefs([]*AviStringGroupNode)
 
 	GetPaths() []string
+
+	// GetHTTPDSrefs / SetHTTPDSrefs expose the AKO-managed DataScript nodes
+	// that are included in AviHTTPDataScriptNode entries on the VS.
+	// Used by AI gateway policies to attach token-accounting DataScripts.
+	GetHTTPDSrefs() []*AviHTTPDataScriptNode
+	SetHTTPDSrefs([]*AviHTTPDataScriptNode)
 }
 
 type AviEvhVsNode struct {
@@ -371,6 +377,14 @@ func (v *AviEvhVsNode) SetStringGroupRefs(stringGroupRefs []*AviStringGroupNode)
 
 func (v *AviEvhVsNode) GetPaths() []string {
 	return v.Paths
+}
+
+func (v *AviEvhVsNode) GetHTTPDSrefs() []*AviHTTPDataScriptNode {
+	return v.HTTPDSrefs
+}
+
+func (v *AviEvhVsNode) SetHTTPDSrefs(refs []*AviHTTPDataScriptNode) {
+	v.HTTPDSrefs = refs
 }
 
 func (o *AviObjectGraph) GetAviEvhVS() []*AviEvhVsNode {

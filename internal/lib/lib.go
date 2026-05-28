@@ -880,6 +880,15 @@ func IsInferenceExtensionEnabled() bool {
 	return ok
 }
 
+// IsAIGatewayEnabled returns true when AKO should watch AIGatewayAuthPolicy and
+// AITokenRateLimitPolicy CRDs and translate them into Avi JWT / DataScript
+// configurations. Controlled by the AI_GATEWAY_ENABLED environment variable,
+// set from values.yaml → aiGateway.enabled.
+func IsAIGatewayEnabled() bool {
+	ok, _ := strconv.ParseBool(os.Getenv("AI_GATEWAY_ENABLED"))
+	return ok
+}
+
 // GetInferenceScrapeInterval returns the Prometheus scrape interval in seconds
 // for the inference extension. Defaults to 15 if not set or invalid.
 func GetInferenceScrapeInterval() int {

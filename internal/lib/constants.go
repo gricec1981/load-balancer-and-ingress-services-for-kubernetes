@@ -119,6 +119,8 @@ const (
 	GatewayClass                               = "GatewayClass"
 	HTTPRoute                                  = "HTTPRoute"
 	InferencePool                              = "InferencePool"
+	AIGatewayAuthPolicy                        = "AIGatewayAuthPolicy"
+	AITokenRateLimitPolicy                     = "AITokenRateLimitPolicy"
 	TCPRoute                                   = "TCPRoute"
 	TLSRoute                                   = "TLSRoute"
 	UDPRoute                                   = "UDPRoute"

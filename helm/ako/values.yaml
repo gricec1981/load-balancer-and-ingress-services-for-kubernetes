@@ -25,6 +25,12 @@ inferenceExtension:
   # Set to 0 to disable token-rate signal.
   betaTokenRate: 1.0
 
+### When enabled, AKO watches AIGatewayAuthPolicy and AITokenRateLimitPolicy CRDs and
+### translates them into Avi JWT validation (SSO policy) and DataScript-based token-budget
+### enforcement on each targeted Virtual Service.
+aiGateway:
+  enabled: false
+
 replicaCount: 1
 
 image:

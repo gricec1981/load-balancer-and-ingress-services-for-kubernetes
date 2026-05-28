@@ -1,0 +1,205 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: aitokenratelimitpolicies.ai.ako.vmware.com
+spec:
+  group: ai.ako.vmware.com
+  names:
+    kind: AITokenRateLimitPolicy
+    listKind: AITokenRateLimitPolicyList
+    plural: aitokenratelimitpolicies
+    singular: aitokenratelimitpolicy
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    subresources:
+      status: {}
+    schema:
+      openAPIV3Schema:
+        description: |-
+          AITokenRateLimitPolicy enforces token-based budgets and quotas per consumer,
+          tenant, or model, plus optional classic request-rate limiting.
+
+          Token accounting is reactive: budgets are enforced on the next request once
+          the running total is exceeded (the gateway cannot block a request because it
+          *would* exceed the budget). See design doc Section 5 for the full consistency
+          model across scaled-out Service Engines.
+        type: object
+        required:
+        - spec
+        properties:
+          apiVersion:
+            type: string
+          kind:
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: Spec defines the desired rate-limiting configuration.
+            type: object
+            required:
+            - targetRef
+            properties:
+              targetRef:
+                description: |-
+                  targetRef identifies the HTTPRoute (or Gateway) this policy applies to.
+                type: object
+                required:
+                - group
+                - kind
+                - name
+                properties:
+                  group:
+                    type: string
+                  kind:
+                    type: string
+                    enum:
+                    - HTTPRoute
+                    - Gateway
+                  name:
+                    type: string
+              identitySource:
+                description: |-
+                  identitySource controls how the consumer identity is resolved.
+                  Defaults to reading "x-ai-consumer" (set by AIGatewayAuthPolicy).
+                type: object
+                properties:
+                  header:
+                    description: header is the request header carrying the consumer identity.
+                    type: string
+                    default: x-ai-consumer
+                  fallback:
+                    description: |-
+                      fallback controls the identity used when the header is absent.
+                      "clientIP" uses the source IP address.
+                    type: string
+                    default: clientIP
+                    enum:
+                    - clientIP
+                    - reject
+              limits:
+                description: |-
+                  limits defines token-budget limits. Each entry generates a counter
+                  in the SE DataScript shared state. All limits are evaluated per
+                  request; a request is rejected if ANY limit is already at or over budget.
+                type: array
+                items:
+                  type: object
+                  required:
+                  - name
+                  - key
+                  - budget
+                  - window
+                  properties:
+                    name:
+                      description: Unique name for this limit (used as the counter key prefix).
+                      type: string
+                    key:
+                      description: |-
+                        key is the dimension to key the counter on.
+                        "consumer" uses the resolved consumer identity.
+                        "header:<name>" uses a specific request header value.
+                        "clientIP" uses the source IP.
+                      type: string
+                    tokens:
+                      description: |-
+                        tokens selects which token dimension counts against this budget.
+                        "prompt" counts prompt tokens only, "completion" counts completion
+                        tokens only, "total" counts prompt + completion.
+                      type: string
+                      default: total
+                      enum:
+                      - prompt
+                      - completion
+                      - total
+                    budget:
+                      description: budget is the maximum token count allowed in the window.
+                      type: integer
+                      format: int64
+                      minimum: 1
+                    window:
+                      description: |-
+                        window is the time window for the budget (e.g. "1m", "1h", "24h").
+                        Fixed-window counters are used; the window resets at the boundary.
+                      type: string
+                      pattern: '^[0-9]+(s|m|h|d)$'
+                    action:
+                      description: action controls what happens when the budget is exceeded.
+                      type: object
+                      properties:
+                        type:
+                          type: string
+                          default: Reject
+                          enum:
+                          - Reject
+                          - Log
+                        statusCode:
+                          type: integer
+                          default: 429
+                          minimum: 400
+                          maximum: 599
+                        retryAfter:
+                          description: |-
+                            retryAfter, if true, includes a Retry-After header pointing to
+                            the window boundary.
+                          type: boolean
+                          default: false
+              requestRateLimit:
+                description: |-
+                  requestRateLimit applies a classic requests-per-second rate limiter on
+                  the VS using Avi's native distributed rate limiter. This is exact and
+                  consistent across Service Engines (unlike token limits which are
+                  eventually-consistent).
+                type: object
+                required:
+                - requestsPerSecond
+                properties:
+                  requestsPerSecond:
+                    description: requestsPerSecond is the sustained request rate limit.
+                    type: integer
+                    minimum: 1
+                  burst:
+                    description: |-
+                      burst is the maximum number of requests allowed above the sustained
+                      rate in a single burst. Defaults to requestsPerSecond.
+                    type: integer
+                    minimum: 1
+                  key:
+                    description: |-
+                      key is the dimension to rate-limit on.
+                      "consumer" uses the x-ai-consumer header, "clientIP" uses source IP.
+                    type: string
+                    default: clientIP
+                    enum:
+                    - consumer
+                    - clientIP
+          status:
+            description: Status reflects the observed state of the policy.
+            type: object
+            properties:
+              conditions:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    type:
+                      type: string
+                    status:
+                      type: string
+                    reason:
+                      type: string
+                    message:
+                      type: string
+                    lastTransitionTime:
+                      type: string
+                      format: date-time
+    additionalPrinterColumns:
+    - name: Target
+      type: string
+      jsonPath: .spec.targetRef.name
+    - name: Age
+      type: date
+      jsonPath: .metadata.creationTimestamp
