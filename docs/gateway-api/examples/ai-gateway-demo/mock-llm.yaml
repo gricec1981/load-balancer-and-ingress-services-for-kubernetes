@@ -1,0 +1,200 @@
+---
+# mock-llm.yaml
+#
+# Extended mock LLM server — re-uses the same python:3.11-slim image as the
+# inference-extension demo but adds OpenAI-compatible POST /v1/chat/completions
+# so the AI Gateway token-accounting DataScripts have real usage JSON to parse.
+#
+# Tune token counts per-deployment with env vars:
+#   PROMPT_TOKENS     (default 25)  — prompt tokens reported in each response
+#   COMPLETION_TOKENS (default 75)  — completion tokens reported in each response
+#   WAITING           (default 0)   — vLLM waiting-queue depth for inference weight demo
+#   KV_CACHE          (default 0.1) — vLLM KV-cache fill % for inference weight demo
+#   TOKEN_RATE        (default 100) — generation_tokens_total increment per /metrics scrape
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mock-llm-script
+  namespace: inference
+data:
+  server.py: |
+    import os, json, time
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    gen_tokens = 0
+    req_count  = 0
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            global gen_tokens
+            waiting = int(os.environ.get("WAITING", "0"))
+            kv      = float(os.environ.get("KV_CACHE", "0.1"))
+            gen_tokens += int(os.environ.get("TOKEN_RATE", "100"))
+            body = (
+                f"vllm:num_requests_waiting {waiting}\n"
+                f"vllm:kv_cache_usage_perc {kv}\n"
+                f"vllm:num_requests_running 1\n"
+                f"vllm:generation_tokens_total {gen_tokens}\n"
+                f"vllm:prompt_tokens_total 0\n"
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            global req_count
+            req_count += 1
+            length   = int(self.headers.get("Content-Length", 0))
+            _body_in = self.rfile.read(length) if length else b""
+
+            pt = int(os.environ.get("PROMPT_TOKENS",     "25"))
+            ct = int(os.environ.get("COMPLETION_TOKENS", "75"))
+            tt = pt + ct
+            pod = os.environ.get("POD_NAME", "mock-llm")
+
+            resp = {
+                "id":      f"chatcmpl-{req_count:06d}",
+                "object":  "chat.completion",
+                "created": int(time.time()),
+                "model":   os.environ.get("MODEL_NAME", "mock-llm-v1"),
+                "choices": [{
+                    "index":   0,
+                    "message": {
+                        "role":    "assistant",
+                        "content": f"[mock response #{req_count} from {pod}]"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens":     pt,
+                    "completion_tokens": ct,
+                    "total_tokens":      tt
+                }
+            }
+            body_out = json.dumps(resp).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body_out)))
+            self.end_headers()
+            self.wfile.write(body_out)
+
+        def log_message(self, fmt, *args):
+            pass  # silence access logs; AKO logs are noisy enough
+
+    HTTPServer(("0.0.0.0", 8000), H).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-llm-1
+  namespace: inference
+  labels:
+    app: mock-llm
+    pod: "1"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-llm
+      pod: "1"
+  template:
+    metadata:
+      labels:
+        app: mock-llm
+        pod: "1"
+    spec:
+      containers:
+      - name: mock-llm
+        image: python:3.11-slim
+        command: ["python3", "/scripts/server.py"]
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: WAITING
+          value: "0"
+        - name: KV_CACHE
+          value: "0.1"
+        - name: TOKEN_RATE
+          value: "100"
+        - name: PROMPT_TOKENS
+          value: "25"
+        - name: COMPLETION_TOKENS
+          value: "75"
+        ports:
+        - containerPort: 8000
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+      volumes:
+      - name: scripts
+        configMap:
+          name: mock-llm-script
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-llm-2
+  namespace: inference
+  labels:
+    app: mock-llm
+    pod: "2"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-llm
+      pod: "2"
+  template:
+    metadata:
+      labels:
+        app: mock-llm
+        pod: "2"
+    spec:
+      containers:
+      - name: mock-llm
+        image: python:3.11-slim
+        command: ["python3", "/scripts/server.py"]
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: WAITING
+          value: "0"
+        - name: KV_CACHE
+          value: "0.2"
+        - name: TOKEN_RATE
+          value: "100"
+        - name: PROMPT_TOKENS
+          value: "25"
+        - name: COMPLETION_TOKENS
+          value: "75"
+        ports:
+        - containerPort: 8000
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+      volumes:
+      - name: scripts
+        configMap:
+          name: mock-llm-script
+---
+# Headless service — AKO / InferencePool builds individual per-pod pools so
+# we do NOT want kube-proxy load-balancing here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-llm
+  namespace: inference
+spec:
+  clusterIP: None
+  selector:
+    app: mock-llm
+  ports:
+  - port: 8000
+    targetPort: 8000

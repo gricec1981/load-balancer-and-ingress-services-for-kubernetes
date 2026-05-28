@@ -1,0 +1,198 @@
+---
+# jwt-issuer.yaml
+#
+# Tiny in-cluster JWT issuer for demo purposes.
+# - Reads an RSA private key from the "jwt-signing-key" Secret (created by setup.sh).
+# - GET /jwks  → public JWKS (pointed at by the Avi JWTServerProfile)
+# - GET /token?sub=alice&tenant=acme&model=gpt-4o
+#              → {"token": "<signed JWT>", "expires_in": 3600}
+#
+# The Avi SSO Policy is configured to validate against http://<ISSUER_VIP>/jwks,
+# so the Service needs to be reachable from the Avi Controller.
+# setup.sh creates a LoadBalancer Service and waits for its external IP.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jwt-issuer-script
+  namespace: inference
+data:
+  issuer.py: |
+    import os, json, time, base64
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from urllib.parse import urlparse, parse_qs
+
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.backends import default_backend
+        import jwt as pyjwt
+    except ImportError:
+        import subprocess, sys
+        subprocess.check_call([sys.executable, "-m", "pip", "install",
+                               "--quiet", "cryptography", "PyJWT"])
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.backends import default_backend
+        import jwt as pyjwt
+
+    KEY_PATH = os.environ.get("KEY_PATH", "/keys/key.pem")
+    ISSUER   = os.environ.get("ISSUER",   "http://jwt-issuer.inference.svc.cluster.local:8080")
+    AUDIENCE = os.environ.get("AUDIENCE", "llm-api")
+    KID      = "demo-key-1"
+
+    with open(KEY_PATH, "rb") as f:
+        private_key = serialization.load_pem_private_key(f.read(), password=None)
+
+    pub = private_key.public_key()
+    pub_numbers = pub.public_numbers()
+
+    def b64url(n):
+        b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+    JWK = {
+        "kty": "RSA", "use": "sig", "alg": "RS256", "kid": KID,
+        "n": b64url(pub_numbers.n),
+        "e": b64url(pub_numbers.e),
+    }
+    JWKS = json.dumps({"keys": [JWK]})
+
+    private_pem = private_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    )
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            path = urlparse(self.path).path
+            qs   = parse_qs(urlparse(self.path).query)
+
+            if path in ("/jwks", "/.well-known/jwks.json"):
+                body = JWKS.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            elif path == "/token":
+                now     = int(time.time())
+                sub     = qs.get("sub",    ["alice"])[0]
+                tenant  = qs.get("tenant", ["default"])[0]
+                model   = qs.get("model",  ["mock-llm-v1"])[0]
+                payload = {
+                    "iss": ISSUER,
+                    "sub": sub,
+                    "aud": AUDIENCE,
+                    "iat": now,
+                    "exp": now + 3600,
+                    "tenant": tenant,
+                    "model":  model,
+                }
+                token = pyjwt.encode(
+                    payload, private_pem,
+                    algorithm="RS256",
+                    headers={"kid": KID},
+                )
+                body = json.dumps({"token": token, "expires_in": 3600,
+                                   "sub": sub, "tenant": tenant}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            elif path == "/health":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, fmt, *args):
+            pass
+
+    HTTPServer(("0.0.0.0", 8080), H).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jwt-issuer
+  namespace: inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jwt-issuer
+  template:
+    metadata:
+      labels:
+        app: jwt-issuer
+    spec:
+      initContainers:
+      - name: pip-install
+        image: python:3.11-slim
+        command: ["pip", "install", "--quiet", "--target", "/pylibs",
+                  "cryptography", "PyJWT"]
+        volumeMounts:
+        - name: pylibs
+          mountPath: /pylibs
+      containers:
+      - name: jwt-issuer
+        image: python:3.11-slim
+        command: ["python3", "/scripts/issuer.py"]
+        env:
+        - name: KEY_PATH
+          value: /keys/key.pem
+        - name: ISSUER
+          # Override this in setup.sh once you know the external IP.
+          # The value must match spec.jwt.issuer in AIGatewayAuthPolicy.
+          value: "http://jwt-issuer.inference.svc.cluster.local:8080"
+        - name: AUDIENCE
+          value: "llm-api"
+        - name: PYTHONPATH
+          value: /pylibs
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+        - name: jwt-key
+          mountPath: /keys
+          readOnly: true
+        - name: pylibs
+          mountPath: /pylibs
+      volumes:
+      - name: scripts
+        configMap:
+          name: jwt-issuer-script
+      - name: jwt-key
+        secret:
+          secretName: jwt-signing-key
+      - name: pylibs
+        emptyDir: {}
+---
+# Exposed as LoadBalancer so the Avi Controller can reach /jwks for JWKS fetching.
+# The external IP is used when creating the Avi JWTServerProfile in setup.sh.
+apiVersion: v1
+kind: Service
+metadata:
+  name: jwt-issuer
+  namespace: inference
+spec:
+  type: LoadBalancer
+  selector:
+    app: jwt-issuer
+  ports:
+  - port: 8080
+    targetPort: 8080
