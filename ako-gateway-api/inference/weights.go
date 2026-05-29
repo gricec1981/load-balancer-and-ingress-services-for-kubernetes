@@ -39,6 +39,10 @@ const (
 // signal: a value of 1.0 for any coefficient weights that signal equally with
 // a fully-saturated waiting queue or a fully-loaded token pipeline.
 //
+// maxNumSeqs is the model's maximum concurrent sequence capacity (e.g. 256).
+// It is used by callers to normalise NumRequestsRunning and to interpret
+// WaitingSustainedStreak. Pass 0 to use a built-in default (256).
+//
 // When the pool-wide maximum of a signal is zero (e.g. no pod has any queued
 // requests) that term contributes 0 to avoid division by zero, matching the
 // idle-pool behaviour of the previous formula.
@@ -48,7 +52,7 @@ const (
 //
 // The ratios always sum to 100 (with rounding adjustment on the highest-score
 // pod to absorb any remainder).
-func ComputeWeights(metrics []PodMetrics, alpha, beta float64) []WeightedPod {
+func ComputeWeights(metrics []PodMetrics, alpha, beta, maxNumSeqs float64) []WeightedPod {
 	if len(metrics) == 0 {
 		return nil
 	}
