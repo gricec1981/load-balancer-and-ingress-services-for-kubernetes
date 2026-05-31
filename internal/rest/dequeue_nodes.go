@@ -1537,6 +1537,7 @@ func (rest *RestOperations) SNINodeCU(sni_node *nodes.AviVsNode, vs_cache_obj *a
 	var http_policies_to_delete []avicache.NamespaceName
 	var sslkey_cert_delete []avicache.NamespaceName
 	var string_groups_to_delete []avicache.NamespaceName
+	var ds_to_delete []avicache.NamespaceName
 	if vs_cache_obj != nil {
 		sni_key := avicache.NamespaceName{Namespace: namespace, Name: sni_node.Name}
 		// Search the VS cache and obtain the UUID of this VS. Then see if this UUID is part of the SNIChildCollection or not.
@@ -1556,6 +1557,7 @@ func (rest *RestOperations) SNINodeCU(sni_node *nodes.AviVsNode, vs_cache_obj *a
 				sni_pgs_to_delete, rest_ops = rest.PoolGroupCU(sni_node.PoolGroupRefs, sni_cache_obj, namespace, rest_ops, key)
 				string_groups_to_delete, rest_ops = rest.StringGroupVsCU(sni_node.StringGroupRefs, sni_cache_obj, namespace, rest_ops, key)
 				http_policies_to_delete, rest_ops = rest.HTTPPolicyCU(sni_node.HttpPolicyRefs, sni_cache_obj, namespace, rest_ops, key)
+				ds_to_delete, rest_ops = rest.DatascriptCU(sni_node.HTTPDSrefs, sni_cache_obj, namespace, rest_ops, key)
 				// The checksums are different, so it should be a PUT call.
 				if sni_cache_obj.CloudConfigCksum != strconv.Itoa(int(sni_node.GetCheckSum())) {
 					restOp := rest.AviVsBuild(sni_node, utils.RestPut, sni_cache_obj, key)
@@ -1574,6 +1576,7 @@ func (rest *RestOperations) SNINodeCU(sni_node *nodes.AviVsNode, vs_cache_obj *a
 			_, rest_ops = rest.PoolGroupCU(sni_node.PoolGroupRefs, nil, namespace, rest_ops, key)
 			_, rest_ops = rest.StringGroupVsCU(sni_node.StringGroupRefs, nil, namespace, rest_ops, key)
 			_, rest_ops = rest.HTTPPolicyCU(sni_node.HttpPolicyRefs, nil, namespace, rest_ops, key)
+			_, rest_ops = rest.DatascriptCU(sni_node.HTTPDSrefs, nil, namespace, rest_ops, key)
 
 			// Not found - it should be a POST call.
 			restOp := rest.AviVsBuild(sni_node, utils.RestPost, nil, key)
@@ -1583,6 +1586,7 @@ func (rest *RestOperations) SNINodeCU(sni_node *nodes.AviVsNode, vs_cache_obj *a
 		}
 		rest_ops = rest.SSLKeyCertDelete(sslkey_cert_delete, namespace, rest_ops, key)
 		rest_ops = rest.HTTPPolicyDelete(http_policies_to_delete, namespace, rest_ops, key)
+		rest_ops = rest.DSDelete(ds_to_delete, namespace, rest_ops, key)
 		rest_ops = rest.StringGroupDelete(string_groups_to_delete, namespace, rest_ops, key)
 		rest_ops = rest.PoolGroupDelete(sni_pgs_to_delete, namespace, rest_ops, key)
 		rest_ops = rest.PoolDelete(sni_pools_to_delete, namespace, rest_ops, nil, key)
@@ -1595,6 +1599,7 @@ func (rest *RestOperations) SNINodeCU(sni_node *nodes.AviVsNode, vs_cache_obj *a
 		_, rest_ops = rest.PoolGroupCU(sni_node.PoolGroupRefs, nil, namespace, rest_ops, key)
 		_, rest_ops = rest.StringGroupVsCU(sni_node.StringGroupRefs, nil, namespace, rest_ops, key)
 		_, rest_ops = rest.HTTPPolicyCU(sni_node.HttpPolicyRefs, nil, namespace, rest_ops, key)
+		_, rest_ops = rest.DatascriptCU(sni_node.HTTPDSrefs, nil, namespace, rest_ops, key)
 
 		// Not found - it should be a POST call.
 		restOp := rest.AviVsBuild(sni_node, utils.RestPost, nil, key)

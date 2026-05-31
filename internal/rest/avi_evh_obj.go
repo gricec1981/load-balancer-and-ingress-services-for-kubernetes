@@ -175,6 +175,7 @@ func (rest *RestOperations) EvhNodeCU(sni_node *nodes.AviEvhVsNode, vs_cache_obj
 	var http_policies_to_delete []avicache.NamespaceName
 	var sslkey_cert_delete []avicache.NamespaceName
 	var string_groups_to_delete []avicache.NamespaceName
+	var ds_to_delete []avicache.NamespaceName
 	var sni_cache_obj *avicache.AviVsCache
 	if vs_cache_obj != nil {
 		sni_key := avicache.NamespaceName{Namespace: namespace, Name: sni_node.Name}
@@ -195,6 +196,7 @@ func (rest *RestOperations) EvhNodeCU(sni_node *nodes.AviEvhVsNode, vs_cache_obj
 				sni_pgs_to_delete, rest_ops = rest.PoolGroupCU(sni_node.PoolGroupRefs, sni_cache_obj, namespace, rest_ops, key)
 				string_groups_to_delete, rest_ops = rest.StringGroupVsCU(sni_node.StringGroupRefs, sni_cache_obj, namespace, rest_ops, key)
 				http_policies_to_delete, rest_ops = rest.HTTPPolicyCU(sni_node.HttpPolicyRefs, sni_cache_obj, namespace, rest_ops, key)
+				ds_to_delete, rest_ops = rest.DatascriptCU(sni_node.HTTPDSrefs, sni_cache_obj, namespace, rest_ops, key)
 
 				// The checksums are different, so it should be a PUT call.
 				if sni_cache_obj.CloudConfigCksum != strconv.Itoa(int(sni_node.GetCheckSum())) {
@@ -214,6 +216,7 @@ func (rest *RestOperations) EvhNodeCU(sni_node *nodes.AviEvhVsNode, vs_cache_obj
 			_, rest_ops = rest.PoolGroupCU(sni_node.PoolGroupRefs, nil, namespace, rest_ops, key)
 			_, rest_ops = rest.StringGroupVsCU(sni_node.StringGroupRefs, nil, namespace, rest_ops, key)
 			_, rest_ops = rest.HTTPPolicyCU(sni_node.HttpPolicyRefs, nil, namespace, rest_ops, key)
+			_, rest_ops = rest.DatascriptCU(sni_node.HTTPDSrefs, nil, namespace, rest_ops, key)
 
 			// Not found - it should be a POST call.
 			restOp := rest.AviVsBuildForEvh(sni_node, utils.RestPost, nil, key)
@@ -223,6 +226,7 @@ func (rest *RestOperations) EvhNodeCU(sni_node *nodes.AviEvhVsNode, vs_cache_obj
 		}
 		rest_ops = rest.SSLKeyCertDelete(sslkey_cert_delete, namespace, rest_ops, key)
 		rest_ops = rest.HTTPPolicyDelete(http_policies_to_delete, namespace, rest_ops, key)
+		rest_ops = rest.DSDelete(ds_to_delete, namespace, rest_ops, key)
 		rest_ops = rest.StringGroupDelete(string_groups_to_delete, namespace, rest_ops, key)
 		rest_ops = rest.PoolGroupDelete(sni_pgs_to_delete, namespace, rest_ops, key)
 		rest_ops = rest.PoolDelete(sni_pools_to_delete, namespace, rest_ops, sni_cache_obj, key)
@@ -235,6 +239,7 @@ func (rest *RestOperations) EvhNodeCU(sni_node *nodes.AviEvhVsNode, vs_cache_obj
 		_, rest_ops = rest.PoolGroupCU(sni_node.PoolGroupRefs, nil, namespace, rest_ops, key)
 		_, rest_ops = rest.StringGroupVsCU(sni_node.StringGroupRefs, nil, namespace, rest_ops, key)
 		_, rest_ops = rest.HTTPPolicyCU(sni_node.HttpPolicyRefs, nil, namespace, rest_ops, key)
+		_, rest_ops = rest.DatascriptCU(sni_node.HTTPDSrefs, nil, namespace, rest_ops, key)
 
 		// Not found - it should be a POST call.
 		restOp := rest.AviVsBuildForEvh(sni_node, utils.RestPost, nil, key)
@@ -596,13 +601,25 @@ func (rest *RestOperations) AviVsChildEvhBuild(vs_meta *nodes.AviEvhVsNode, rest
 		evhChild.PoolGroupRef = &pg_ref
 	}
 	var datascriptCollection []*avimodels.VSDataScripts
+	dsIndex := int32(0)
+
+	// Inline DataScripts attached directly to the child VS (e.g. AI Gateway
+	// token-accounting scripts added by the aigateway translator via HTTPDSrefs).
+	// These reference VSDataScriptSet objects created by DatascriptCU in the rest layer.
+	for _, ds := range vs_meta.HTTPDSrefs {
+		idx := dsIndex
+		dsRef := "/api/vsdatascriptset/?name=" + ds.Name
+		datascriptCollection = append(datascriptCollection, &avimodels.VSDataScripts{VsDatascriptSetRef: &dsRef, Index: &idx})
+		dsIndex++
+	}
 
 	//DS from hostrule
-	for i, script := range vs_meta.VsDatascriptRefs {
-		j := int32(i)
+	for _, script := range vs_meta.VsDatascriptRefs {
+		idx := dsIndex
 		datascript := script
-		datascripts := &avimodels.VSDataScripts{VsDatascriptSetRef: &datascript, Index: &j}
+		datascripts := &avimodels.VSDataScripts{VsDatascriptSetRef: &datascript, Index: &idx}
 		datascriptCollection = append(datascriptCollection, datascripts)
+		dsIndex++
 	}
 	evhChild.VsDatascripts = datascriptCollection
 
