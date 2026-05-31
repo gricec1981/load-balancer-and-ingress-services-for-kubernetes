@@ -74,8 +74,12 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy) TokenAccount
 	// ── Shared header: resolve identity ────────────────────────────────────
 	identityBlock := buildIdentityBlock(identityHeader, fallback)
 
+	// jwt_claim helper is shared by both phases (identity + group extraction).
+	helper := jwtClaimHelper()
+
 	// ── Request-phase: enforce limits ─────────────────────────────────────
 	reqParts = append(reqParts, "-- AKO AI Gateway: token-budget enforcement")
+	reqParts = append(reqParts, helper)
 	reqParts = append(reqParts, identityBlock)
 	reqParts = append(reqParts, "local now = os.time()")
 
@@ -85,6 +89,7 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy) TokenAccount
 
 	// ── Response-phase: account for tokens ────────────────────────────────
 	respParts = append(respParts, "-- AKO AI Gateway: token-usage accounting")
+	respParts = append(respParts, helper)
 	respParts = append(respParts, identityBlock)
 	respParts = append(respParts, "local now = os.time()")
 	respParts = append(respParts, buildUsageParseBlock())
@@ -99,14 +104,52 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy) TokenAccount
 	}
 }
 
+// jwtClaimHelper returns a Lua function `jwt_claim(claim)` that extracts a string
+// claim directly from the bearer JWT in the Authorization header. It is robust to
+// the Avi DataScript Lua sandbox: it uses only core string functions plus
+// avi.utils.base64_decode, handles base64url (-/_ and missing padding), and never
+// raises (returns "" on any failure). This avoids depending on avi.http.oauth_get_claim
+// (an OAuth-session function) which is not available for direct SSO_TYPE_JWT validation.
+func jwtClaimHelper() string {
+	return `-- AKO AI Gateway: extract a string claim from the bearer JWT
+local function jwt_claim(claim)
+  local auth = avi.http.get_header("authorization", avi.HTTP_REQUEST)
+  if not auth or auth == "" then return "" end
+  local sp = string.find(auth, " ", 1, true)
+  local token = sp and string.sub(auth, sp + 1) or auth
+  local d1 = string.find(token, ".", 1, true)
+  if not d1 then return "" end
+  local d2 = string.find(token, ".", d1 + 1, true)
+  if not d2 then return "" end
+  local b64 = string.sub(token, d1 + 1, d2 - 1)
+  b64 = string.gsub(b64, "-", "+")
+  b64 = string.gsub(b64, "_", "/")
+  local pad = #b64 % 4
+  if pad == 2 then b64 = b64 .. "=="
+  elseif pad == 3 then b64 = b64 .. "=" end
+  local ok, payload = pcall(avi.utils.base64_decode, b64)
+  if not ok or not payload then return "" end
+  local ks = string.find(payload, '"' .. claim .. '"', 1, true)
+  if not ks then return "" end
+  local colon = string.find(payload, ":", ks, true)
+  if not colon then return "" end
+  local q1 = string.find(payload, '"', colon, true)
+  if not q1 then return "" end
+  local q2 = string.find(payload, '"', q1 + 1, true)
+  if not q2 then return "" end
+  return string.sub(payload, q1 + 1, q2 - 1)
+end`
+}
+
 // buildIdentityBlock returns the Lua snippet that resolves the consumer identity
 // into the local variable `identity`.
 func buildIdentityBlock(header, fallback string) string {
 	var b strings.Builder
-	// In HTTP_RESP, get_header reads response headers by default.
-	// Pass avi.HTTP_REQUEST to read a request header in either phase.
-	fmt.Fprintf(&b, `local identity = avi.http.get_header(%q, avi.HTTP_REQUEST)`, header)
-	b.WriteString("\n")
+	// Prefer the validated JWT subject claim (decoded from the bearer token),
+	// then the forwarded identity header, then the configured fallback.
+	b.WriteString("local _ok_id, _id = pcall(jwt_claim, \"sub\")\n")
+	b.WriteString("local identity = (_ok_id and _id) or \"\"\n")
+	fmt.Fprintf(&b, "if identity == \"\" then identity = avi.http.get_header(%q, avi.HTTP_REQUEST) or \"\" end\n", header)
 	if fallback == "clientIP" {
 		b.WriteString(`if not identity or identity == "" then
   identity = avi.vs.client_ip()
@@ -188,6 +231,8 @@ func tokenDimensionExpr(tokens string) string {
 
 // buildReqLimitBlock generates the Lua snippet that enforces one token limit in
 // the HTTP_REQ phase: look up the counter and reject if already at budget.
+// When limit.GroupHeader is set it emits a per-group budget table so each group
+// gets its own ceiling while the counter is still keyed per-consumer.
 func buildReqLimitBlock(limit TokenLimit) string {
 	windowSec := windowSeconds(limit.Window)
 	keyExpr := counterKeyExpr(limit)
@@ -209,27 +254,66 @@ func buildReqLimitBlock(limit TokenLimit) string {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "-- limit: %s (budget %d / %s)\n", limit.Name, limit.Budget, limit.Window)
-	fmt.Fprintf(&b, "do\n")
+	fmt.Fprintf(&b, "-- limit: %s", limit.Name)
+	if limit.GroupHeader != "" {
+		fmt.Fprintf(&b, " (group-based budget via header '%s')", limit.GroupHeader)
+	} else {
+		fmt.Fprintf(&b, " (budget %d / %s)", limit.Budget, limit.Window)
+	}
+	fmt.Fprintf(&b, "\ndo\n")
 	fmt.Fprintf(&b, "  local k = %s\n", keyExpr)
 	fmt.Fprintf(&b, "  local cur = tonumber(avi.vs.table_lookup(k) or 0)\n")
-	fmt.Fprintf(&b, "  if cur >= %d then\n", limit.Budget)
+
+	if limit.GroupHeader != "" && len(limit.GroupBudgets) > 0 {
+		// Per-group budget: read the group from the validated JWT claim (decoded
+		// from the bearer token), falling back to a forwarded request header.
+		fmt.Fprintf(&b, "  local _ok_g, _g = pcall(jwt_claim, %q)\n", limit.GroupHeader)
+		fmt.Fprintf(&b, "  local group_hdr = (_ok_g and _g) or \"\"\n")
+		fmt.Fprintf(&b, "  if group_hdr == \"\" then group_hdr = avi.http.get_header(%q, avi.HTTP_REQUEST) or \"\" end\n", limit.GroupHeader)
+		fmt.Fprintf(&b, "  local group_budgets = {")
+		first := true
+		for g, budget := range limit.GroupBudgets {
+			if !first {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(&b, "[%q]=%d", g, budget)
+			first = false
+		}
+		fmt.Fprintf(&b, "}\n")
+		fmt.Fprintf(&b, "  local budget = group_budgets[group_hdr]\n")
+		// Unknown group: use fallback Budget (0 = deny, >0 = allow with fallback limit)
+		if limit.Budget > 0 {
+			fmt.Fprintf(&b, "  if not budget then budget = %d end\n", limit.Budget)
+		} else {
+			fmt.Fprintf(&b, "  if not budget then\n")
+			fmt.Fprintf(&b, "    avi.http.response(403, {[\"Content-Type\"]=\"application/json\"},\n")
+			fmt.Fprintf(&b, "      string.format('{\"error\":\"unknown_group\",\"limit\":%q,\"group\":\"'..group_hdr..'\"}',%q))\n",
+				limit.Name, limit.Name)
+			fmt.Fprintf(&b, "    return\n  end\n")
+		}
+		fmt.Fprintf(&b, "  if cur >= budget then\n")
+	} else {
+		fmt.Fprintf(&b, "  if cur >= %d then\n", limit.Budget)
+	}
 
 	switch actionType {
 	case "Log":
-		fmt.Fprintf(&b, "    -- Log-only mode: allow but emit a log entry\n")
-		fmt.Fprintf(&b, "    avi.vs.log(string.format(\"ai-gateway: limit %s exceeded (cur=%%s budget=%d)\", tostring(cur)))\n",
-			limit.Name, limit.Budget)
+		fmt.Fprintf(&b, "    avi.vs.log(string.format(\"ai-gateway: limit %s exceeded (cur=%%s)\", tostring(cur)))\n",
+			limit.Name)
 	default:
-		headers := fmt.Sprintf(`{["Content-Type"] = "application/json"`)
+		headers := `{["Content-Type"] = "application/json"`
 		if doRetryAfter {
 			fmt.Fprintf(&b, "    local retry_at = (math.floor(now/%d)+1)*%d - now\n", windowSec, windowSec)
 			headers += `, ["Retry-After"] = tostring(math.max(1, retry_at))`
 		}
 		headers += "}"
+		budgetExpr := fmt.Sprintf("%d", limit.Budget)
+		if limit.GroupHeader != "" && len(limit.GroupBudgets) > 0 {
+			budgetExpr = "budget"
+		}
 		fmt.Fprintf(&b, "    avi.http.response(%d, %s,\n", statusCode, headers)
-		fmt.Fprintf(&b, "      string.format('{\"error\":\"token_budget_exceeded\",\"limit\":%q,\"current\":%%d,\"budget\":%d}', cur))\n",
-			limit.Name, limit.Budget)
+		fmt.Fprintf(&b, "      string.format('{\"error\":\"token_budget_exceeded\",\"limit\":%q,\"current\":%%d,\"budget\":%%d}', cur, %s))\n",
+			limit.Name, budgetExpr)
 		fmt.Fprintf(&b, "    return\n")
 	}
 

@@ -155,11 +155,28 @@ type TokenLimit struct {
 	Tokens string `json:"tokens,omitempty"`
 
 	// Budget is the maximum token count allowed within the window.
+	// When GroupBudgets is set this acts as the fallback for unrecognised groups
+	// (0 = reject requests from unrecognised groups).
 	Budget int64 `json:"budget"`
 
 	// Window is the time window for the budget (e.g. "1m", "1h", "24h").
 	// Fixed-window counters reset at the boundary.
 	Window string `json:"window"`
+
+	// GroupHeader, when set, enables per-group budget enforcement.
+	// The header value (forwarded from a JWT claim by AIGatewayAuthPolicy) is
+	// looked up in GroupBudgets to determine the per-user budget ceiling.
+	// The counter is still keyed on the consumer identity (Key field), so each
+	// user gets their own counter; the *budget* they are checked against depends
+	// on which group they belong to.
+	// +optional
+	GroupHeader string `json:"groupHeader,omitempty"`
+
+	// GroupBudgets maps group header values to their token budgets.
+	// Only used when GroupHeader is set.
+	// Example: {"group1": 500, "group2": 1000}
+	// +optional
+	GroupBudgets map[string]int64 `json:"groupBudgets,omitempty"`
 
 	// Action controls what happens when the budget is exceeded.
 	Action *LimitAction `json:"action,omitempty"`

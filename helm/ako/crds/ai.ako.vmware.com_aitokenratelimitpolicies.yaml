@@ -116,10 +116,29 @@ spec:
                       - completion
                       - total
                     budget:
-                      description: budget is the maximum token count allowed in the window.
+                      description: |-
+                        budget is the maximum token count allowed in the window.
+                        Set to 0 when using groupBudgets to deny requests from unrecognised groups.
                       type: integer
                       format: int64
-                      minimum: 1
+                      minimum: 0
+                    groupHeader:
+                      description: |-
+                        groupHeader, when set, enables per-group budget enforcement.
+                        The value of this request header (typically forwarded from a JWT claim
+                        by AIGatewayAuthPolicy) is looked up in groupBudgets to determine the
+                        budget ceiling for the request. The counter is still keyed on the
+                        consumer identity (key field).
+                      type: string
+                    groupBudgets:
+                      description: |-
+                        groupBudgets maps group header values to their token budgets.
+                        Only used when groupHeader is set.
+                        Example: {"group1": 500, "group2": 1000}
+                      type: object
+                      additionalProperties:
+                        type: integer
+                        format: int64
                     window:
                       description: |-
                         window is the time window for the budget (e.g. "1m", "1h", "24h").

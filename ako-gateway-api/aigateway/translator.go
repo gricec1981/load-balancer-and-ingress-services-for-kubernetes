@@ -28,29 +28,53 @@ import (
 // ApplyAuthPolicy configures the Avi VS node model to enforce JWT authentication
 // as described in the AIGatewayAuthPolicy spec.
 //
-// Avi object mapping (Phase 1):
-//   - JWT validation:  references a pre-existing Avi SSO Policy by name.
-//     The SSO Policy encapsulates the JWTServerProfile (issuer, JWKS) and the
-//     HTTP security action that validates the bearer token.  The SSO policy name
-//     is derived from the policy namespace/name: "<ns>-<name>-sso".
-//     Full AKO-managed JWTServerProfile/SSO-Policy lifecycle is Phase 1.5.
-//   - Identity header: HTTP request policy rules copy the claim headers that
-//     the Avi SSO policy inserts (X-AVI-JWT-<CLAIM>) into the user-configured
-//     identityHeader and any forwardClaims headers.
+// Avi object mapping (Phase 1.5):
+//   - JWTServerProfile: created/updated in Avi with issuer + JWKS keys fetched
+//     from spec.jwt.jwksUri.  Name: "<ns>-<name>-jwt".
+//   - AuthProfile (JWT): wraps the JWTServerProfile. Name: "<ns>-<name>-jwt-auth".
+//   - SSOPolicy (SSO_TYPE_JWT): references the AuthProfile. Name: "<ns>-<name>-sso".
+//     AKO sets VirtualService.SsoPolicyRef to this policy's Avi API path.
+//   - Identity header: HTTP request policy rules copy the Avi-injected JWT claim
+//     headers (X-AVI-JWT-<CLAIM>) into the user-configured header names so that
+//     downstream policies (e.g. AITokenRateLimitPolicy) have stable names.
 func ApplyAuthPolicy(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVsEvhSniModel) {
 	if policy == nil {
 		return
 	}
 	spec := policy.Spec
 
-	// ── 1. Reference the Avi SSO Policy for JWT signature validation ─────────
-	// The SSO Policy must be pre-created in Avi with the correct JWTServerProfile
-	// (issuer + JWKS).  Full lifecycle management will be added in Phase 1.5.
-	ssoPolicyName := derivedSSOPolicyName(policy)
+	// ── 1. Ensure JWTServerProfile + SSOPolicy exist in Avi ──────────────────
+	jwtProfileRef, err := EnsureJWTServerProfile(key, policy)
+	if err != nil {
+		utils.AviLog.Errorf("key: %s, msg: AIGatewayAuthPolicy %s/%s: JWTServerProfile error: %v",
+			key, policy.Namespace, policy.Name, err)
+		return
+	}
+	ssoPolicyName, err := EnsureSSOPolicy(key, policy, jwtProfileRef)
+	if err != nil {
+		utils.AviLog.Errorf("key: %s, msg: AIGatewayAuthPolicy %s/%s: SSOPolicy error: %v",
+			key, policy.Namespace, policy.Name, err)
+		return
+	}
+
 	ssoPolicyRef := fmt.Sprintf("/api/ssopolicy?name=%s", ssoPolicyName)
-	vsNode.GetGeneratedFields().SsoPolicyRef = proto.String(ssoPolicyRef)
-	utils.AviLog.Infof("key: %s, msg: AIGatewayAuthPolicy %s/%s: set SsoPolicyRef → %s",
-		key, policy.Namespace, policy.Name, ssoPolicyName)
+	gf := vsNode.GetGeneratedFields()
+	gf.SsoPolicyRef = proto.String(ssoPolicyRef)
+
+	// Avi requires jwt_config on the VS whenever sso_policy_ref is set for
+	// SSO_TYPE_JWT. Set the audience from the first audience in the spec (or a
+	// wildcard if none provided) and fix the token location to the Authorization header.
+	jwtLocation := "JWT_LOCATION_AUTHORIZATION_HEADER"
+	audience := "*"
+	if len(spec.JWT.Audiences) > 0 {
+		audience = spec.JWT.Audiences[0]
+	}
+	gf.JwtConfig = &avimodels.JWTValidationVsConfig{
+		Audience:    proto.String(audience),
+		JwtLocation: proto.String(jwtLocation),
+	}
+	utils.AviLog.Infof("key: %s, msg: AIGatewayAuthPolicy %s/%s: set SsoPolicyRef → %s (audience=%s)",
+		key, policy.Namespace, policy.Name, ssoPolicyName, audience)
 
 	// ── 2. Identity-header + forward-claim injection via HTTP request policy ──
 	// The Avi SSO policy copies validated JWT claims into headers of the form
@@ -162,9 +186,13 @@ func buildClaimForwardRules(srcIdentityHeader, dstIdentityHeader string, forward
 	return rules
 }
 
-// buildHeaderCopyRule constructs an HTTPRequestRule that copies srcHeader → dstHeader
-// using the HTTP_POLICY_VAR_HTTP_HDR variable.
+// buildHeaderCopyRule constructs an HTTPRequestRule that copies srcHeader → dstHeader.
+// Avi HTTP policy variables for request headers use the form "$http_<name>" where
+// the header name has dashes replaced with underscores and is lowercased.
+// The rule adds dstHeader carrying the value of srcHeader.
 func buildHeaderCopyRule(ruleName string, index int32, srcHeader, dstHeader string) *avimodels.HTTPRequestRule {
+	// Convert "X-AVI-JWT-SUB" → "$http_x_avi_jwt_sub" per Avi variable naming.
+	srcVar := "$http_" + strings.ToLower(strings.ReplaceAll(srcHeader, "-", "_"))
 	return &avimodels.HTTPRequestRule{
 		Name:   proto.String(ruleName),
 		Enable: proto.Bool(true),
@@ -176,7 +204,7 @@ func buildHeaderCopyRule(ruleName string, index int32, srcHeader, dstHeader stri
 					Name: proto.String(dstHeader),
 					Value: &avimodels.HTTPHdrValue{
 						Var: proto.String("HTTP_POLICY_VAR_HTTP_HDR"),
-						Val: proto.String(srcHeader),
+						Val: proto.String(srcVar),
 					},
 				},
 			},
@@ -200,24 +228,27 @@ func buildRequestRateLimitScript(spec AITokenRateLimitPolicySpec) string {
 	switch rl.Key {
 	case "consumer":
 		hdr := spec.EffectiveIdentityHeader()
-		keyExpr = fmt.Sprintf(`(avi.http.get_header(%q) or avi.vs.client_ip())`, hdr)
+		keyExpr = fmt.Sprintf(`(avi.http.get_header(%q, avi.HTTP_REQUEST) or avi.vs.client_ip())`, hdr)
 	default:
 		keyExpr = "avi.vs.client_ip()"
 	}
 
+	// avi.vs.table_* take (key[, value[, ttl]]) - no table-name argument - and
+	// table_insert does not overwrite, so remove-then-insert to update the count.
 	return fmt.Sprintf(`-- AKO AI Gateway: per-consumer RPS soft rate limiter
 -- Phase 1.5 upgrade: replace with native avi.vs.rate_limiter() for cross-SE consistency.
 do
   local rk = "rps:"..%s
   local win_key = rk..":"..math.floor(os.time())
-  local cur = tonumber(avi.vs.table_lookup("ai_rps", win_key) or 0)
+  local cur = tonumber(avi.vs.table_lookup(win_key) or 0)
   if cur >= %d then
     avi.http.response(429,
       {["Content-Type"] = "application/json", ["Retry-After"] = "1"},
       '{"error":"rate_limit_exceeded","limit":"requests_per_second","budget":%d}')
     return
   end
-  avi.vs.table_insert("ai_rps", win_key, tostring(cur + 1), 2)
+  avi.vs.table_remove(win_key)
+  avi.vs.table_insert(win_key, tostring(cur + 1), 2)
 end`, keyExpr, burst, rl.RequestsPerSecond)
 }
 

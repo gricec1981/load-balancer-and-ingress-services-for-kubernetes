@@ -216,6 +216,9 @@ func SetupAuthPolicyEventHandlers(
 			ps.mu.RUnlock()
 			if p != nil {
 				enqueueTargetRoute(ns, p.Spec.TargetRef.Name, lib.AIGatewayAuthPolicy, workqueues, numWorkers)
+				// Clean up AKO-managed Avi objects (SSO Policy, AuthProfile, JWTServerProfile).
+				DeleteSSOPolicy("AIGatewayAuthPolicy/"+ns+"/"+name, p)
+				DeleteJWTServerProfile("AIGatewayAuthPolicy/"+ns+"/"+name, p)
 			}
 			ps.deleteAuthPolicy(ns, name)
 		},
@@ -419,6 +422,20 @@ func unstructuredToTokenRateLimitPolicy(obj *unstructured.Unstructured) (*AIToke
 			}
 			if v, _, _ := unstructured.NestedString(lm, "window"); v != "" {
 				tl.Window = v
+			}
+			if v, _, _ := unstructured.NestedString(lm, "groupHeader"); v != "" {
+				tl.GroupHeader = v
+			}
+			if gb, found, _ := unstructured.NestedMap(lm, "groupBudgets"); found {
+				tl.GroupBudgets = make(map[string]int64)
+				for gk, gv := range gb {
+					switch n := gv.(type) {
+					case int64:
+						tl.GroupBudgets[gk] = n
+					case float64:
+						tl.GroupBudgets[gk] = int64(n)
+					}
+				}
 			}
 			// action
 			if actionType, _, _ := unstructured.NestedString(lm, "action", "type"); actionType != "" {
