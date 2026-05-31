@@ -87,14 +87,37 @@ func (rest *RestOperations) AviDSBuild(ds_meta *nodes.AviHTTPDataScriptNode, cac
 				Model:   "VSDataScriptSet",
 			}
 		} else {
-			path = "/api/vsdatascriptset"
-			rest_op = utils.RestOp{
-				ObjName: *vsdatascriptset.Name,
-				Path:    path,
-				Method:  utils.RestPost,
-				Obj:     vsdatascriptset,
-				Tenant:  ds_meta.Tenant,
-				Model:   "VSDataScriptSet",
+			// Cache miss after restart: check Avi directly to avoid a POST→409 cycle.
+			var existing struct {
+				Count   int    `json:"count"`
+				Results []struct{ UUID string `json:"uuid"` } `json:"results"`
+			}
+			client := avicache.SharedAVIClients(ds_meta.Tenant).AviClient[0]
+			if err := lib.AviGet(client, "/api/vsdatascriptset?name="+ds_meta.Name, &existing); err == nil && existing.Count > 0 {
+				path = "/api/vsdatascriptset/" + existing.Results[0].UUID
+				rest_op = utils.RestOp{
+					ObjName: *vsdatascriptset.Name,
+					Path:    path,
+					Method:  utils.RestPut,
+					Obj:     vsdatascriptset,
+					Tenant:  ds_meta.Tenant,
+					Model:   "VSDataScriptSet",
+				}
+				// Warm the cache so future calls use the PUT path directly.
+				rest.cache.DSCache.AviCacheAdd(
+					avicache.NamespaceName{Namespace: ds_meta.Tenant, Name: ds_meta.Name},
+					&avicache.AviDSCache{Name: ds_meta.Name, Tenant: ds_meta.Tenant, Uuid: existing.Results[0].UUID},
+				)
+			} else {
+				path = "/api/vsdatascriptset"
+				rest_op = utils.RestOp{
+					ObjName: *vsdatascriptset.Name,
+					Path:    path,
+					Method:  utils.RestPost,
+					Obj:     vsdatascriptset,
+					Tenant:  ds_meta.Tenant,
+					Model:   "VSDataScriptSet",
+				}
 			}
 		}
 	}

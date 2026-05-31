@@ -23,6 +23,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	avimodels "github.com/vmware/alb-sdk/go/models"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/pkg/apis/ako/v1alpha2"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/pkg/utils"
 )
@@ -46,6 +47,9 @@ type AviVsNodeGeneratedFields struct {
 	Services                      []*v1alpha2.Service
 	SslSessCacheAvgSize           *uint32
 	SsoPolicyRef                  *string
+	// JwtConfig holds the JWT audience + token-location config required by Avi
+	// when an SSO Policy of type SSO_TYPE_JWT is attached to the VS.
+	JwtConfig                     *avimodels.JWTValidationVsConfig
 	TrafficCloneProfileRef        *string
 }
 
@@ -121,6 +125,15 @@ func (v *AviVsNodeGeneratedFields) CalculateCheckSumOfGeneratedCode() uint32 {
 
 	if v.SsoPolicyRef != nil {
 		checksumStringSlice = append(checksumStringSlice, *v.SsoPolicyRef)
+	}
+
+	if v.JwtConfig != nil {
+		if v.JwtConfig.Audience != nil {
+			checksumStringSlice = append(checksumStringSlice, *v.JwtConfig.Audience)
+		}
+		if v.JwtConfig.JwtLocation != nil {
+			checksumStringSlice = append(checksumStringSlice, *v.JwtConfig.JwtLocation)
+		}
 	}
 
 	if v.TrafficCloneProfileRef != nil {
