@@ -1,11 +1,20 @@
 # AI Gateway Demo — Install Guide
 
-Step-by-step guide to demo `AIGatewayAuthPolicy` and `AITokenRateLimitPolicy` on
-the same cluster already running the [Inference Extension](inference-install.md).
+Step-by-step guide to demo `AIGatewayAuthPolicy` and `AITokenRateLimitPolicy` on the same
+cluster already running the [Inference Extension](inference-install.md).
 
-The demo requires **no real LLMs or GPUs**. It reuses the same `mock-llm` pod pattern
-from the inference extension demo, extended to return OpenAI-compatible JSON responses
-with token-usage fields that the DataScript can parse.
+The demo requires **no real LLMs or GPUs**. It reuses the `mock-llm` pod pattern, which returns
+OpenAI-compatible JSON and — importantly — emits the token-usage **response headers** the
+AI-Gateway DataScript reads.
+
+> **Two things that changed and matter for this guide**
+> 1. **Token usage is read from response headers, not the body.** Avi DataScripts cannot read
+>    the response body in the `HTTP_RESP` event, so the backend emits
+>    `X-Prompt-Tokens` / `X-Completion-Tokens` / `X-Total-Tokens`. The bundled `mock-llm.yaml`
+>    does this; a metrics-only mock will account 0 tokens.
+> 2. **AKO manages the Avi JWT objects (Phase 1.5).** You no longer pre-create the
+>    JWTServerProfile / SSO Policy. Applying an `AIGatewayAuthPolicy` makes AKO create them. You
+>    only need the in-cluster `jwt-issuer` pod so AKO can fetch its JWKS.
 
 ---
 
@@ -14,51 +23,36 @@ with token-usage fields that the DataScript can parse.
 | Requirement | Notes |
 |---|---|
 | Working inference-extension demo | Gateway, InferencePool, HTTPRoute already set up |
-| AKO image from `feature/auth-rate-limiting` | Rebuilt with `AI_GATEWAY_ENABLED` support |
-| `openssl` | For RSA keypair generation (Part B) |
-| Avi Controller access | Required only for Part B (JWT auth) |
+| AKO image with AI Gateway code | This branch; toggled by `aiGateway.enabled` (no rebuild to toggle) |
+| Avi Controller reachable from AKO | For JWT auth (Part B) |
 
-> If you're starting fresh, complete [inference-install.md](inference-install.md) first through Step 9, then return here.
+> Starting fresh? Complete [inference-install.md](inference-install.md) first, then return here.
 
 ---
 
-## Step 1 — Rebuild and push AKO with AI Gateway enabled
-
-The `feature/auth-rate-limiting` branch includes the AI Gateway code. Rebuild the image:
-
-```bash
-cd ~/load-balancer-and-ingress-services-for-kubernetes
-
-make dev-build-and-push-gateway-api \
-  REGISTRY=ghcr.io/gricec1981 \
-  TAG=inference-ext
-```
-
-> **No local Docker?** `Dockerfile.ako-gateway-api-dev` is self-contained (compiles the
-> Go binary in a `golang` builder, then distroless), so you can build it remotely in an
-> Azure Container Registry with no Docker daemon:
-> ```bash
-> az acr build -r <your-acr> -t ako-gateway-api:inference-ext -f Dockerfile.ako-gateway-api-dev .
-> ```
-
-Then enable the feature in `values-inference-dev.yaml` (or your equivalent values file):
+## Step 1 — Enable the AI Gateway feature
 
 ```yaml
+# values.yaml
+featureGates:
+  GatewayAPI: true
 aiGateway:
   enabled: true
 ```
 
-Upgrade AKO:
-
 ```bash
-helm upgrade ako ./helm/ako \
-  -n avi-system \
-  -f helm/ako/values-inference-dev.yaml
+helm upgrade ako ./helm/ako -n avi-system -f values.yaml
 kubectl rollout status statefulset/ako -n avi-system
 ```
 
-Confirm the feature is on. The `ako-gateway-api` container is **distroless** (no shell, no
-`env` binary), and AKO does **not** log the flag — so read it from the pod spec:
+> **No local Docker to build the image?** `Dockerfile.ako-gateway-api-dev` is self-contained
+> (compiles the Go binary, then distroless), so build it remotely with no Docker daemon:
+> ```bash
+> az acr build -r <your-acr> -t ako-gateway-api:<tag> -f Dockerfile.ako-gateway-api-dev .
+> ```
+
+Confirm the flag (the container is **distroless** — no `env` binary — and the flag isn't logged,
+so read the pod spec):
 
 ```bash
 kubectl get pod ako-0 -n avi-system \
@@ -82,10 +76,7 @@ kubectl get crd | grep ai.ako
 
 ---
 
-## Step 3 — Deploy the extended mock LLM pods
-
-The existing inference demo uses pods that only serve `GET /` (Prometheus metrics).
-Replace them with the extended version that also handles `POST /v1/chat/completions`:
+## Step 3 — Deploy the mock LLM pods (emit token headers)
 
 ```bash
 kubectl apply -f docs/gateway-api/examples/ai-gateway-demo/mock-llm.yaml
@@ -93,212 +84,153 @@ kubectl rollout status deployment/mock-llm-1 -n inference
 kubectl rollout status deployment/mock-llm-2 -n inference
 ```
 
-> **⚠️ Make sure your InferencePool actually selects these pods.** `mock-llm.yaml` labels its
-> pods `app: mock-llm`. If your `InferencePool` was created with `selector: {app: vllm}` (as in
-> the inference demo), it will match **zero** of these pods and the route will have no backend —
-> requests return a 5xx and the token DataScript never sees a `usage` block to account. Either
-> deploy these with `app: vllm`, or update the InferencePool selector to `app: mock-llm` and let
-> AKO re-resolve.
->
-> The backend **must** return an OpenAI `usage` block on `POST /v1/chat/completions` — the
-> token-accounting DataScript parses `usage.total_tokens` from the response body. A mock that
-> only emits Prometheus `/metrics` (no `usage` JSON) will account **0 tokens**, so Part A never
-> reaches the 429. `mock-llm.yaml` includes the `usage` block; a metrics-only mock does not.
+> **⚠️ Selector + headers.** `mock-llm.yaml` labels pods `app: mock-llm`. Your `InferencePool`
+> must select them — if it was created with `selector: {app: vllm}`, either label these pods
+> `app: vllm` or change the pool selector to `app: mock-llm` (and let AKO re-resolve). The mock
+> emits the `X-*-Tokens` response headers the DataScript needs.
 
-Test that the OpenAI endpoint works:
+Verify the endpoint and headers:
 
 ```bash
-# Port-forward directly to a pod to bypass the VIP.
 kubectl port-forward -n inference deployment/mock-llm-1 8000:8000 &
 PF_PID=$!
-
-curl -s -X POST http://localhost:8000/v1/chat/completions \
+curl -si -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"mock-llm-v1","messages":[{"role":"user","content":"hi"}]}' \
-  | python3 -m json.tool
-
+  | grep -iE 'X-(Prompt|Completion|Total)-Tokens|total_tokens'
 kill $PF_PID
 ```
 
-Expected output includes:
-```json
-{
-  "usage": {
-    "prompt_tokens": 25,
-    "completion_tokens": 75,
-    "total_tokens": 100
-  }
-}
-```
-
-> **Tip:** Change `PROMPT_TOKENS` / `COMPLETION_TOKENS` env vars on the Deployment to
-> adjust how many tokens each response "uses". The DataScript reads these from the
-> live response body, not from a configmap.
+Expected: `X-Total-Tokens: 100` (and a `usage` block with `total_tokens: 100`). Tune with the
+`PROMPT_TOKENS` / `COMPLETION_TOKENS` env vars on the Deployment.
 
 ---
 
-## Step 4 (Part A) — Token Rate Limiting demo (no Avi pre-setup)
+## Part A — Token rate limiting (no JWT)
 
-This part works independently of JWT auth. Apply the rate-limit policy only:
-
-```bash
-kubectl apply -f docs/gateway-api/examples/ai-gateway-demo/ai-gateway-policies.yaml \
-  -l demo-part=token-limits
-```
-
-AKO will detect the new `AITokenRateLimitPolicy`, re-enqueue the `llm-route` HTTPRoute,
-and attach two DataScripts to the child Virtual Service. Confirm in AKO logs:
+A simple per-IP token budget — no auth required. Apply a flat-budget policy:
 
 ```bash
-kubectl logs -n avi-system ako-0 -c ako-gateway-api | grep "AITokenRate\|DataScript"
-# Expected: "AITokenRateLimitPolicy inference/llm-limits: registered token-accounting DataScripts on VS ..."
+cat <<'EOF' | kubectl apply -f -
+apiVersion: ai.ako.vmware.com/v1alpha1
+kind: AITokenRateLimitPolicy
+metadata:
+  name: llm-limits-flat
+  namespace: inference
+spec:
+  targetRef: { group: gateway.networking.k8s.io, kind: HTTPRoute, name: llm-route }
+  identitySource: { header: x-ai-consumer, fallback: clientIP }
+  limits:
+    - name: hourly-tokens
+      key: consumer        # falls back to clientIP when no identity header/JWT
+      tokens: total
+      budget: 500          # 5 x 100-token requests
+      window: 1h
+      action: { type: Reject, statusCode: 429, retryAfter: true }
+EOF
 ```
 
-Confirm the DataScripts appear in the Avi UI:
-
-```
-Applications → Virtual Services → <llm-route VS> → DataScript tab
-  <vsname>-ai-tok-req    (HTTP_REQ phase)
-  <vsname>-ai-tok-resp   (HTTP_RESP phase)
-```
-
----
-
-## Step 5 (Part A) — Run the token rate limit demo
-
-Get the Gateway VIP:
+Confirm AKO attached the DataScripts:
 
 ```bash
-VIP=$(kubectl get gateway llm-gateway -n inference \
-  -o jsonpath='{.status.addresses[0].value}')
-echo "VIP: $VIP"
+kubectl logs -n avi-system ako-0 -c ako-gateway-api | grep "registered token-accounting DataScripts"
+# AITokenRateLimitPolicy inference/llm-limits-flat: registered token-accounting DataScripts on VS ...
 ```
 
-Send 5 successful requests (each uses 100 tokens, budget = 500):
+In the Avi UI: **Applications → Virtual Services → <llm-route VS> → DataScript** shows
+`<vsname>-ai-tok-req` (HTTP_REQ) and `<vsname>-ai-tok-resp` (HTTP_RESP).
+
+### Run it
 
 ```bash
-for i in 1 2 3 4 5; do
-  echo "── request $i ──"
-  curl -s -X POST "http://${VIP}/v1/chat/completions" \
-    -H "Content-Type: application/json" \
-    -d '{"model":"mock-llm-v1","messages":[{"role":"user","content":"hi"}]}' \
-    | python3 -c "
-import sys, json
-r = json.load(sys.stdin)
-u = r['usage']
-print(f'  tokens: {u[\"total_tokens\"]}  model: {r[\"model\"]}')
-"
+VIP=$(kubectl get gateway avi-gateway -n inference -o jsonpath='{.status.addresses[0].value}')
+
+# 5 succeed (100 tokens each, budget 500), 6th is rejected
+for i in $(seq 1 6); do
+  curl -s -o /dev/null -w "req $i: HTTP %{http_code}\n" \
+    -X POST "http://${VIP}/v1/chat/completions" -H "Content-Type: application/json" \
+    -d '{"model":"mock-llm-v1","messages":[{"role":"user","content":"hi"}]}'
 done
 ```
 
-Now send the 6th — it should be rejected:
+Expected: `req 1..5: HTTP 200`, `req 6: HTTP 429` with body
+`{"error":"token_budget_exceeded","limit":"hourly-tokens","current":500,"budget":500}`.
+
+> The VIP is on the Avi VIP network and may be private (e.g. `10.225.0.100`). If you can't reach
+> it from your workstation, run the curls from an in-cluster pod that shares the VNet.
+
+Remove the flat policy before Part B so the two don't both attach:
 
 ```bash
-echo "── request 6 (should fail) ──"
-curl -s -w "\nHTTP %{http_code}" \
-  -X POST "http://${VIP}/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"mock-llm-v1","messages":[{"role":"user","content":"hi"}]}'
-```
-
-Expected:
-```json
-{"error":"token_budget_exceeded","limit":"hourly-consumer-tokens","current":500,"budget":500}
-HTTP 429
-```
-
-**Show per-consumer isolation** — add an `x-ai-consumer` header to get a fresh counter:
-
-```bash
-curl -s -w "\nHTTP %{http_code}" \
-  -X POST "http://${VIP}/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -H "x-ai-consumer: alice" \
-  -d '{"model":"mock-llm-v1","messages":[{"role":"user","content":"hi"}]}'
-# Returns 200 — alice has her own fresh 500-token budget
+kubectl delete aitokenratelimitpolicy llm-limits-flat -n inference
 ```
 
 ---
 
-## Step 6 (Part B) — JWT Authentication demo
+## Part B — JWT auth + per-group token budgets
 
-Part B requires the Avi Controller to validate JWTs. Run the full setup:
+Demonstrates: requests without a token → 401; with a valid token → identity + group come from
+the JWT; **group1 users get 500 tokens/hr, group2 users get 1000**; unknown groups → 403.
 
-```bash
-export AVI_CONTROLLER=10.x.x.x   # your Avi Controller IP
-export AVI_USERNAME=admin
-export AVI_PASSWORD=yourpassword
+### B1. Deploy the in-cluster JWT issuer
 
-./docs/gateway-api/examples/ai-gateway-demo/setup.sh
-```
-
-`setup.sh` will:
-1. Generate an RSA-2048 keypair and store it in a Kubernetes Secret
-2. Deploy the `jwt-issuer` pod (Python server that signs RS256 JWTs and serves JWKS)
-3. Wait for the `jwt-issuer` LoadBalancer IP
-4. Create an Avi `JWTServerProfile` pointing at `/jwks` on the issuer
-5. Create an Avi `SSO Policy` (`inference-llm-auth-sso`) referencing the JWT profile
-6. Apply the `AIGatewayAuthPolicy`
-
-Confirm in Avi UI:
-```
-Templates → Security → SSO Policies → inference-llm-auth-sso
-Templates → Security → JWT Server Profiles → inference-llm-auth-jwt
-```
-
-Confirm in AKO logs:
-```bash
-kubectl logs -n avi-system ako-0 -c ako-gateway-api | grep "SsoPolicyRef\|AIGatewayAuth"
-# Expected: "AIGatewayAuthPolicy inference/llm-auth: set SsoPolicyRef → inference-llm-auth-sso"
-```
-
----
-
-## Step 7 (Part B) — Run the JWT auth demo
+The issuer self-generates an RSA key, signs RS256 JWTs (with a `group` claim), and serves JWKS.
+It is a **ClusterIP** service — the Avi Controller reaches it over the pod network and AKO fetches
+its JWKS in-cluster, so no public IP is needed.
 
 ```bash
-ISSUER_VIP=$(kubectl get svc jwt-issuer -n inference \
-  -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+# RSA signing key (any RSA-2048 key works)
+openssl genrsa -out /tmp/key.pem 2048
+kubectl create secret generic jwt-signing-key -n inference --from-file=key.pem=/tmp/key.pem
 
-# 1. Request without token → 401
-echo "── no token ──"
-curl -s -w "\nHTTP %{http_code}" \
-  -X POST "http://${VIP}/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"mock-llm-v1","messages":[{"role":"user","content":"hi"}]}'
-
-# 2. Get a valid token
-TOKEN=$(curl -sf "http://${ISSUER_VIP}:8080/token?sub=alice&tenant=acme&model=mock-llm-v1" \
-  | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
-echo "Token: ${TOKEN:0:60}..."
-
-# 3. Request with valid token → 200
-echo "── valid token ──"
-curl -s -w "\nHTTP %{http_code}" \
-  -X POST "http://${VIP}/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"model":"mock-llm-v1","messages":[{"role":"user","content":"hi"}]}'
+kubectl apply -f docs/gateway-api/examples/ai-gateway-demo/jwt-issuer.yaml
+kubectl rollout status deployment/jwt-issuer -n inference
 ```
 
-Expected:
-- No token → `HTTP 401`
-- Valid token → `HTTP 200`, and the Avi VS sets `x-ai-consumer: alice` as a request header
-
----
-
-## Step 8 — Use the automated demo script
-
-For a full scripted walkthrough with pauses and narration:
+### B2. Apply the auth + group-budget policies
 
 ```bash
-export VIP=<gateway-external-ip>
-./docs/gateway-api/examples/ai-gateway-demo/demo.sh
+kubectl apply -f docs/gateway-api/examples/ai-gateway-demo/ai-gateway-policies.yaml
 ```
 
-The script covers:
-- Part A: 5 successful requests → 6th hits 429, per-consumer isolation
-- Part B: no-token 401 → fetch token → 200 → alice's JWT-keyed counter fills up → bob's counter is independent
+This applies an `AIGatewayAuthPolicy` (issuer = `jwt-issuer.inference.svc.cluster.local:8080`) and
+the group-budget `AITokenRateLimitPolicy`. AKO then **creates the Avi objects automatically**:
+
+```bash
+kubectl logs -n avi-system ako-0 -c ako-gateway-api | grep -E "JWTServerProfile|SSOPolicy|SsoPolicyRef"
+# JWTServerProfile inference-llm-auth-jwt created
+# SSOPolicy inference-llm-auth-sso created
+# AIGatewayAuthPolicy inference/llm-auth: set SsoPolicyRef -> inference-llm-auth-sso (audience=llm-api)
+```
+
+In the Avi UI they appear under **Templates → Security → SSO Policies** (`inference-llm-auth-sso`)
+and **JWT Server Profiles** (`inference-llm-auth-jwt`).
+
+### B3. Run it
+
+```bash
+ISS=http://jwt-issuer.inference.svc.cluster.local:8080   # run these from an in-cluster pod
+tok() { curl -sf "$ISS/token?sub=$1&group=$2" | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])"; }
+hit() { curl -s -o /dev/null -w "%{http_code}" -X POST "http://${VIP}/v1/chat/completions" \
+          -H "Authorization: Bearer $1" -H "Content-Type: application/json" -d '{}'; }
+
+# no token -> 401
+curl -s -o /dev/null -w "no token: HTTP %{http_code}\n" -X POST "http://${VIP}/v1/chat/completions" -d '{}'
+
+# alice is group1 (budget 500 = 5 requests, 6th -> 429)
+A=$(tok alice group1); for i in $(seq 1 6); do echo "alice req $i: $(hit $A)"; done
+
+# bob is group2 (budget 1000 = 10 requests, 11th -> 429)
+B=$(tok bob group2);   for i in $(seq 1 11); do echo "bob req $i: $(hit $B)"; done
+
+# carol is also group1 but an INDEPENDENT counter -> 200
+C=$(tok carol group1); echo "carol req 1: $(hit $C)"
+
+# dave's group isn't in groupBudgets -> 403 unknown_group
+D=$(tok dave admin);   echo "dave req 1: $(hit $D)"
+```
+
+Expected: alice 5×200 then 429; bob 10×200 then 429; carol 200 (fresh counter); dave 403.
 
 ---
 
@@ -306,29 +238,21 @@ The script covers:
 
 | Goal | How |
 |---|---|
-| Faster budget exhaustion | Reduce `budget` in `ai-gateway-policies.yaml` (e.g., `budget: 200`) |
-| Bigger responses | Increase `COMPLETION_TOKENS` on the Deployment (e.g., `"200"`) |
-| Simulate load imbalance | `kubectl set env deployment/mock-llm-1 -n inference WAITING=20 KV_CACHE=0.8` (same as inference extension demo) |
-| Per-IP limiting | Change `key: consumer` → `key: clientIP` in the policy |
-| Log-only mode | Change `action.type: Reject` → `action.type: Log` to count but not block |
-| RPS throttle | Uncomment `requestRateLimit` block in `ai-gateway-policies.yaml` |
+| Faster budget exhaustion | Lower `budget` (or raise `PROMPT_TOKENS`/`COMPLETION_TOKENS` on the mock) |
+| Per-IP limiting | `key: clientIP` |
+| Log-only (shadow) mode | `action.type: Log` |
+| RPS throttle | uncomment `requestRateLimit` in `ai-gateway-policies.yaml` |
+| Change group budgets | edit `groupBudgets` (e.g. add `group3: 2000`) and re-apply |
 
 ---
 
 ## Cleanup
 
 ```bash
-# Remove policies (leaves mock LLMs and gateway running)
-kubectl delete aigatewayauthpolicy llm-auth -n inference
+kubectl delete aigatewayauthpolicy llm-auth -n inference        # AKO deletes the Avi SSO/JWT objects
 kubectl delete aitokenratelimitpolicy llm-limits -n inference
-
-# Remove jwt-issuer
-kubectl delete deployment jwt-issuer -n inference
-kubectl delete service jwt-issuer -n inference
+kubectl delete -f docs/gateway-api/examples/ai-gateway-demo/jwt-issuer.yaml
 kubectl delete secret jwt-signing-key -n inference
-kubectl delete configmap jwt-issuer-script -n inference
-
-# Remove extended mock LLMs (if you want to go back to the original inference demo)
 kubectl delete -f docs/gateway-api/examples/ai-gateway-demo/mock-llm.yaml
 ```
 
@@ -336,28 +260,21 @@ kubectl delete -f docs/gateway-api/examples/ai-gateway-demo/mock-llm.yaml
 
 ## Troubleshooting
 
-**DataScripts don't appear on the VS**
+**DataScripts don't appear on the VS** — confirm `AI_GATEWAY_ENABLED=true` (Step 1; the
+container is distroless so read the pod spec, not `kubectl exec -- env`).
 
-Check that `AI_GATEWAY_ENABLED=true` is set on the gateway-api container. The container is
-distroless (no `env` binary), so `kubectl exec … -- env` will fail — read the pod spec instead:
-```bash
-kubectl get pod ako-0 -n avi-system \
-  -o jsonpath='{range .spec.containers[?(@.name=="ako-gateway-api")].env[*]}{.name}={.value}{"\n"}{end}' \
-  | grep AI_GATEWAY
-```
+**5xx / "no available servers"** — the backend pods are down or not selected by the
+InferencePool. If you're running a large scale test, many InferencePools all scraping the same
+few single-threaded mock pods can saturate them and fail health checks — scale the mock down or
+add replicas.
 
-**429 never fires even after many requests**
+**Token limits never fire** — the backend isn't emitting `X-Total-Tokens` (or the prompt/
+completion pair). The DataScript reads usage from those headers, not the JSON body.
 
-The DataScript counter is per-SE. If you're hitting different SEs (scaled-out), the per-SE counter fills up more slowly. To force a single SE for demo: set the SE group to 1 SE max or check you're always hitting the same SE.
+**429/403 wrong under JWT** — confirm the issued token carries the claim named in `groupHeader`
+and that its value is a key in `groupBudgets`. The DataScript decodes the claim from the bearer
+token; check the AKO logs for `SsoPolicyRef` to confirm auth is wired.
 
-**401 even with a valid token**
-
-The Avi SSO Policy name must be exactly `<namespace>-<policy-name>-sso`. Verify in the Avi UI that the SSO Policy exists and is named `inference-llm-auth-sso`. Also check the `issuer` field in the policy matches `spec.jwt.issuer` in `AIGatewayAuthPolicy`.
-
-**jwt-issuer pod not starting**
-
-```bash
-kubectl logs -n inference deployment/jwt-issuer -c pip-install
-kubectl logs -n inference deployment/jwt-issuer -c jwt-issuer
-```
-The init container installs `cryptography` and `PyJWT` via pip. If the cluster has no internet access, you'll need to use a private registry image with these pre-installed.
+**JWT always 401** — confirm AKO created the SSO objects (`grep JWTServerProfile` in the logs)
+and that AKO could reach `jwksUri` to fetch the keys (the JWTServerProfile's `jwks_keys` must be
+populated).

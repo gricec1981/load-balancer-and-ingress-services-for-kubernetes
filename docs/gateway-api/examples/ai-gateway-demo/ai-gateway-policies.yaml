@@ -1,80 +1,20 @@
 ---
 # ai-gateway-policies.yaml
 #
-# Demo policies for the AKO AI Gateway — both applied to the same HTTPRoute
-# (llm-route) so you can layer them independently.
+# AKO AI Gateway demo: JWT authentication + per-group token budgets on llm-route.
 #
-# Part A — token rate limiting only (no Avi pre-setup needed):
-#   kubectl apply -f ai-gateway-policies.yaml -l demo-part=token-limits
+# AKO (Phase 1.5) creates the Avi JWTServerProfile, AuthProfile and SSO Policy
+# automatically from the AIGatewayAuthPolicy below — no setup.sh / manual Avi setup.
+# You only need the jwt-issuer pod running (jwt-issuer.yaml) so AKO can fetch its JWKS.
 #
-# Part B — add JWT auth on top (requires setup.sh to have created the Avi SSO Policy):
-#   kubectl apply -f ai-gateway-policies.yaml
+# Apply:   kubectl apply -f ai-gateway-policies.yaml
 
-
-# ─── Part A: Token rate limiting ─────────────────────────────────────────────
-apiVersion: ai.ako.vmware.com/v1alpha1
-kind: AITokenRateLimitPolicy
-metadata:
-  name: llm-limits
-  namespace: inference
-  labels:
-    demo-part: token-limits
-spec:
-  targetRef:
-    group: gateway.networking.k8s.io
-    kind: HTTPRoute
-    name: llm-route
-
-  # Identity resolution: use x-ai-consumer header (set by AIGatewayAuthPolicy
-  # when JWT auth is enabled), falling back to source IP for the Part-A demo.
-  identitySource:
-    header: x-ai-consumer
-    fallback: clientIP   # change to "reject" to require the header
-
-  limits:
-  # Tight budget for demo — 500 total tokens per consumer per hour.
-  # Each mock response uses 100 tokens, so the 6th request is rejected.
-  - name: hourly-consumer-tokens
-    key: consumer          # keyed on x-ai-consumer header (or clientIP fallback)
-    tokens: total
-    budget: 500
-    window: 1h
-    action:
-      type: Reject
-      statusCode: 429
-      retryAfter: true     # adds Retry-After header pointing at window boundary
-
-  # A looser daily cap to show multiple limits can stack.
-  - name: daily-consumer-tokens
-    key: consumer
-    tokens: total
-    budget: 5000
-    window: 24h
-    action:
-      type: Reject
-      statusCode: 429
-
-  # Optional: soft RPS throttle (per-SE token bucket, Phase 1).
-  # Uncomment to demo requests getting dropped at >5 RPS from the same IP.
-  # requestRateLimit:
-  #   requestsPerSecond: 5
-  #   burst: 10
-  #   key: clientIP
-
-
-# ─── Part B: JWT authentication ──────────────────────────────────────────────
-# Requires:
-#   1. setup.sh has run and created the Avi JWTServerProfile + SSO Policy.
-#   2. The SSO Policy is named exactly "inference-llm-auth-sso" in Avi
-#      (AKO derives: <namespace>-<policy-name>-sso = inference-llm-auth-sso).
----
+# ─── JWT authentication ──────────────────────────────────────────────────────
 apiVersion: ai.ako.vmware.com/v1alpha1
 kind: AIGatewayAuthPolicy
 metadata:
   name: llm-auth
   namespace: inference
-  labels:
-    demo-part: jwt-auth
 spec:
   targetRef:
     group: gateway.networking.k8s.io
@@ -82,16 +22,58 @@ spec:
     name: llm-route
 
   jwt:
-    # Must match the "issuer" value in the Avi JWTServerProfile.
-    # setup.sh sets this to the jwt-issuer LoadBalancer IP.
-    issuer: "http://REPLACE_WITH_ISSUER_VIP:8080"
+    # In-cluster issuer (ClusterIP). AKO fetches the JWKS from jwksUri and stores
+    # the keys in the Avi JWTServerProfile, so no public IP is needed.
+    issuer: "http://jwt-issuer.inference.svc.cluster.local:8080"
+    jwksUri: "http://jwt-issuer.inference.svc.cluster.local:8080/jwks"
     audiences:
     - llm-api
-    identityClaim: sub         # becomes the x-ai-consumer header value
+    identityClaim: sub         # JWT sub -> consumer identity (per-user counter key)
     forwardClaims:
-    - tenant                   # forwarded as "tenant" request header
-    - model                    # forwarded as "model" request header
+    - group                    # group claim used for per-group budgets
+    - tenant
+    - model
 
-  identityHeader: x-ai-consumer  # matches AITokenRateLimitPolicy.identitySource.header
+  identityHeader: x-ai-consumer
   onFailure:
     statusCode: 401
+---
+# ─── Per-group token budgets ─────────────────────────────────────────────────
+apiVersion: ai.ako.vmware.com/v1alpha1
+kind: AITokenRateLimitPolicy
+metadata:
+  name: llm-limits
+  namespace: inference
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: llm-route
+
+  # The token DataScript decodes the JWT directly; identitySource.header is the
+  # fallback when no JWT is present, and clientIP is the final fallback.
+  identitySource:
+    header: x-ai-consumer
+    fallback: clientIP
+
+  limits:
+  # Per-user counter, but the budget ceiling is chosen by the user's group claim.
+  - name: hourly-group-budget
+    key: consumer          # per-user counter (JWT sub)
+    groupHeader: group     # budget ceiling looked up from this JWT claim
+    groupBudgets:
+      group1: 500          # 5 x 100-token requests / hr
+      group2: 1000         # 10 x 100-token requests / hr
+    budget: 0              # 0 = reject unknown groups (403); >0 = fallback ceiling
+    tokens: total
+    window: 1h
+    action:
+      type: Reject
+      statusCode: 429
+      retryAfter: true
+
+  # Optional: soft RPS throttle (per-window token bucket).
+  # requestRateLimit:
+  #   requestsPerSecond: 5
+  #   burst: 10
+  #   key: clientIP
