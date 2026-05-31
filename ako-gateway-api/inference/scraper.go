@@ -111,7 +111,9 @@ func NewScraper(intervalSeconds int, alpha, beta, maxNumSeqs float64, onUpdate O
 		client: &http.Client{
 			Timeout: scrapeTimeout,
 			Transport: &http.Transport{
-				DisableKeepAlives: true,
+				DisableKeepAlives:   false,
+				MaxIdleConnsPerHost: 2,               // one idle conn per pod is enough
+				IdleConnTimeout:     30 * time.Second, // reuse within scrape window
 			},
 		},
 	}
