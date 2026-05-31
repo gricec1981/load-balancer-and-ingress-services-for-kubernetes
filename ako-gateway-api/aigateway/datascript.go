@@ -103,7 +103,9 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy) TokenAccount
 // into the local variable `identity`.
 func buildIdentityBlock(header, fallback string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, `local identity = avi.http.get_header(%q)`, header)
+	// In HTTP_RESP, get_header reads response headers by default.
+	// Pass avi.HTTP_REQUEST to read a request header in either phase.
+	fmt.Fprintf(&b, `local identity = avi.http.get_header(%q, avi.HTTP_REQUEST)`, header)
 	b.WriteString("\n")
 	if fallback == "clientIP" {
 		b.WriteString(`if not identity or identity == "" then
@@ -210,7 +212,7 @@ func buildReqLimitBlock(limit TokenLimit) string {
 	fmt.Fprintf(&b, "-- limit: %s (budget %d / %s)\n", limit.Name, limit.Budget, limit.Window)
 	fmt.Fprintf(&b, "do\n")
 	fmt.Fprintf(&b, "  local k = %s\n", keyExpr)
-	fmt.Fprintf(&b, "  local cur = tonumber(avi.vs.table_lookup(%q, k) or 0)\n", DSTableName)
+	fmt.Fprintf(&b, "  local cur = tonumber(avi.vs.table_lookup(k) or 0)\n")
 	fmt.Fprintf(&b, "  if cur >= %d then\n", limit.Budget)
 
 	switch actionType {
@@ -237,27 +239,23 @@ func buildReqLimitBlock(limit TokenLimit) string {
 }
 
 // buildUsageParseBlock generates the Lua snippet that extracts prompt_tokens,
-// completion_tokens, and total_tokens from the OpenAI-compatible response body.
-// For streaming responses (SSE), only the terminal chunk is parsed.
+// completion_tokens, and total_tokens from the backend response.
+//
+// Avi DataScripts cannot read the HTTP response *body* in the HTTP_RESP event
+// (avi.http.get_body is unavailable there; body access requires the
+// HTTP_RESP_DATA buffered-event mechanism). For reliable token accounting the
+// backend reports usage via response headers, which avi.http.get_header reads
+// directly in the HTTP_RESP event:
+//
+//	X-Prompt-Tokens / X-Completion-Tokens / X-Total-Tokens
+//
+// An OpenAI-style proxy/sidecar can surface usage.* from the JSON body into
+// these headers; full in-SE body parsing is a follow-up (HTTP_RESP_DATA).
 func buildUsageParseBlock() string {
-	return `-- parse usage block from OpenAI-compatible response (non-streaming + SSE terminal chunk)
-local body = avi.http.get_body(65536)  -- cap at 64 KiB to protect SE CPU
-local prompt_tokens = 0
-local completion_tokens = 0
-local total_tokens = 0
-if body then
-  -- For SSE streams the usage block is in the last data: chunk.
-  -- For non-streaming it is in the top-level response object.
-  local usage_json = string.match(body, '"usage"%s*:%s*(%b{})')
-  if usage_json then
-    local pt = string.match(usage_json, '"prompt_tokens"%s*:%s*(%d+)')
-    local ct = string.match(usage_json, '"completion_tokens"%s*:%s*(%d+)')
-    local tt = string.match(usage_json, '"total_tokens"%s*:%s*(%d+)')
-    prompt_tokens     = tonumber(pt) or 0
-    completion_tokens = tonumber(ct) or 0
-    total_tokens      = tonumber(tt) or (prompt_tokens + completion_tokens)
-  end
-end`
+	return `-- token usage from backend response headers (HTTP_RESP cannot read the body)
+local prompt_tokens     = tonumber(avi.http.get_header("X-Prompt-Tokens")) or 0
+local completion_tokens = tonumber(avi.http.get_header("X-Completion-Tokens")) or 0
+local total_tokens      = tonumber(avi.http.get_header("X-Total-Tokens")) or (prompt_tokens + completion_tokens)`
 }
 
 // buildRespLimitBlock generates the Lua snippet that increments one counter in
@@ -271,10 +269,13 @@ func buildRespLimitBlock(limit TokenLimit) string {
 	fmt.Fprintf(&b, "-- account: %s\n", limit.Name)
 	fmt.Fprintf(&b, "do\n")
 	fmt.Fprintf(&b, "  local k = %s\n", keyExpr)
-	fmt.Fprintf(&b, "  local cur = tonumber(avi.vs.table_lookup(%q, k) or 0)\n", DSTableName)
+	fmt.Fprintf(&b, "  local cur = tonumber(avi.vs.table_lookup(k) or 0)\n")
 	fmt.Fprintf(&b, "  local ttl = (%d - (now %% %d)) + 5\n", windowSec, windowSec)
-	fmt.Fprintf(&b, "  avi.vs.table_insert(%q, k, tostring(cur + %s), math.max(1, ttl))\n",
-		DSTableName, dimVar)
+	// avi.vs.table_insert does NOT overwrite an existing key — it is a true insert.
+	// Remove the old entry first so the updated counter always gets written.
+	fmt.Fprintf(&b, "  avi.vs.table_remove(k)\n")
+	fmt.Fprintf(&b, "  avi.vs.table_insert(k, tostring(cur + %s), math.max(1, ttl))\n",
+		dimVar)
 	fmt.Fprintf(&b, "end\n")
 	return b.String()
 }
