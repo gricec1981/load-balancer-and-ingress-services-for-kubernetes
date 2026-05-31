@@ -34,6 +34,13 @@ make dev-build-and-push-gateway-api \
   TAG=inference-ext
 ```
 
+> **No local Docker?** `Dockerfile.ako-gateway-api-dev` is self-contained (compiles the
+> Go binary in a `golang` builder, then distroless), so you can build it remotely in an
+> Azure Container Registry with no Docker daemon:
+> ```bash
+> az acr build -r <your-acr> -t ako-gateway-api:inference-ext -f Dockerfile.ako-gateway-api-dev .
+> ```
+
 Then enable the feature in `values-inference-dev.yaml` (or your equivalent values file):
 
 ```yaml
@@ -50,10 +57,13 @@ helm upgrade ako ./helm/ako \
 kubectl rollout status statefulset/ako -n avi-system
 ```
 
-Confirm the feature is on:
+Confirm the feature is on. The `ako-gateway-api` container is **distroless** (no shell, no
+`env` binary), and AKO does **not** log the flag — so read it from the pod spec:
 
 ```bash
-kubectl logs -n avi-system ako-0 -c ako-gateway-api | grep "AI_GATEWAY"
+kubectl get pod ako-0 -n avi-system \
+  -o jsonpath='{range .spec.containers[?(@.name=="ako-gateway-api")].env[*]}{.name}={.value}{"\n"}{end}' \
+  | grep AI_GATEWAY
 # Expected: AI_GATEWAY_ENABLED=true
 ```
 
@@ -82,6 +92,18 @@ kubectl apply -f docs/gateway-api/examples/ai-gateway-demo/mock-llm.yaml
 kubectl rollout status deployment/mock-llm-1 -n inference
 kubectl rollout status deployment/mock-llm-2 -n inference
 ```
+
+> **⚠️ Make sure your InferencePool actually selects these pods.** `mock-llm.yaml` labels its
+> pods `app: mock-llm`. If your `InferencePool` was created with `selector: {app: vllm}` (as in
+> the inference demo), it will match **zero** of these pods and the route will have no backend —
+> requests return a 5xx and the token DataScript never sees a `usage` block to account. Either
+> deploy these with `app: vllm`, or update the InferencePool selector to `app: mock-llm` and let
+> AKO re-resolve.
+>
+> The backend **must** return an OpenAI `usage` block on `POST /v1/chat/completions` — the
+> token-accounting DataScript parses `usage.total_tokens` from the response body. A mock that
+> only emits Prometheus `/metrics` (no `usage` JSON) will account **0 tokens**, so Part A never
+> reaches the 429. `mock-llm.yaml` includes the `usage` block; a metrics-only mock does not.
 
 Test that the OpenAI endpoint works:
 
@@ -316,9 +338,12 @@ kubectl delete -f docs/gateway-api/examples/ai-gateway-demo/mock-llm.yaml
 
 **DataScripts don't appear on the VS**
 
-Check that `AI_GATEWAY_ENABLED=true` is set in the AKO pod:
+Check that `AI_GATEWAY_ENABLED=true` is set on the gateway-api container. The container is
+distroless (no `env` binary), so `kubectl exec … -- env` will fail — read the pod spec instead:
 ```bash
-kubectl exec -n avi-system ako-0 -c ako-gateway-api -- env | grep AI_GATEWAY
+kubectl get pod ako-0 -n avi-system \
+  -o jsonpath='{range .spec.containers[?(@.name=="ako-gateway-api")].env[*]}{.name}={.value}{"\n"}{end}' \
+  | grep AI_GATEWAY
 ```
 
 **429 never fires even after many requests**
