@@ -60,8 +60,12 @@ type Scraper struct {
 	pools    map[string]*poolScrapeState // key: namespace/name
 	client   *http.Client
 	interval time.Duration
-	alpha    float64 // weight of kv_cache signal relative to waiting queue
-	beta     float64 // weight of token throughput signal relative to waiting queue
+	alpha      float64 // weight of kv_cache signal relative to waiting queue
+	beta       float64 // weight of token throughput signal relative to waiting queue
+	// maxNumSeqs is the model's maximum concurrent sequence capacity, supplied
+	// via the "inference.ako.vmware.com/max-num-seqs" annotation on the
+	// InferencePool. 0 means ComputeWeights will use its internal default.
+	maxNumSeqs float64
 	onUpdate OnWeightsUpdated
 }
 
@@ -84,22 +88,26 @@ type poolScrapeState struct {
 	lastEmittedWeights []WeightedPod
 }
 
-// NewScraper creates a Scraper with the given interval (seconds), alpha, and beta.
+// NewScraper creates a Scraper with the given interval (seconds), alpha, beta,
+// and maxNumSeqs.
 //   - alpha controls how much KV-cache pressure contributes relative to the
 //     waiting queue depth (0 disables KV-cache signal).
 //   - beta controls how much the normalised token throughput rate contributes
 //     relative to the waiting queue depth (0 disables token-rate signal).
-func NewScraper(intervalSeconds int, alpha, beta float64, onUpdate OnWeightsUpdated) *Scraper {
+//   - maxNumSeqs is the model's maximum concurrent sequence capacity used by
+//     ComputeWeights. Pass 0 to let ComputeWeights apply its internal default.
+func NewScraper(intervalSeconds int, alpha, beta, maxNumSeqs float64, onUpdate OnWeightsUpdated) *Scraper {
 	interval := defaultScrapeInterval
 	if intervalSeconds > 0 {
 		interval = time.Duration(intervalSeconds) * time.Second
 	}
 	return &Scraper{
-		pools:    make(map[string]*poolScrapeState),
-		interval: interval,
-		alpha:    alpha,
-		beta:     beta,
-		onUpdate: onUpdate,
+		pools:      make(map[string]*poolScrapeState),
+		interval:   interval,
+		alpha:      alpha,
+		beta:       beta,
+		maxNumSeqs: maxNumSeqs,
+		onUpdate:   onUpdate,
 		client: &http.Client{
 			Timeout: scrapeTimeout,
 			Transport: &http.Transport{
@@ -107,6 +115,14 @@ func NewScraper(intervalSeconds int, alpha, beta float64, onUpdate OnWeightsUpda
 			},
 		},
 	}
+}
+
+// SetMaxNumSeqs updates the maxNumSeqs value used in subsequent ComputeWeights
+// calls. Safe to call concurrently; guarded by s.mu.
+func (s *Scraper) SetMaxNumSeqs(v float64) {
+	s.mu.Lock()
+	s.maxNumSeqs = v
+	s.mu.Unlock()
 }
 
 // RegisterPool starts a scrape loop for the given pool if not already running.
@@ -199,6 +215,7 @@ func (s *Scraper) scrapeLoop(ctx context.Context, state *poolScrapeState) {
 			for k, v := range state.podJitter {
 				jitterByPod[k] = v
 			}
+			maxNumSeqs := s.maxNumSeqs
 			s.mu.Unlock()
 
 			if len(podIPs) == 0 {
@@ -214,7 +231,7 @@ func (s *Scraper) scrapeLoop(ctx context.Context, state *poolScrapeState) {
 			}
 			s.mu.Unlock()
 
-			weights := ComputeWeights(results, s.alpha, s.beta)
+			weights := ComputeWeights(results, s.alpha, s.beta, maxNumSeqs)
 
 			// Only call onUpdate when weights actually changed to avoid
 			// redundant Avi PoolGroup writes on every scrape cycle.
@@ -344,6 +361,16 @@ func (s *Scraper) scrapePod(
 		promptTokensTotal:     promptTokens,
 		scrapeTime:            now,
 	}
+
+	// Compute the sustained-waiting streak: increment when the queue is
+	// non-empty, reset to 0 when it drains. The streak is carried in the
+	// snapshot so it persists across cycles via the existing persist logic.
+	if m.NumRequestsWaiting > 0 {
+		snap.waitingPositiveStreak = prev.waitingPositiveStreak + 1
+	} else {
+		snap.waitingPositiveStreak = 0
+	}
+	m.WaitingSustainedStreak = snap.waitingPositiveStreak
 
 	// Compute token throughput rates if we have a valid previous snapshot.
 	if !prev.scrapeTime.IsZero() {

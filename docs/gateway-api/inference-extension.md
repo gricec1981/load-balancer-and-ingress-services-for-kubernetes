@@ -4,7 +4,7 @@
 
 AKO supports load balancing for LLM inference workloads via a native implementation of the [Gateway API Inference Extension](https://gateway-api-inference-extension.sigs.k8s.io/) (`gateway.inference.x-k8s.io`).
 
-Instead of using Envoy's External Processing (ext-proc) and a separate Endpoint Picker (EPP) sidecar, AKO implements intelligent backend selection directly in the controller. AKO periodically scrapes Prometheus metrics from each LLM pod — including both instantaneous request-queue gauges and token throughput rates — and translates them into Avi Pool Group member weights, steering traffic away from overloaded instances automatically.
+Instead of using Envoy's External Processing (ext-proc) and a separate Endpoint Picker (EPP) sidecar, AKO implements intelligent backend selection directly in the controller. AKO periodically scrapes Prometheus metrics from each LLM pod — request queue depth, KV-cache occupancy, and slot utilisation — and translates them into Avi Pool Group member weights, steering traffic away from overloaded instances automatically.
 
 This approach works with any gateway that AKO manages — no ext-proc support is required.
 
@@ -50,8 +50,8 @@ featureGates:
 inferenceExtension:
   enabled: true
   scrapeIntervalSeconds: 15   # how often to scrape each pod
-  alphaKVCache: 1.0           # weight of KV-cache signal vs waiting queue
-  betaTokenRate: 1.0          # weight of token throughput signal vs waiting queue
+  alphaKVCache: 1.0           # KV-cache signal weight (above 75% threshold)
+  betaTokenRate: 1.0          # slot-utilisation signal weight (running / maxNumSeqs)
 ```
 
 These values are injected as environment variables into the `ako-gateway-api` container:
@@ -61,7 +61,9 @@ These values are injected as environment variables into the `ako-gateway-api` co
 | `INFERENCE_EXTENSION_ENABLED` | `false` | Master switch |
 | `INFERENCE_SCRAPE_INTERVAL_SECONDS` | `15` | Scrape interval per pod (seconds) |
 | `INFERENCE_ALPHA_KV_CACHE` | `1.0` | KV-cache signal weight (0 = disable) |
-| `INFERENCE_BETA_TOKEN_RATE` | `1.0` | Token throughput signal weight (0 = disable) |
+| `INFERENCE_BETA_TOKEN_RATE` | `1.0` | Slot-utilisation signal weight (0 = disable) |
+
+The model's maximum concurrent sequence capacity can be set per pool via an annotation (see [Weight Calculation](#weight-calculation)).
 
 ---
 
@@ -133,59 +135,76 @@ Each pod gets its own Avi Pool object. Avi's built-in health monitors on each po
 
 ## Weight Calculation
 
-The scoring formula used to compute `Ratio` values is:
+The scoring formula uses three additive load signals, all bounded to [0, 1] before their coefficient is applied:
 
 ```
-load(pod)  = waiting
-           + α · kv_cache_perc
-           + β · (totalTokens/sec ÷ maxTokens/sec across pool)
+waitingLoad  = NumRequestsWaiting / maxWaiting_across_pool
+               (only when WaitingSustainedStreak ≥ 2 consecutive scrapes;
+                transient single-cycle spikes are ignored)
 
-score(pod) = 1 / (load + ε)
+kvLoad       = α · (KVCacheUsagePerc − 0.75) / 0.25
+               (only when KVCacheUsagePerc > 0.75;
+                zero below threshold, ramps to α at 100% occupancy)
 
-ratio(pod) = round(100 · score(pod) / Σ score(all_pods))
+slotLoad     = β · clamp(NumRequestsRunning / maxNumSeqs, 0, 1)
+               (slot utilisation against the model's max sequence capacity)
+
+load(pod)    = waitingLoad + kvLoad + slotLoad
+score(pod)   = 1 / (load + ε)
+ratio(pod)   = round(100 · score / Σ scores)
 ```
-
-Where:
 
 | Variable | Source | Description |
 |---|---|---|
-| `waiting` | `vllm:num_requests_waiting` | Instantaneous queue depth |
-| `kv_cache_perc` | `vllm:kv_cache_usage_perc` | KV cache fill level (0.0–1.0) |
-| `totalTokens/sec` | `vllm:generation_tokens_total` + `vllm:prompt_tokens_total` (rate) | Combined prompt + output token throughput |
-| `maxTokens/sec` | Highest rate observed across the pool | Normalises β to [0, 1] |
+| `NumRequestsWaiting` | `vllm:num_requests_waiting` | Instantaneous queue depth |
+| `WaitingSustainedStreak` | Computed by scraper | Consecutive cycles with waiting > 0; filters transient bursts |
+| `KVCacheUsagePerc` | `vllm:kv_cache_usage_perc` | KV cache fill fraction (0.0–1.0) |
+| `NumRequestsRunning` | `vllm:num_requests_running` | Active inference slots in use |
+| `maxNumSeqs` | Annotation (default 256) | Model's max concurrent sequences |
 | `α` | `alphaKVCache` config (default 1.0) | KV-cache signal weight |
-| `β` | `betaTokenRate` config (default 1.0) | Token throughput signal weight |
-| `ε` | 1.0 (fixed) | Prevents division by zero; ensures equal distribution when all pods are idle |
+| `β` | `betaTokenRate` config (default 1.0) | Slot-utilisation signal weight |
+| `ε` | 1.0 (fixed) | Div-by-zero guard; produces equal ratios when all pods are idle |
 
-**Token throughput rate** is computed as a per-interval delta from Prometheus cumulative counters:
+Pods that fail scraping receive `Ratio=1` (minimum), keeping them in service while Avi's health monitor decides whether to remove them. Ratios always sum to 100; any rounding error is absorbed by the highest-scoring pod.
 
+### Signal design rationale
+
+| Signal | Why it's designed this way |
+|---|---|
+| **Streak-gated waiting** | A single spike in `num_requests_waiting` can be a transient scheduling artefact. Requiring ≥ 2 consecutive cycles before penalising a pod avoids unnecessary weight shifts on short bursts. |
+| **Threshold-ramped KV** | KV-cache below 75% is normal operating headroom and should not penalise a pod. The signal ramps smoothly from 0 at 75% to α at 100%, so only genuine memory pressure steers traffic away. |
+| **Slot utilisation** | `num_requests_running / maxNumSeqs` captures GPU concurrency directly — a pod at 95% slot utilisation is close to saturated regardless of queue depth. |
+
+### Setting `maxNumSeqs` per pool
+
+Add the annotation to your `InferencePool` to match your deployed model configuration:
+
+```yaml
+apiVersion: gateway.inference.x-k8s.io/v1
+kind: InferencePool
+metadata:
+  name: llm-pool
+  namespace: inference
+  annotations:
+    inference.ako.vmware.com/max-num-seqs: "128"   # match --max-num-seqs in your vLLM args
+spec:
+  selector:
+    matchLabels:
+      app: vllm
+  targetPort: 8000
 ```
-totalTokens/sec = (Δgeneration_tokens + Δprompt_tokens) / Δtime
-```
 
-Counter resets (e.g. pod restarts) are detected by clamping negative deltas to zero, so a restarted pod starts with a clean rate on the next cycle.
-
-Pods that fail scraping receive `Ratio=1` (minimum), ensuring they still receive a small amount of traffic while Avi's health monitor decides whether to take them out of service.
-
-Ratios always sum to 100. Any rounding error is absorbed by the pod with the highest score.
-
-### Why Token Throughput Matters
-
-Request-count metrics alone cannot distinguish between:
-- A pod serving 100 short (10-token) completions — low actual load
-- A pod serving 1 long (100k-token) context — extremely high GPU memory and compute load
-
-By incorporating the token throughput rate, AKO steers new requests away from pods that are already generating large amounts of tokens, regardless of how many requests are queued.
+If the annotation is absent or invalid, AKO defaults to `256`. The value does not need to be exact — it is a normalisation ceiling, not a hard limit.
 
 ### Supported Metrics
 
 | Metric | Type | Used for |
 |---|---|---|
-| `vllm:num_requests_waiting` | Gauge | Primary queue depth signal |
-| `vllm:num_requests_running` | Gauge | Collected, not used in scoring |
+| `vllm:num_requests_waiting` | Gauge | Streak-gated queue depth signal |
+| `vllm:num_requests_running` | Gauge | Slot utilisation signal (β) |
 | `vllm:kv_cache_usage_perc` | Gauge | Memory pressure signal (α) |
-| `vllm:generation_tokens_total` | Counter | Output token rate (β) |
-| `vllm:prompt_tokens_total` | Counter | Input token rate (β) |
+| `vllm:generation_tokens_total` | Counter | Scraped; not used in scoring |
+| `vllm:prompt_tokens_total` | Counter | Scraped; not used in scoring |
 
 Other LLM servers (e.g. TGI, Ollama) work if they expose metrics with the same names at `/metrics`.
 
@@ -198,10 +217,11 @@ Other LLM servers (e.g. TGI, Ollama) work if they expose metrics with the same n
 | Fast-changing load (interactive chat) | Lower `scrapeIntervalSeconds` (5–10s) |
 | Stable throughput workloads (batch) | Higher `scrapeIntervalSeconds` (30–60s) |
 | Memory-bound models (large KV cache) | Increase `alphaKVCache` (2.0–5.0) |
-| Long-context / large output models | Increase `betaTokenRate` (2.0–5.0) |
-| Short-context chat, token rate not relevant | Set `betaTokenRate: 0` |
-| Ignore KV-cache, use queue + tokens only | Set `alphaKVCache: 0` |
-| Queue depth only (original behaviour) | Set `alphaKVCache: 0`, `betaTokenRate: 0` |
+| Compute-bound / high-concurrency models | Increase `betaTokenRate` (2.0–5.0) |
+| Memory pressure not a concern | Set `alphaKVCache: 0` |
+| Slot utilisation not a concern | Set `betaTokenRate: 0` |
+| Queue depth only | Set `alphaKVCache: 0`, `betaTokenRate: 0` |
+| Model with small sequence limit | Set `inference.ako.vmware.com/max-num-seqs` annotation (e.g. `"64"`) |
 | All pods always idle | Weights automatically equal (ε ensures fair distribution) |
 
 ---
@@ -209,12 +229,13 @@ Other LLM servers (e.g. TGI, Ollama) work if they expose metrics with the same n
 ## Limitations
 
 - **Periodic, not per-request:** Weight adjustment happens on a configurable interval (default 15s), not per-request like the EPP ext-proc approach. Rapid load spikes within a scrape window are not reacted to immediately.
+- **Waiting streak delay:** The streak-gated waiting signal requires ≥ 2 consecutive scrapes (≥ 30s at default interval) before sustained queue depth starts penalising a pod. This is intentional but means the signal lags real-world queue build-up by one cycle.
 - **No LoRA / adapter awareness:** The current implementation does not route based on which LoRA adapters are loaded on a given pod. This is a Phase 2 consideration.
 - **No prefix-cache awareness:** Unlike the EPP's scheduling layer, AKO cannot route requests to pods that have a matching KV-cache prefix. Aggregate load is used instead.
 - **Direct pod IP scraping:** AKO scrapes pod IPs directly. Ensure NetworkPolicies allow traffic from the AKO pod to LLM pods on the `targetPort`.
 - **InferenceObjective not yet supported:** The `InferenceObjective` CRD (model-name based traffic split) is a Phase 2 item.
 - **IPv4 only:** The current implementation constructs pool servers as `V4` address type. IPv6 support is not yet implemented.
-- **Token rate unavailable on first scrape:** The rate requires two data points. On the first scrape cycle after startup, `totalTokens/sec` is 0 for all pods and only the queue and KV-cache signals contribute to scoring.
+- **`maxNumSeqs` is pool-wide:** All pods in the pool share one `maxNumSeqs` value. If pods have different model configurations, set the annotation to the lowest common denominator.
 
 ---
 
@@ -224,7 +245,7 @@ Other LLM servers (e.g. TGI, Ollama) work if they expose metrics with the same n
 |---|---|---|
 | Gateway dependency | Any AKO-managed gateway | Must support ext-proc (Envoy-based only) |
 | Routing granularity | Periodic weight update (configurable) | Per-request |
-| Token-aware routing | Yes (throughput rate via counter deltas) | Yes (per-request token count) |
+| Slot-utilisation routing | Yes (running / maxNumSeqs per pod) | Yes (per-request token count) |
 | LoRA adapter routing | Not supported | Supported |
 | Prefix-cache routing | Not supported | Supported |
 | Operational complexity | Low (built into AKO) | High (EPP sidecar, ext-proc wiring) |
@@ -239,14 +260,15 @@ Other LLM servers (e.g. TGI, Ollama) work if they expose metrics with the same n
 - Verify `INFERENCE_EXTENSION_ENABLED=true` in the ako-gateway-api container: `kubectl exec -n avi-system <ako-pod> -c ako-gateway-api -- env | grep INFERENCE`
 - Confirm AKO pod can reach `http://<podIP>:<targetPort>/metrics` — try `kubectl exec` from the AKO pod
 
-**Token rate always zero:**
-- Expected on first scrape cycle (needs two data points to compute a delta)
-- Check that the LLM server exposes `vllm:generation_tokens_total` and `vllm:prompt_tokens_total`: `curl http://<podIP>:<port>/metrics | grep tokens_total`
-- Set `betaTokenRate: 0` to disable the signal if your server does not expose these metrics
-
 **All pods getting equal weight:**
 - Expected when all pods are idle (ε ensures fair distribution)
-- Check live metrics: `curl http://<podIP>:<port>/metrics | grep -E 'waiting|kv_cache|tokens_total'`
+- Also expected in the first 2 scrape cycles while the waiting streak accumulates
+- Check live metrics: `curl http://<podIP>:<port>/metrics | grep -E 'waiting|kv_cache|running'`
+- Verify KV cache is above the 75% threshold if relying on the KV signal: `grep kv_cache_usage_perc`
+
+**Slot-utilisation signal always zero:**
+- Check that `vllm:num_requests_running` is exposed: `curl http://<podIP>:<port>/metrics | grep num_requests_running`
+- Set `betaTokenRate: 0` to disable if your server does not expose this metric
 
 **InferencePool not reconciling:**
 - Confirm the InferencePool CRD is installed: `kubectl get crd inferencepools.gateway.inference.x-k8s.io`

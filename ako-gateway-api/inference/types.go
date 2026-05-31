@@ -109,16 +109,26 @@ type PodMetrics struct {
 	// Used as the primary token-load signal in weight scoring.
 	TotalTokensPerSec float64
 
+	// WaitingSustainedStreak is the number of consecutive scrape cycles on
+	// which NumRequestsWaiting was > 0. Resets to 0 when the queue drains.
+	// Used by ComputeWeights to detect sustained overload vs transient bursts.
+	WaitingSustainedStreak int
+
 	// Reachable is false when the scrape failed for this pod.
 	Reachable bool
 }
 
-// podCounterSnapshot holds raw Prometheus counter values and the time they
-// were recorded, used to compute per-interval token throughput rates.
+// podCounterSnapshot holds raw Prometheus counter values, the scrape
+// timestamp, and streak state used to compute per-interval throughput rates
+// and sustained-queue-depth signals across consecutive scrape cycles.
 type podCounterSnapshot struct {
 	generationTokensTotal float64
 	promptTokensTotal     float64
 	scrapeTime            time.Time
+	// waitingPositiveStreak is the number of consecutive scrapes on which
+	// NumRequestsWaiting was > 0. Carried forward each cycle and stored back
+	// via the existing snapshot persist logic in scrapeLoop.
+	waitingPositiveStreak int
 }
 
 // WeightedPod associates a pod IP with its computed Avi pool member ratio.

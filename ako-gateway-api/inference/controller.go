@@ -17,6 +17,7 @@ package inference
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
@@ -98,7 +99,9 @@ func InitController(
 			podIPToPools:   make(map[string]map[string]struct{}),
 			poolSelectors:  make(map[string]labels.Selector),
 		}
-		ctrl.scraper = NewScraper(scrapeIntervalSeconds, alphaKVCache, betaTokenRate, ctrl.onWeightsUpdated)
+		// maxNumSeqs starts at 0; updated per-pool from the
+		// "inference.ako.vmware.com/max-num-seqs" annotation in Reconcile.
+		ctrl.scraper = NewScraper(scrapeIntervalSeconds, alphaKVCache, betaTokenRate, 0, ctrl.onWeightsUpdated)
 		controllerInstance = ctrl
 	})
 	return controllerInstance
@@ -182,6 +185,23 @@ func (c *Controller) Reconcile(key string) error {
 	pool, err := parseInferencePool(obj)
 	if err != nil {
 		return fmt.Errorf("failed to parse InferencePool %s: %w", nsName, err)
+	}
+
+	// Parse the optional max-num-seqs annotation and propagate it to the
+	// scraper so ComputeWeights can use the model's sequence capacity ceiling.
+	// A missing or unparseable value falls back to ComputeWeights' internal
+	// default (0 passed here signals "use default"). Pool registration is
+	// never aborted for a bad annotation value.
+	const maxNumSeqsAnnotation = "inference.ako.vmware.com/max-num-seqs"
+	if raw, ok := obj.GetAnnotations()[maxNumSeqsAnnotation]; ok {
+		if v, parseErr := strconv.ParseFloat(raw, 64); parseErr == nil && v > 0 {
+			c.scraper.SetMaxNumSeqs(v)
+		} else {
+			utils.AviLog.Debugf("key: %s, msg: annotation %s value %q unparseable or non-positive (%v), ComputeWeights will use its default", key, maxNumSeqsAnnotation, raw, parseErr)
+			c.scraper.SetMaxNumSeqs(0)
+		}
+	} else {
+		utils.AviLog.Debugf("key: %s, msg: annotation %s not set on InferencePool, ComputeWeights will use its default", key, maxNumSeqsAnnotation)
 	}
 
 	podIPs, err := c.resolvePodIPs(ns, pool.Spec.Selector)

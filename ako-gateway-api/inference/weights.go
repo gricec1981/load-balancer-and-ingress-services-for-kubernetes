@@ -23,49 +23,63 @@ const (
 	minRatio = uint32(1)
 	// maxRatio is the maximum Avi PoolGroupMember.Ratio value.
 	maxRatio = uint32(100)
+	// kvThreshold is the KV-cache occupancy fraction above which the KV signal
+	// begins to contribute load. Below this level the cache is not considered
+	// a bottleneck.
+	kvThreshold = 0.75
+	// waitingSustainedScrapes is the minimum number of consecutive scrape
+	// cycles with NumRequestsWaiting > 0 before the waiting term is activated.
+	// Transient single-cycle spikes are ignored.
+	waitingSustainedScrapes = 2
+	// defaultMaxNumSeqs is the fallback maximum concurrent sequence capacity
+	// when the InferencePool annotation is absent or zero.
+	defaultMaxNumSeqs = 256.0
 )
 
 // ComputeWeights converts a slice of PodMetrics into Avi pool group member
-// ratios using an inverse-load scoring function:
+// ratios using an inverse-load scoring function with three additive terms:
 //
-//	load(pod)  = (waiting / maxWaiting_across_pods)
-//	           + alpha * kv_cache_perc
-//	           + beta  * (totalTokensPerSec / maxTokensPerSec_across_pods)
-//	score(pod) = 1 / (load + epsilon)
-//	ratio(pod) = round(100 * score / sum(scores))
+//	waitingLoad  = NumRequestsWaiting / maxWaiting_across_pods
+//	                 (only when WaitingSustainedStreak >= waitingSustainedScrapes;
+//	                  transient single-cycle spikes are ignored)
 //
-// All three terms are normalised against the pool maximum so each lives on
-// [0, 1]. This makes alpha and beta directly comparable to the queue-depth
-// signal: a value of 1.0 for any coefficient weights that signal equally with
-// a fully-saturated waiting queue or a fully-loaded token pipeline.
+//	kvLoad       = alpha * (KVCacheUsagePerc - kvThreshold) / (1 - kvThreshold)
+//	                 (only when KVCacheUsagePerc > kvThreshold=0.75;
+//	                  zero below the threshold, ramps to alpha at full occupancy)
 //
-// When the pool-wide maximum of a signal is zero (e.g. no pod has any queued
-// requests) that term contributes 0 to avoid division by zero, matching the
-// idle-pool behaviour of the previous formula.
+//	slotLoad     = beta * clamp(NumRequestsRunning / maxNumSeqs, 0, 1)
+//	                 (slot utilisation normalised by the model's max capacity)
+//
+//	load(pod)    = waitingLoad + kvLoad + slotLoad
+//	score(pod)   = 1 / (load + epsilon)
+//	ratio(pod)   = round(100 * score / sum(scores))
+//
+// maxNumSeqs is the model's maximum concurrent sequence capacity. Pass 0 (or
+// omit the InferencePool annotation) to use the built-in default of 256.
+//
+// When maxWaiting is zero (no pod has a queue) or the sustained streak is too
+// short, the waiting term contributes 0 so idle pools produce near-equal ratios.
 //
 // Pods that are unreachable receive the minimum ratio (1) so they still
 // receive some traffic while health monitors decide whether to remove them.
 //
 // The ratios always sum to 100 (with rounding adjustment on the highest-score
 // pod to absorb any remainder).
-func ComputeWeights(metrics []PodMetrics, alpha, beta float64) []WeightedPod {
+func ComputeWeights(metrics []PodMetrics, alpha, beta, maxNumSeqs float64) []WeightedPod {
 	if len(metrics) == 0 {
 		return nil
 	}
 
-	// Single pass: find the per-signal pool maxima across reachable pods for
-	// normalisation. When a maximum is zero the corresponding term is zeroed
-	// (div-by-zero guard) so idle pools still produce near-equal ratios.
-	maxTokenRate := 0.0
+	if maxNumSeqs <= 0 {
+		maxNumSeqs = defaultMaxNumSeqs
+	}
+
+	// Single pass: find maxWaiting across reachable pods for normalisation.
+	// When maxWaiting is zero (no pod has a queue) the waiting term is zeroed
+	// so idle pools still produce near-equal ratios.
 	maxWaiting := 0.0
 	for _, m := range metrics {
-		if !m.Reachable {
-			continue
-		}
-		if m.TotalTokensPerSec > maxTokenRate {
-			maxTokenRate = m.TotalTokensPerSec
-		}
-		if m.NumRequestsWaiting > maxWaiting {
+		if m.Reachable && m.NumRequestsWaiting > maxWaiting {
 			maxWaiting = m.NumRequestsWaiting
 		}
 	}
@@ -81,19 +95,34 @@ func ComputeWeights(metrics []PodMetrics, alpha, beta float64) []WeightedPod {
 			continue
 		}
 
-		// Normalised waiting queue depth: high queue → high load → lower score.
+		// Streak-gated waiting: only count the queue depth once it has been
+		// sustained for at least waitingSustainedScrapes consecutive cycles,
+		// filtering out transient single-cycle bursts.
 		waitingLoad := 0.0
-		if maxWaiting > 0 {
+		if m.WaitingSustainedStreak >= waitingSustainedScrapes && maxWaiting > 0 {
 			waitingLoad = m.NumRequestsWaiting / maxWaiting
 		}
 
-		// Normalised token throughput: high throughput → high load → lower score.
-		tokenLoad := 0.0
-		if beta > 0 && maxTokenRate > 0 {
-			tokenLoad = beta * (m.TotalTokensPerSec / maxTokenRate)
+		// Threshold-ramped KV cache: contributes load only above kvThreshold,
+		// ramping linearly from 0 at the threshold to alpha at full occupancy.
+		kvLoad := 0.0
+		if m.KVCacheUsagePerc > kvThreshold {
+			kvLoad = alpha * (m.KVCacheUsagePerc - kvThreshold) / (1.0 - kvThreshold)
 		}
 
-		load := waitingLoad + alpha*m.KVCacheUsagePerc + tokenLoad
+		// Slot utilisation: running requests normalised by max model capacity.
+		// Clamped to [0, 1] before applying beta so an overloaded pod never
+		// produces a negative score contribution.
+		slotLoad := 0.0
+		if beta > 0 {
+			util := m.NumRequestsRunning / maxNumSeqs
+			if util > 1.0 {
+				util = 1.0
+			}
+			slotLoad = beta * util
+		}
+
+		load := waitingLoad + kvLoad + slotLoad
 		scores[i] = 1.0 / (load + epsilon)
 		totalScore += scores[i]
 	}
