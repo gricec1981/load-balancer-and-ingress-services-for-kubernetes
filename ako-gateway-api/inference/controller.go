@@ -470,7 +470,14 @@ func parseInferencePool(obj *unstructured.Unstructured) (*InferencePool, error) 
 	}
 	pool.Spec.TargetPort = int32(port)
 
-	selectorMap, _, _ := unstructured.NestedStringMap(spec, "selector", "matchLabels")
+	// Upstream inference.networking.x-k8s.io/v1alpha2 defines `selector` as a flat
+	// map of label key/value pairs (Service-style), NOT a Kubernetes LabelSelector.
+	// Read that form first; fall back to selector.matchLabels for CRDs that shape
+	// the field as a LabelSelector.
+	selectorMap, _, _ := unstructured.NestedStringMap(spec, "selector")
+	if len(selectorMap) == 0 {
+		selectorMap, _, _ = unstructured.NestedStringMap(spec, "selector", "matchLabels")
+	}
 	pool.Spec.Selector.MatchLabels = selectorMap
 
 	return pool, nil
