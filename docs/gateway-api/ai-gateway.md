@@ -223,13 +223,28 @@ The `HTTP_RESP` event can't see the body, but the **`HTTP_RESP_DATA`** event can
 | `completion_tokens` | completion/output tokens |
 | `total_tokens` | total (falls back to prompt + completion if absent) |
 
+Two safeguards keep the body-parse path honest:
+
+- **Gated to POST + JSON.** `HTTP_RESP` only enables buffering when the request was a `POST` and
+  the response `Content-Type` is `application/json`. So `GET /metrics` scrapes, health checks,
+  and streaming `text/event-stream` responses are never buffered or scanned — no wasted SE work
+  and no accidental parsing of non-completion bodies.
+- **Fail-closed on unreadable usage.** If a buffered JSON completion (it has the
+  `"object":"chat.completion"` / `"choices"` markers, which survive a tail truncation) yields no
+  parseable `usage` — because the body was larger than the buffer, or compressed — the script
+  charges a conservative penalty (`FailClosedTokens`, ~`RespBodyBufferKB*1024/4`) instead of 0,
+  so the consumer's **next** request is blocked rather than letting an over-buffer response slip
+  through the budget unmetered.
+
 > **Buffering cost / streaming.** `usage` sits at the *end* of the body, so the SE buffers the
-> whole response before parsing — controlled by `RespBodyBufferKB` (default 64 KB; raise it for
-> large completions). This buffers (store-and-forward) rather than streams, so it suits
-> non-streaming API traffic. For **streaming** (SSE) responses, buffering the whole stream
-> defeats token-by-token delivery — there, meter in a proxy/sidecar and report out-of-band, or
-> rate-limit by request count instead. The older response-header approach
-> (`X-Prompt-Tokens` / `X-Completion-Tokens` / `X-Total-Tokens` emitted by a sidecar) is still a
+> whole response before parsing — controlled by `RespBodyBufferKB` (default 256 KB ≈ ~40K output
+> tokens; size it to your model's `max_tokens` — roughly `max_tokens * 6` bytes). This buffers
+> (store-and-forward) rather than streams, so it suits non-streaming API traffic. The memory cost
+> is the buffered body per in-flight response, so very high concurrency × large responses eats SE
+> memory (and competes with connection capacity). For **streaming** (SSE) responses, buffering
+> the whole stream defeats token-by-token delivery — there, meter in a proxy/sidecar and report
+> out-of-band, or rate-limit by request count instead. The response-header approach
+> (`X-Prompt-Tokens` / `X-Completion-Tokens` / `X-Total-Tokens` emitted by a sidecar) remains a
 > valid alternative when you want to keep the SE in streaming pass-through.
 
 ### Avi object mapping

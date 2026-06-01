@@ -320,11 +320,13 @@ few single-threaded mock pods can saturate them and fail health checks — scale
 add replicas.
 
 **Token limits never fire** — the DataScript parses `usage.total_tokens` from the response
-**body** (in `HTTP_RESP_DATA`). Check the backend actually returns an OpenAI `usage` block, and
-that the body fits within `RespBodyBufferKB` (default 64 KB — `usage` sits at the end of the
-body, so a response larger than the buffer is truncated before the `usage` is reached). Note the
-bundled workload-sim mock can report large token counts — reset it
-(`/set?prompt=25&completion=75`) for a clean 100-token-per-request demo.
+**body** (in `HTTP_RESP_DATA`). Check the backend actually returns a non-streaming
+`application/json` response with an OpenAI `usage` block, and that the body fits within
+`RespBodyBufferKB` (default 256 KB — `usage` sits at the end of the body, so a response larger
+than the buffer would normally be truncated; the script now charges `FailClosedTokens` for such a
+completion rather than letting it through unmetered). Note the bundled workload-sim mock can
+report large token counts — reset it (`/set?prompt=25&completion=75`) for a clean
+100-token-per-request demo.
 
 **Every request 302-redirects to the issuer / never gets a 200** — that is the OIDC login
 redirect (expected when unauthenticated). Drive the flow with a cookie jar (the B3 harness), make

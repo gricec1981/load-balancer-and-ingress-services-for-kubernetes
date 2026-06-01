@@ -32,9 +32,21 @@ const DSTableName = "ai_tok"
 
 // RespBodyBufferKB is how much of the response body the SE buffers so the
 // HTTP_RESP_DATA script can read the OpenAI `usage` block (which sits at the end
-// of the JSON). Sized generously for the demo; a real vLLM deployment with long
-// completions should raise this to cover the largest expected response body.
-const RespBodyBufferKB = 64
+// of the JSON). `usage` is only reachable if the whole body fits, so size this to
+// your largest expected completion (~max_tokens * 6 bytes). 256 KB covers
+// ~40K output tokens; raise it for long-form generation (cost is SE memory per
+// in-flight buffered response).
+const RespBodyBufferKB = 256
+
+// FailClosedTokens is the conservative token amount charged when a buffered JSON
+// completion has no parseable `usage` — i.e. the body was truncated (larger than
+// RespBodyBufferKB) or compressed. Charging a large penalty (instead of 0) keeps
+// an over-buffer or unparseable response from slipping through the budget
+// unmetered; the response itself already reached the client, so this consumes the
+// consumer's budget so their *next* request is blocked. Derived from the buffer
+// size (~RespBodyBufferKB*1024/4 tokens) — a response that didn't fit must have
+// been at least this large.
+const FailClosedTokens = RespBodyBufferKB * 1024 / 4
 
 // DSNameReq / DSNameResp / DSNameRespData are the suffixes appended to the VS
 // name to generate DataScript set names.  One DataScript set is created per
@@ -105,11 +117,9 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy) TokenAccount
 	}
 
 	// ── Response-header phase: enable body buffering ──────────────────────
-	// The body is not available in HTTP_RESP; this only turns on buffering so
-	// the HTTP_RESP_DATA phase can read it.
-	respParts = append(respParts,
-		"-- AKO AI Gateway: buffer the response body so HTTP_RESP_DATA can read usage",
-		fmt.Sprintf("avi.http.set_response_body_buffer_size(%d)", RespBodyBufferKB))
+	// The body is not available in HTTP_RESP; this only turns on buffering (for
+	// POST responses with a JSON content-type) so HTTP_RESP_DATA can read it.
+	respParts = append(respParts, buildBufferEnableBlock())
 
 	// ── Response-body phase: account for tokens ───────────────────────────
 	respDataParts = append(respDataParts, "-- AKO AI Gateway: token-usage accounting (from response body)")
@@ -330,6 +340,25 @@ func buildReqLimitBlock(limit TokenLimit) string {
 	return b.String()
 }
 
+// buildBufferEnableBlock generates the HTTP_RESP Lua that turns on response-body
+// buffering — but only for POST requests with a JSON response content-type. This
+// skips GET /metrics scrapes, health checks, and streaming (text/event-stream)
+// responses, so the SE doesn't buffer + scan bodies that never carry a usage
+// block. get_method is pcall-guarded so the gate degrades to content-type-only
+// if the function isn't available in this event.
+func buildBufferEnableBlock() string {
+	return fmt.Sprintf(`-- AKO AI Gateway: buffer the JSON response body so HTTP_RESP_DATA can read usage
+do
+  local ct = avi.http.get_header("Content-Type") or ""
+  local is_json = string.find(ct, "application/json", 1, true) ~= nil
+  local is_post = true
+  do local ok, m = pcall(avi.http.get_method); if ok and m then is_post = (m == "POST") end end
+  if is_json and is_post then
+    avi.http.set_response_body_buffer_size(%d)
+  end
+end`, RespBodyBufferKB)
+}
+
 // buildUsageParseBlock generates the Lua snippet that extracts prompt_tokens,
 // completion_tokens, and total_tokens directly from the OpenAI-compatible
 // `usage` block in the buffered response body. It runs in the HTTP_RESP_DATA
@@ -359,7 +388,19 @@ end
 local prompt_tokens     = _num_after('"prompt_tokens"')
 local completion_tokens = _num_after('"completion_tokens"')
 local total_tokens      = _num_after('"total_tokens"')
-if total_tokens == 0 then total_tokens = prompt_tokens + completion_tokens end`, RespBodyBufferKB)
+if total_tokens == 0 then total_tokens = prompt_tokens + completion_tokens end
+-- Fail-closed: a buffered JSON completion (it reached here, so HTTP_RESP saw a
+-- JSON content-type) with no parseable usage was truncated (body > buffer) or
+-- compressed. The "object":"chat.completion" / "choices" markers sit at the head
+-- of the body and survive a tail truncation, so their presence means this really
+-- was a completion that should have been metered. Charge a penalty so it cannot
+-- slip through the budget unmetered.
+if total_tokens == 0 and _body and
+   (string.find(_body, "chat.completion", 1, true) or string.find(_body, '"choices"', 1, true)) then
+  total_tokens      = %d
+  prompt_tokens     = %d
+  completion_tokens = %d
+end`, RespBodyBufferKB, FailClosedTokens, FailClosedTokens, FailClosedTokens)
 }
 
 // buildRespLimitBlock generates the Lua snippet that increments one counter in
