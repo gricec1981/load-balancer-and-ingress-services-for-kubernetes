@@ -2,7 +2,7 @@
 
 ## Overview
 
-The AKO AI Gateway extension adds **JWT authentication** and **token-based rate limiting**
+The AKO AI Gateway extension adds **OAuth/OIDC authentication** and **token-based rate limiting**
 (including **per-group token budgets**) to any HTTPRoute managed by AKO's Gateway API
 controller. Both capabilities are expressed as lightweight Kubernetes CRDs that attach to an
 HTTPRoute via a `targetRef` and are reconciled into existing Avi Service Engine features — no
@@ -10,6 +10,15 @@ sidecars, no external rate-limit servers, no changes to the data-plane binary.
 
 This feature builds directly on top of the [AKO Inference Extension](inference-extension.md).
 It is designed to protect and govern the same LLM endpoints that `InferencePool` load-balances.
+
+> **Why OAuth/OIDC and not raw JWT validation?** Avi's `SSO_TYPE_JWT` validates a bearer token
+> but **strips the `Authorization` header before any DataScript runs**, and this Avi build has no
+> mechanism to inject validated claims as headers — so a token-budget DataScript cannot read the
+> per-group claim. Avi's **OAuth/OIDC** flow is a browser, session-cookie **authorization-code**
+> flow: the Service Engine runs the login redirect, exchanges the code for a token, validates it,
+> and exposes the verified claims to DataScripts via `avi.http.oauth_get_claim()`. That is the
+> supported path for "validate the token **and** read its claims in a DataScript", so the AI
+> Gateway builds on it. Because OAuth/OIDC requires TLS, the **Gateway listener must be HTTPS**.
 
 ---
 
@@ -33,25 +42,30 @@ It is designed to protect and govern the same LLM endpoints that `InferencePool`
                     ▼
 ┌─────────────────────────────────────────────────────┐
 │  Avi Controller   (objects AKO creates/manages)      │
-│  JWTServerProfile  ←  issuer + JWKS (fetched by AKO)  │
-│  AuthProfile (JWT) ←  wraps the JWTServerProfile      │
-│  SSOPolicy (JWT)   ←  references the AuthProfile       │
-│  Virtual Service                                     │
-│  ├─ SsoPolicyRef + jwt_config  ← JWT validation       │
+│  Pool                ←  issuer Service endpoints      │
+│  AuthProfile (OAUTH) ←  issuer + jwks_uri → the Pool  │
+│  SSOPolicy (OAUTH)   ←  references the AuthProfile     │
+│  Virtual Service (HTTPS / TLS-terminating)           │
+│  ├─ SsoPolicyRef + oauth_vs_config ← OIDC validation  │
 │  └─ DataScriptSet ← budget enforcement + accounting   │
 └─────────────────────────────────────────────────────┘
 ```
 
 **Control flow:**
 
-1. User creates `AIGatewayAuthPolicy` and/or `AITokenRateLimitPolicy` targeting an `HTTPRoute`.
+1. User creates `AIGatewayAuthPolicy` and/or `AITokenRateLimitPolicy` targeting an `HTTPRoute`
+   on an **HTTPS** Gateway listener.
 2. AKO's informers detect the event, parse the CR into the `PolicyStore`, and re-enqueue the
    targeted HTTPRoute.
 3. During `BuildChildVS`, AKO calls `ApplyAuthPolicy` and `ApplyTokenRateLimitPolicy` for each
-   policy attached to the route. For auth, AKO **creates/updates the JWTServerProfile,
-   AuthProfile and SSOPolicy** in Avi and wires `SsoPolicyRef` + `jwt_config` onto the VS.
+   policy attached to the route. For auth, AKO **creates/updates the issuer Pool, the
+   `AUTH_PROFILE_OAUTH` AuthProfile and the `SSO_TYPE_OAUTH` SSOPolicy** in Avi and wires
+   `SsoPolicyRef` + `oauth_vs_config` onto the VS (the same way the `SSORule` CRD attaches OAuth).
 4. The resulting Avi Virtual Service node and its DataScripts are pushed to the Avi controller
    via the normal REST path.
+5. At request time the SE runs the OIDC auth-code flow against the issuer, validates the token,
+   and the token-budget DataScript reads the verified `group` (and `sub`) via
+   `avi.http.oauth_get_claim()`.
 
 ---
 
@@ -63,9 +77,12 @@ It is designed to protect and govern the same LLM endpoints that `InferencePool`
   runtime flag — no rebuild is needed to toggle it, only a Helm value change)
 - Install the two CRDs on the cluster before enabling the feature flag (see
   [Installing the CRDs](#installing-the-crds))
-- For JWT auth: the JWT issuer's **JWKS endpoint must be reachable from the AKO pod** (AKO
-  fetches the keys and stores them in the Avi `JWTServerProfile`). The Avi Controller itself
-  does not need to reach the issuer.
+- For auth: the **Gateway listener must be HTTPS** (OAuth/OIDC requires TLS termination).
+- For auth: the OIDC issuer must be an **OAuth/OIDC provider** (discovery, `/authorize`,
+  `/token` code exchange, `/jwks`). The **Avi Service Engine** reaches the issuer's `/jwks` and
+  `/token` at runtime through an Avi **Pool** that AKO builds from the issuer Service's
+  endpoints — so the issuer must be reachable from the SE data path (in Azure CNI, pod IPs are
+  VNet-routable; the in-cluster `jwt-issuer` works as-is).
 
 ---
 
@@ -109,43 +126,48 @@ Both CRDs are namespaced and live under the `ai.ako.vmware.com` API group, versi
 
 ---
 
-## JWT Authentication — `AIGatewayAuthPolicy`
+## OAuth/OIDC Authentication — `AIGatewayAuthPolicy`
 
 ### What it does
 
-- Validates the `Authorization: Bearer <token>` JWT on every inbound request using an Avi SSO
-  Policy that **AKO creates and manages**.
-- Makes the validated JWT claims available to downstream token-rate-limit enforcement.
+- Authenticates inbound requests via the Avi **OAuth/OIDC** flow on an SSO Policy that **AKO
+  creates and manages**. Unauthenticated requests are redirected into the issuer's
+  authorization-code login; once authenticated, the SE validates the token and carries a session.
+- Makes the **verified** token claims (e.g. `sub`, `group`) available to downstream
+  token-rate-limit enforcement via `avi.http.oauth_get_claim()`.
 
-### AKO-managed Avi objects (no manual SSO/JWT setup)
+> **This is a browser/session flow, not an API-bearer flow.** Avi obtains the token itself
+> through the OIDC redirect and stores it in a session cookie — it does not validate a bearer
+> token presented on the `Authorization` header. Drive the demo with a cookie jar (a browser, or
+> `curl -c jar`), not by sending `Authorization: Bearer`.
+
+### AKO-managed Avi objects (no manual OAuth setup)
 
 When you apply an `AIGatewayAuthPolicy`, AKO creates/updates three Avi objects and wires them
 onto the VS. Names are derived from the policy namespace/name:
 
 | Avi object | Name | Built from |
 |---|---|---|
-| `JWTServerProfile` (type `CLIENT_AUTH`) | `<ns>-<name>-jwt` | `jwt.issuer` + JWKS fetched from `jwt.jwksUri` |
-| `AuthProfile` (type `AUTH_PROFILE_JWT`) | `<ns>-<name>-jwt-auth` | references the JWTServerProfile |
-| `SSOPolicy` (type `SSO_TYPE_JWT`) | `<ns>-<name>-sso` | references the AuthProfile |
-| VS `sso_policy_ref` + `jwt_config` | — | `jwt.audiences[0]`, location = Authorization header |
+| `Pool` | `<ns>-<name>-oauth-pool` | the issuer Service's endpoint IPs (so the SE can reach `/jwks` and `/token`) |
+| `AuthProfile` (type `AUTH_PROFILE_OAUTH`) | `<ns>-<name>-oauth` | `jwt.issuer`, `jwt.jwksUri`, and the OAuth endpoints, pointing at the Pool |
+| `SSOPolicy` (type `SSO_TYPE_OAUTH`) | `<ns>-<name>-oauth-sso` | references the AuthProfile |
+| VS `sso_policy_ref` + `oauth_vs_config` | — | client `app_settings` + `resource_server` (`access_type: JWT`, `audiences[0]`), `redirect_uri` on the route host |
 
-AKO fetches the JWKS from `jwt.jwksUri` and stores the key set directly in the JWTServerProfile,
-so the Avi Controller never needs network access to the issuer. The objects are checksum-gated
-(no Avi writes when nothing changed) and deleted when the `AIGatewayAuthPolicy` is removed.
+Unlike the JWT flow, the **SE fetches the JWKS at runtime through the Pool** (it has no cluster
+DNS), so AKO resolves the issuer Service's endpoints into Pool servers. The Pool is treated as
+immutable once OAuth-bound (Avi blocks server edits); if the issuer endpoints change, delete and
+re-apply the `AIGatewayAuthPolicy`. The objects are deleted when the policy is removed.
 
 ### How claims reach rate limiting
 
-After the SSO Policy validates the token, the `AITokenRateLimitPolicy` DataScript reads the
-required claims (e.g. `sub`, `group`) by **decoding the JWT payload directly** from the
-`Authorization` header inside the DataScript (base64url-decode + claim lookup). This is the
-reliable path on the Service Engine and does not depend on Avi injecting per-claim headers.
-
-> `spec.jwt.forwardClaims` additionally emits Avi HTTP request rules that copy
-> `X-AVI-JWT-<CLAIM>` headers into request headers. Whether those source headers are present
-> depends on the Avi/SSO configuration; the in-DataScript decode above is the mechanism the
-> token-limit policy relies on.
+After the OIDC flow validates the token, the `AITokenRateLimitPolicy` DataScript reads the
+required claims (e.g. `sub`, `group`) with `avi.http.oauth_get_claim(0, "<claim>")` — the
+SE-verified claim, not a client-supplied value. (The accessor returns a Lua table on this Avi
+build; AKO's generated DataScript unwraps the first scalar.)
 
 ### Example
+
+The issuer must be a real OIDC provider and the route must sit on an HTTPS Gateway listener:
 
 ```yaml
 apiVersion: ai.ako.vmware.com/v1alpha1
@@ -159,14 +181,13 @@ spec:
     kind: HTTPRoute
     name: llm-route
   jwt:
-    issuer: "https://auth.example.com"
-    jwksUri: "https://auth.example.com/.well-known/jwks.json"   # AKO fetches + caches the keys
+    issuer: "http://jwt-issuer.inference.svc.cluster.local:8080"          # token `iss`
+    jwksUri: "http://jwt-issuer.inference.svc.cluster.local:8080/jwks"     # SE fetches via the Pool
     audiences:
-      - "llm-api"
+      - "llm-api"               # access-token aud + OAuth client_id
     identityClaim: sub          # default; becomes the consumer identity
     forwardClaims:
-      - group                   # used for per-group token budgets
-      - tenant
+      - group                   # group claim used for per-group budgets
   identityHeader: x-ai-consumer # default
   onFailure:
     statusCode: 401             # default
@@ -219,7 +240,7 @@ Counters are stored in the Avi VS string table (`avi.vs.table_lookup` / `table_r
 
 The consumer identity (the counter key) is resolved in this order:
 
-1. The `sub` claim decoded from the bearer JWT (when `AIGatewayAuthPolicy` is in use).
+1. The verified `sub` claim from `avi.http.oauth_get_claim()` (when `AIGatewayAuthPolicy` is in use).
 2. The configured identity header (`identitySource.header`, default `x-ai-consumer`).
 3. The fallback: `clientIP` (default) keys on the source IP; `reject` returns HTTP 401 when no
    identity is found.
@@ -301,8 +322,8 @@ current window boundary.
 
 ## Combining Auth and Group-based Rate Limiting
 
-Apply both policies to the same HTTPRoute for the full stack — JWT auth resolves identity and
-group, and the token policy enforces per-group budgets keyed on the JWT `sub`:
+Apply both policies to the same HTTPRoute for the full stack — OAuth/OIDC auth resolves identity
+and group, and the token policy enforces per-group budgets keyed on the verified `sub`:
 
 ```yaml
 apiVersion: ai.ako.vmware.com/v1alpha1
@@ -348,13 +369,13 @@ AKO applies both policies during the same `BuildChildVS` reconcile cycle.
 | `spec.targetRef.group` | string | yes | API group of referent (`gateway.networking.k8s.io`) |
 | `spec.targetRef.kind` | string | yes | `HTTPRoute` or `Gateway` |
 | `spec.targetRef.name` | string | yes | Name of the referent in the same namespace |
-| `spec.jwt.issuer` | string | yes | Expected `iss` claim value |
-| `spec.jwt.jwksUri` | string | no | JWKS endpoint URL. AKO fetches and caches the keys into the JWTServerProfile |
-| `spec.jwt.audiences` | []string | no | Acceptable `aud` values (skip validation if empty) |
+| `spec.jwt.issuer` | string | yes | OIDC issuer URL; must match the token `iss` and is used as the OAuthProfile issuer |
+| `spec.jwt.jwksUri` | string | yes | JWKS endpoint URL. The SE fetches it at runtime through the AKO-built issuer Pool |
+| `spec.jwt.audiences` | []string | no | Access-token `aud` + OAuth `client_id` (uses `audiences[0]`) |
 | `spec.jwt.identityClaim` | string | no | Claim used as consumer identity. Default: `sub` |
-| `spec.jwt.forwardClaims` | []string | no | Additional claims to forward as request headers |
+| `spec.jwt.forwardClaims` | []string | no | Claims of interest (e.g. `group`); read in the DataScript via `oauth_get_claim` |
 | `spec.identityHeader` | string | no | Header for resolved identity. Default: `x-ai-consumer` |
-| `spec.onFailure.statusCode` | int | no | HTTP status on JWT failure. Default: `401` |
+| `spec.onFailure.statusCode` | int | no | HTTP status on auth failure. Default: `401` |
 
 ### AITokenRateLimitPolicy
 
@@ -384,13 +405,28 @@ AKO applies both policies during the same `BuildChildVS` reconcile cycle.
 **Policy not taking effect after apply**
 
 ```bash
-kubectl logs -n avi-system ako-0 -c ako-gateway-api | grep "AIGateway\|ai-tok\|SsoPolicyRef\|JWTServerProfile\|SSOPolicy"
+kubectl logs -n avi-system ako-0 -c ako-gateway-api | grep "AIGateway\|ai-tok\|SsoPolicyRef\|issuer Pool\|OAuth"
 ```
 
-**JWT validates but group budget rejects with 403 `unknown_group`**
+**Request 302-redirects to the issuer and never completes**
 
-The DataScript decodes the `group` claim from the bearer JWT. Confirm the issued token actually
-carries the claim named in `groupHeader`, and that the value matches a key in `groupBudgets`.
+That is the OIDC login redirect — expected for an unauthenticated request. Drive the flow with a
+cookie jar so the auth-code exchange and session cookie are followed (`curl -c jar -b demo_user=…`,
+or a browser). Confirm the **Gateway listener is HTTPS** (OAuth needs TLS) and that the
+`redirect_uri` path falls under the route's path prefix so the callback lands on the child VS.
+
+**Request 404s on the OAuth callback**
+
+The callback must be content-switched to the EVH child holding `oauth_vs_config`; AKO places it
+under the route prefix (e.g. `/v1/oauth/callback`). If you changed the route path, the callback
+path must move with it.
+
+**Auth succeeds but group budget rejects with 403 `unknown_group`**
+
+The DataScript reads the verified `group` claim via `oauth_get_claim`. Confirm the issued token
+carries the claim named in `groupHeader` and that its value is a key in `groupBudgets`. Check that
+the issuer Pool is `OPER_UP` and reachable from the SE (a failed JWKS fetch makes Avi fall back to
+the login redirect instead of validating).
 
 **Token limits not enforced / 429 never fires**
 
@@ -409,14 +445,13 @@ Install the CRDs and restart the `ako-gateway-api` pod.
 
 | Phase | Feature | Status |
 |---|---|---|
-| 1 | `AIGatewayAuthPolicy` — JWT validation | ✅ Done |
 | 1 | `AITokenRateLimitPolicy` — DataScript token accounting | ✅ Done |
 | 1 | Soft RPS rate limiting (DataScript token bucket) | ✅ Done |
-| 1.5 | AKO-managed `JWTServerProfile` + `AuthProfile` + `SSOPolicy` lifecycle | ✅ Done |
 | 1.5 | Per-group token budgets (`groupHeader` / `groupBudgets`) | ✅ Done |
-| 1.5 | Native distributed rate limiter (`avi.vs.rate_limiter()`) for exact cross-SE limits | Planned |
-| 2 | `AIObservabilityPolicy` — per-request token usage logging | Planned |
-| 2 | mTLS / OIDC in `AIGatewayAuthPolicy` | Planned |
+| 2 | `AIGatewayAuthPolicy` — OAuth/OIDC auth, AKO-managed `Pool` + `AuthProfile` + `SSOPolicy` lifecycle | ✅ Done |
+| 2 | Verified claims in the DataScript via `oauth_get_claim` | ✅ Done |
+| 2.5 | Native distributed rate limiter (`avi.vs.rate_limiter()`) for exact cross-SE limits | Planned |
+| 2.5 | `AIObservabilityPolicy` — per-request token usage logging | Planned |
 
 ---
 

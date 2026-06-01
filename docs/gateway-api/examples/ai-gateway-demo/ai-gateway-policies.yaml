@@ -1,15 +1,16 @@
 ---
 # ai-gateway-policies.yaml
 #
-# AKO AI Gateway demo: JWT authentication + per-group token budgets on llm-route.
+# AKO AI Gateway demo: OAuth/OIDC authentication + per-group token budgets on llm-route.
 #
-# AKO (Phase 1.5) creates the Avi JWTServerProfile, AuthProfile and SSO Policy
-# automatically from the AIGatewayAuthPolicy below — no setup.sh / manual Avi setup.
-# You only need the jwt-issuer pod running (jwt-issuer.yaml) so AKO can fetch its JWKS.
+# AKO creates the Avi issuer Pool, AUTH_PROFILE_OAUTH AuthProfile and SSO_TYPE_OAUTH
+# Policy automatically from the AIGatewayAuthPolicy below — no manual Avi setup. You
+# need the in-cluster OIDC provider running (jwt-issuer.yaml) and the Gateway listener
+# must be HTTPS (OAuth/OIDC requires TLS).
 #
 # Apply:   kubectl apply -f ai-gateway-policies.yaml
 
-# ─── JWT authentication ──────────────────────────────────────────────────────
+# ─── OAuth/OIDC authentication ───────────────────────────────────────────────
 apiVersion: ai.ako.vmware.com/v1alpha1
 kind: AIGatewayAuthPolicy
 metadata:
@@ -22,17 +23,17 @@ spec:
     name: llm-route
 
   jwt:
-    # In-cluster issuer (ClusterIP). AKO fetches the JWKS from jwksUri and stores
-    # the keys in the Avi JWTServerProfile, so no public IP is needed.
+    # In-cluster OIDC provider. The Avi SE runs the auth-code flow and fetches the
+    # JWKS / exchanges the code at runtime through an Avi Pool that AKO builds from
+    # this Service's endpoints — so no public IP is needed (Azure CNI pod IPs are
+    # VNet-routable). `issuer` must match the token `iss`.
     issuer: "http://jwt-issuer.inference.svc.cluster.local:8080"
     jwksUri: "http://jwt-issuer.inference.svc.cluster.local:8080/jwks"
     audiences:
-    - llm-api
-    identityClaim: sub         # JWT sub -> consumer identity (per-user counter key)
+    - llm-api                  # access-token aud + OAuth client_id
+    identityClaim: sub         # sub -> consumer identity (per-user counter key)
     forwardClaims:
-    - group                    # group claim used for per-group budgets
-    - tenant
-    - model
+    - group                    # group claim used for per-group budgets (read via oauth_get_claim)
 
   identityHeader: x-ai-consumer
   onFailure:
@@ -50,8 +51,9 @@ spec:
     kind: HTTPRoute
     name: llm-route
 
-  # The token DataScript decodes the JWT directly; identitySource.header is the
-  # fallback when no JWT is present, and clientIP is the final fallback.
+  # The token DataScript reads the verified claims via oauth_get_claim;
+  # identitySource.header is the fallback when no session is present, and clientIP
+  # is the final fallback.
   identitySource:
     header: x-ai-consumer
     fallback: clientIP
@@ -59,8 +61,8 @@ spec:
   limits:
   # Per-user counter, but the budget ceiling is chosen by the user's group claim.
   - name: hourly-group-budget
-    key: consumer          # per-user counter (JWT sub)
-    groupHeader: group     # budget ceiling looked up from this JWT claim
+    key: consumer          # per-user counter (verified sub claim)
+    groupHeader: group     # budget ceiling looked up from this verified claim
     groupBudgets:
       group1: 500          # 5 x 100-token requests / hr
       group2: 1000         # 10 x 100-token requests / hr

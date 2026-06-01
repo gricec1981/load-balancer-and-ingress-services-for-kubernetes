@@ -7,14 +7,18 @@ The demo requires **no real LLMs or GPUs**. It reuses the `mock-llm` pod pattern
 OpenAI-compatible JSON and — importantly — emits the token-usage **response headers** the
 AI-Gateway DataScript reads.
 
-> **Two things that changed and matter for this guide**
+> **Three things that matter for this guide**
 > 1. **Token usage is read from response headers, not the body.** Avi DataScripts cannot read
 >    the response body in the `HTTP_RESP` event, so the backend emits
 >    `X-Prompt-Tokens` / `X-Completion-Tokens` / `X-Total-Tokens`. The bundled `mock-llm.yaml`
 >    does this; a metrics-only mock will account 0 tokens.
-> 2. **AKO manages the Avi JWT objects (Phase 1.5).** You no longer pre-create the
->    JWTServerProfile / SSO Policy. Applying an `AIGatewayAuthPolicy` makes AKO create them. You
->    only need the in-cluster `jwt-issuer` pod so AKO can fetch its JWKS.
+> 2. **Auth is OAuth/OIDC, and AKO manages the Avi objects.** Applying an `AIGatewayAuthPolicy`
+>    makes AKO create the issuer `Pool`, `AUTH_PROFILE_OAUTH` AuthProfile and `SSO_TYPE_OAUTH`
+>    Policy. You provide an in-cluster **OIDC provider** (`jwt-issuer.yaml`) — the SE runs the
+>    auth-code flow against it.
+> 3. **OAuth/OIDC requires an HTTPS Gateway listener.** The flow is a browser, session-cookie
+>    redirect — drive it with a cookie jar (a browser, or `curl -c jar`), not `Authorization:
+>    Bearer`.
 
 ---
 
@@ -24,7 +28,9 @@ AI-Gateway DataScript reads.
 |---|---|
 | Working inference-extension demo | Gateway, InferencePool, HTTPRoute already set up |
 | AKO image with AI Gateway code | This branch; toggled by `aiGateway.enabled` (no rebuild to toggle) |
-| Avi Controller reachable from AKO | For JWT auth (Part B) |
+| Avi Controller reachable from AKO | For the OAuth object lifecycle (Part B) |
+| HTTPS Gateway listener + TLS cert | OAuth/OIDC requires TLS (Part B, step B0) |
+| Issuer reachable from the Service Engine data path | The SE fetches JWKS / exchanges the code through an AKO-built Pool (Part B) |
 
 > Starting fresh? Complete [inference-install.md](inference-install.md) first, then return here.
 
@@ -167,19 +173,43 @@ kubectl delete aitokenratelimitpolicy llm-limits-flat -n inference
 
 ---
 
-## Part B — JWT auth + per-group token budgets
+## Part B — OAuth/OIDC auth + per-group token budgets
 
-Demonstrates: requests without a token → 401; with a valid token → identity + group come from
-the JWT; **group1 users get 500 tokens/hr, group2 users get 1000**; unknown groups → 403.
+Demonstrates: unauthenticated requests are redirected into the OIDC login; once authenticated,
+the **verified** group claim drives the budget — **group1 users get 500 tokens/hr, group2 get
+1000**; unknown groups → 403.
 
-### B1. Deploy the in-cluster JWT issuer
+> **This is a browser/session flow.** Avi obtains the token itself via the OIDC auth-code
+> redirect and stores it in a session cookie — it does *not* validate an `Authorization: Bearer`
+> token. Drive it with a cookie jar.
 
-The issuer self-generates an RSA key, signs RS256 JWTs (with a `group` claim), and serves JWKS.
-It is a **ClusterIP** service — the Avi Controller reaches it over the pod network and AKO fetches
-its JWKS in-cluster, so no public IP is needed.
+### B0. Put the route on an HTTPS Gateway listener
+
+OAuth/OIDC needs TLS. Add an HTTPS listener with a (self-signed, for the demo) cert and let the
+route attach to it:
 
 ```bash
-# RSA signing key (any RSA-2048 key works)
+# self-signed cert for the route host
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout /tmp/llm-tls.key -out /tmp/llm-tls.crt \
+  -subj "/CN=llm.demo.local" -addext "subjectAltName=DNS:llm.demo.local"
+kubectl create secret tls llm-tls -n inference --cert=/tmp/llm-tls.crt --key=/tmp/llm-tls.key
+
+# add an HTTPS listener (port 443, hostname llm.demo.local, certificateRefs: llm-tls)
+# to the Gateway, then re-apply it. See examples/ for a full gateway.yaml.
+kubectl get gateway avi-gateway -n inference \
+  -o jsonpath='{range .status.listeners[*]}{.name}: programmed={.conditions[?(@.type=="Programmed")].status}{"\n"}{end}'
+# http:  programmed=True
+# https: programmed=True
+```
+
+### B1. Deploy the in-cluster OIDC provider
+
+`jwt-issuer.yaml` is a small OIDC provider: discovery, `/authorize` (auth-code), `/token`
+(code exchange), `/jwks`. The logged-in user is chosen by a `demo_user` cookie so the flow can be
+driven headlessly. User → group: **alice/carol → group1, bob → group2, dave → admin**.
+
+```bash
 openssl genrsa -out /tmp/key.pem 2048
 kubectl create secret generic jwt-signing-key -n inference --from-file=key.pem=/tmp/key.pem
 
@@ -191,46 +221,64 @@ kubectl rollout status deployment/jwt-issuer -n inference
 
 ```bash
 kubectl apply -f docs/gateway-api/examples/ai-gateway-demo/ai-gateway-policies.yaml
+
+kubectl logs -n avi-system ako-0 -c ako-gateway-api | grep -E "issuer Pool|OAuth AuthProfile|OAuth SSOPolicy|OAuth SsoPolicyRef"
+# issuer Pool inference-llm-auth-oauth-pool created
+# OAuth AuthProfile inference-llm-auth-oauth created
+# OAuth SSOPolicy inference-llm-auth-oauth-sso created
+# AIGatewayAuthPolicy inference/llm-auth: set OAuth SsoPolicyRef -> inference-llm-auth-oauth-sso (audience=llm-api, host=llm.demo.local)
 ```
 
-This applies an `AIGatewayAuthPolicy` (issuer = `jwt-issuer.inference.svc.cluster.local:8080`) and
-the group-budget `AITokenRateLimitPolicy`. AKO then **creates the Avi objects automatically**:
+In the Avi UI they appear under **Applications → Pools** (`…-oauth-pool`), **Templates →
+Security → SSO Policies** (`…-oauth-sso`) and **Auth Profiles** (`…-oauth`).
 
-```bash
-kubectl logs -n avi-system ako-0 -c ako-gateway-api | grep -E "JWTServerProfile|SSOPolicy|SsoPolicyRef"
-# JWTServerProfile inference-llm-auth-jwt created
-# SSOPolicy inference-llm-auth-sso created
-# AIGatewayAuthPolicy inference/llm-auth: set SsoPolicyRef -> inference-llm-auth-sso (audience=llm-api)
+### B3. Run it (cookie-driven auth-code flow)
+
+The harness follows the redirect chain (`VS → issuer /authorize → /v1/oauth/callback → VS`),
+injecting the `demo_user` cookie at the issuer hop to pick the user, then fires N requests on the
+resulting session. Run it from an **in-cluster pod** (the issuer's `/authorize` is on a pod IP and
+the VIP may be private). Save as `oidc-test.py` and run with `python3` in a `python:3.11-slim` pod:
+
+```python
+import json, ssl, urllib.request, http.cookiejar
+from urllib.parse import urlparse
+# VIP of the avi-gateway (kubectl get gateway avi-gateway -n inference -o jsonpath=...)
+VIP = "10.225.0.100"
+with open("/etc/hosts", "a") as f: f.write(f"\n{VIP} llm.demo.local\n")
+ctx = ssl._create_unverified_context()
+class NoRedir(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k): return None
+def step(o, url, method, extra=None, body=None):
+    h = {"Content-Type": "application/json"}; h.update(extra or {})
+    try:
+        r = o.open(urllib.request.Request(url, data=body, headers=h, method=method), timeout=15)
+        return r.status, r.headers, r.read()
+    except urllib.error.HTTPError as e: return e.code, e.headers, e.read()
+def session(user):                         # walk the auth-code flow -> session cookie
+    o = urllib.request.build_opener(NoRedir, urllib.request.HTTPSHandler(context=ctx),
+                                    urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    url, method = "https://llm.demo.local/v1/chat/completions", "GET"
+    for _ in range(10):
+        host = urlparse(url).hostname or ""
+        extra = {"Cookie": "demo_user=" + user} if host.startswith("10.224") else None
+        s, hd, _ = step(o, url, method, extra); loc = hd.get("Location", "")
+        if s in (301,302,303,307,308) and loc:
+            url = loc if loc.startswith("http") else f"{urlparse(url).scheme}://{urlparse(url).netloc}{loc}"
+            method = "GET"
+        else: return o
+    return o
+def hit(o):
+    return step(o, "https://llm.demo.local/v1/chat/completions", "POST", body=b"{}")[0]
+for user, n in [("alice",6),("bob",11),("carol",1),("dave",1)]:
+    o = session(user); print(user, [hit(o) for _ in range(n)])
 ```
 
-In the Avi UI they appear under **Templates → Security → SSO Policies** (`inference-llm-auth-sso`)
-and **JWT Server Profiles** (`inference-llm-auth-jwt`).
+Expected (with the bundled 100-token mock): `alice [200×5, 429]`, `bob [200×10, 429]`,
+`carol [200]`, `dave [403]`.
 
-### B3. Run it
-
-```bash
-ISS=http://jwt-issuer.inference.svc.cluster.local:8080   # run these from an in-cluster pod
-tok() { curl -sf "$ISS/token?sub=$1&group=$2" | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])"; }
-hit() { curl -s -o /dev/null -w "%{http_code}" -X POST "http://${VIP}/v1/chat/completions" \
-          -H "Authorization: Bearer $1" -H "Content-Type: application/json" -d '{}'; }
-
-# no token -> 401
-curl -s -o /dev/null -w "no token: HTTP %{http_code}\n" -X POST "http://${VIP}/v1/chat/completions" -d '{}'
-
-# alice is group1 (budget 500 = 5 requests, 6th -> 429)
-A=$(tok alice group1); for i in $(seq 1 6); do echo "alice req $i: $(hit $A)"; done
-
-# bob is group2 (budget 1000 = 10 requests, 11th -> 429)
-B=$(tok bob group2);   for i in $(seq 1 11); do echo "bob req $i: $(hit $B)"; done
-
-# carol is also group1 but an INDEPENDENT counter -> 200
-C=$(tok carol group1); echo "carol req 1: $(hit $C)"
-
-# dave's group isn't in groupBudgets -> 403 unknown_group
-D=$(tok dave admin);   echo "dave req 1: $(hit $D)"
-```
-
-Expected: alice 5×200 then 429; bob 10×200 then 429; carol 200 (fresh counter); dave 403.
+> The `demo_user` cookie is matched against the issuer **pod IP** (`10.224.x`) in the harness —
+> adjust the prefix if your pod network differs. In a real browser demo, the user logs in at the
+> issuer instead of the cookie shortcut.
 
 ---
 
@@ -249,10 +297,11 @@ Expected: alice 5×200 then 429; bob 10×200 then 429; carol 200 (fresh counter)
 ## Cleanup
 
 ```bash
-kubectl delete aigatewayauthpolicy llm-auth -n inference        # AKO deletes the Avi SSO/JWT objects
+kubectl delete aigatewayauthpolicy llm-auth -n inference        # AKO deletes the Avi Pool/AuthProfile/SSO objects
 kubectl delete aitokenratelimitpolicy llm-limits -n inference
 kubectl delete -f docs/gateway-api/examples/ai-gateway-demo/jwt-issuer.yaml
 kubectl delete secret jwt-signing-key -n inference
+kubectl delete secret llm-tls -n inference
 kubectl delete -f docs/gateway-api/examples/ai-gateway-demo/mock-llm.yaml
 ```
 
@@ -269,12 +318,20 @@ few single-threaded mock pods can saturate them and fail health checks — scale
 add replicas.
 
 **Token limits never fire** — the backend isn't emitting `X-Total-Tokens` (or the prompt/
-completion pair). The DataScript reads usage from those headers, not the JSON body.
+completion pair). The DataScript reads usage from those headers, not the JSON body. Note the
+bundled workload-sim mock can report large token counts — reset it (`/set?prompt=25&completion=75`)
+for a clean 100-token-per-request demo.
 
-**429/403 wrong under JWT** — confirm the issued token carries the claim named in `groupHeader`
-and that its value is a key in `groupBudgets`. The DataScript decodes the claim from the bearer
-token; check the AKO logs for `SsoPolicyRef` to confirm auth is wired.
+**Every request 302-redirects to the issuer / never gets a 200** — that is the OIDC login
+redirect (expected when unauthenticated). Drive the flow with a cookie jar (the B3 harness), make
+sure the Gateway listener is HTTPS, and that the `redirect_uri` path sits under the route prefix
+(AKO uses `/v1/oauth/callback`).
 
-**JWT always 401** — confirm AKO created the SSO objects (`grep JWTServerProfile` in the logs)
-and that AKO could reach `jwksUri` to fetch the keys (the JWTServerProfile's `jwks_keys` must be
-populated).
+**Auth works but 429/403 is wrong** — confirm the issued token carries the claim named in
+`groupHeader` and that its value is a key in `groupBudgets`. The DataScript reads the verified
+claim via `oauth_get_claim`; check the AKO logs for `OAuth SsoPolicyRef`.
+
+**Validation seems to fail (always redirects even with a session)** — confirm the issuer Pool
+(`…-oauth-pool`) is `OPER_UP` and reachable from the SE; a failed JWKS fetch makes Avi fall back
+to the login redirect instead of validating. The Pool is immutable once OAuth-bound — if the
+issuer pod IP changed, delete and re-apply the `AIGatewayAuthPolicy` so AKO rebuilds it.

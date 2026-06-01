@@ -16,28 +16,33 @@ package aigateway
 
 import (
 	"fmt"
-	"strings"
 
 	"google.golang.org/protobuf/proto"
 
-	avimodels "github.com/vmware/alb-sdk/go/models"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/internal/nodes"
 	akov1alpha2 "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/pkg/apis/ako/v1alpha2"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/pkg/utils"
 )
 
-// ApplyAuthPolicy configures the Avi VS node model to enforce JWT authentication
-// as described in the AIGatewayAuthPolicy spec.
+// ApplyAuthPolicy configures the Avi VS node model to enforce OAuth/OIDC
+// authentication as described in the AIGatewayAuthPolicy spec.
 //
-// Avi object mapping (Phase 1.5):
-//   - JWTServerProfile: created/updated in Avi with issuer + JWKS keys fetched
-//     from spec.jwt.jwksUri.  Name: "<ns>-<name>-jwt".
-//   - AuthProfile (JWT): wraps the JWTServerProfile. Name: "<ns>-<name>-jwt-auth".
-//   - SSOPolicy (SSO_TYPE_JWT): references the AuthProfile. Name: "<ns>-<name>-sso".
-//     AKO sets VirtualService.SsoPolicyRef to this policy's Avi API path.
-//   - Identity header: HTTP request policy rules copy the Avi-injected JWT claim
-//     headers (X-AVI-JWT-<CLAIM>) into the user-configured header names so that
-//     downstream policies (e.g. AITokenRateLimitPolicy) have stable names.
+// Avi's SSO_TYPE_JWT validation strips the Authorization header before any
+// DataScript runs (and 31.2 offers no claim-to-header injection), so the
+// AI-Gateway uses the OAuth resource-server flow instead: the SE runs the OIDC
+// auth-code flow, validates the access token, and exposes its claims to the
+// token-budget DataScript via avi.http.oauth_get_claim(). OAuth/OIDC requires
+// the Gateway listener to terminate TLS (HTTPS).
+//
+// Avi object mapping (see oauth_rest.go):
+//   - Pool "<ns>-<name>-oauth-pool": servers = the issuer Service's endpoints
+//     (so the SE can fetch JWKS / exchange the auth code at runtime).
+//   - AuthProfile (AUTH_PROFILE_OAUTH) "<ns>-<name>-oauth": issuer + jwks_uri,
+//     pointing at the pool.
+//   - SSOPolicy (SSO_TYPE_OAUTH) "<ns>-<name>-oauth-sso".
+//   - The VS GeneratedFields get OauthVsConfig (client app_settings +
+//     resource_server access_type JWT) and SsoPolicyRef, attached the same way
+//     the SSORule CRD attaches OAuth to an EVH child.
 func ApplyAuthPolicy(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVsEvhSniModel, host string) {
 	if policy == nil {
 		return
@@ -168,70 +173,6 @@ func ApplyTokenRateLimitPolicy(key string, policy *AITokenRateLimitPolicy, vsNod
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
-// derivedSSOPolicyName generates the expected Avi SSO Policy name for a policy.
-func derivedSSOPolicyName(policy *AIGatewayAuthPolicy) string {
-	return fmt.Sprintf("%s-%s-sso", policy.Namespace, policy.Name)
-}
-
-// aviJWTClaimHeader returns the header name Avi's SSO policy injects for a given JWT claim.
-func aviJWTClaimHeader(claim string) string {
-	return "X-AVI-JWT-" + strings.ToUpper(claim)
-}
-
-// buildClaimForwardRules returns HTTPRequestRules that copy Avi-injected JWT
-// claim headers into user-configured header names.
-func buildClaimForwardRules(srcIdentityHeader, dstIdentityHeader string, forwardClaims []string, startIndex int32) []*avimodels.HTTPRequestRule {
-	var rules []*avimodels.HTTPRequestRule
-	idx := startIndex
-
-	rules = append(rules, buildHeaderCopyRule(
-		fmt.Sprintf("ai-auth-identity-%d", idx),
-		idx,
-		srcIdentityHeader,
-		dstIdentityHeader,
-	))
-	idx++
-
-	for _, claim := range forwardClaims {
-		src := aviJWTClaimHeader(claim)
-		dst := strings.ToLower(claim)
-		rules = append(rules, buildHeaderCopyRule(
-			fmt.Sprintf("ai-auth-fwd-%s-%d", dst, idx),
-			idx,
-			src,
-			dst,
-		))
-		idx++
-	}
-	return rules
-}
-
-// buildHeaderCopyRule constructs an HTTPRequestRule that copies srcHeader → dstHeader.
-// Avi HTTP policy variables for request headers use the form "$http_<name>" where
-// the header name has dashes replaced with underscores and is lowercased.
-// The rule adds dstHeader carrying the value of srcHeader.
-func buildHeaderCopyRule(ruleName string, index int32, srcHeader, dstHeader string) *avimodels.HTTPRequestRule {
-	// Convert "X-AVI-JWT-SUB" → "$http_x_avi_jwt_sub" per Avi variable naming.
-	srcVar := "$http_" + strings.ToLower(strings.ReplaceAll(srcHeader, "-", "_"))
-	return &avimodels.HTTPRequestRule{
-		Name:   proto.String(ruleName),
-		Enable: proto.Bool(true),
-		Index:  proto.Int32(index),
-		HdrAction: []*avimodels.HTTPHdrAction{
-			{
-				Action: proto.String("HTTP_ADD_HDR"),
-				Hdr: &avimodels.HTTPHdrData{
-					Name: proto.String(dstHeader),
-					Value: &avimodels.HTTPHdrValue{
-						Var: proto.String("HTTP_POLICY_VAR_HTTP_HDR"),
-						Val: proto.String(srcVar),
-					},
-				},
-			},
-		},
-	}
-}
-
 // buildRequestRateLimitScript returns the Lua snippet for per-consumer RPS rate
 // limiting using a per-SE soft token bucket.
 //
@@ -270,22 +211,6 @@ do
   avi.vs.table_remove(win_key)
   avi.vs.table_insert(win_key, tostring(cur + 1), 2)
 end`, keyExpr, burst, rl.RequestsPerSecond)
-}
-
-// findOrCreateHTTPPolicySet finds an existing HTTPPolicySetNode on the VS by
-// name, or creates and appends a new one.
-func findOrCreateHTTPPolicySet(name string, vsNode nodes.AviVsEvhSniModel) *nodes.AviHttpPolicySetNode {
-	for _, ps := range vsNode.GetHttpPolicyRefs() {
-		if ps.Name == name {
-			return ps
-		}
-	}
-	ps := &nodes.AviHttpPolicySetNode{
-		Name:   name,
-		Tenant: vsNode.GetTenant(),
-	}
-	vsNode.SetHttpPolicyRefs(append(vsNode.GetHttpPolicyRefs(), ps))
-	return ps
 }
 
 // addDataScriptNode adds or replaces an AviHTTPDataScriptNode in the VS's

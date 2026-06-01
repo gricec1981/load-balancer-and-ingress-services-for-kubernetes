@@ -1,0 +1,65 @@
+---
+# gateway.yaml
+#
+# Gateway for the AI Gateway demo. OAuth/OIDC auth (AIGatewayAuthPolicy) requires
+# the route to terminate TLS, so this Gateway exposes an HTTPS listener in addition
+# to HTTP. Create the TLS secret first (see ai-gateway-install.md, step B0):
+#
+#   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+#     -keyout /tmp/llm-tls.key -out /tmp/llm-tls.crt \
+#     -subj "/CN=llm.demo.local" -addext "subjectAltName=DNS:llm.demo.local"
+#   kubectl create secret tls llm-tls -n inference \
+#     --cert=/tmp/llm-tls.crt --key=/tmp/llm-tls.key
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: avi-gateway
+  namespace: inference
+spec:
+  gatewayClassName: avi-lb
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      hostname: "llm.demo.local"
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: "llm.demo.local"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            group: ""
+            name: llm-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+# httproute.yaml
+#
+# The route AIGatewayAuthPolicy / AITokenRateLimitPolicy attach to. The OAuth
+# callback AKO configures (https://<host>/v1/oauth/callback) deliberately sits
+# under this /v1 path prefix so it is content-switched to this child VS.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: llm-route
+  namespace: inference
+spec:
+  parentRefs:
+    - name: avi-gateway
+  hostnames:
+    - "llm.demo.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1
+      backendRefs:
+        - group: inference.networking.x-k8s.io
+          kind: InferencePool
+          name: llm-pool
