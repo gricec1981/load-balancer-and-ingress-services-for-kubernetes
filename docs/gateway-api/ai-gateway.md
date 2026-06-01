@@ -205,26 +205,38 @@ spec:
 - Optionally enforces a **classic requests-per-second** soft rate limit.
 - All enforcement runs as Lua DataScripts on the Avi Service Engine — no extra infrastructure.
 
-### Token usage source — response headers
+### Token usage source — the response body (`HTTP_RESP_DATA`)
 
-Avi DataScripts **cannot read the HTTP response body** in the `HTTP_RESP` event, so token
-accounting reads usage from **response headers** that the backend (or a proxy in front of it)
-emits:
+Token accounting parses the OpenAI-compatible `usage` block **directly from the response body**,
+so it works with **stock vLLM** — no token-header contract and no sidecar required.
 
-| Header | Meaning |
+The `HTTP_RESP` event can't see the body, but the **`HTTP_RESP_DATA`** event can:
+
+1. In `HTTP_RESP`, `avi.http.set_response_body_buffer_size(N)` tells the SE to buffer the body.
+2. In `HTTP_RESP_DATA`, `avi.http.get_response_body(N)` returns the buffered body, and the
+   DataScript reads `usage.total_tokens` / `prompt_tokens` / `completion_tokens` from the JSON
+   (sandbox-safe `string.find` + a digit scan — Avi's Lua sandbox lacks `string.match`).
+
+| Token field (read from `usage`) | Meaning |
 |---|---|
-| `X-Prompt-Tokens` | prompt/input tokens for the request |
-| `X-Completion-Tokens` | completion/output tokens |
-| `X-Total-Tokens` | total (falls back to prompt + completion if absent) |
+| `prompt_tokens` | prompt/input tokens |
+| `completion_tokens` | completion/output tokens |
+| `total_tokens` | total (falls back to prompt + completion if absent) |
 
-A real deployment would put a thin proxy/sidecar in front of vLLM that surfaces the OpenAI
-`usage.*` fields from the JSON body into these headers.
+> **Buffering cost / streaming.** `usage` sits at the *end* of the body, so the SE buffers the
+> whole response before parsing — controlled by `RespBodyBufferKB` (default 64 KB; raise it for
+> large completions). This buffers (store-and-forward) rather than streams, so it suits
+> non-streaming API traffic. For **streaming** (SSE) responses, buffering the whole stream
+> defeats token-by-token delivery — there, meter in a proxy/sidecar and report out-of-band, or
+> rate-limit by request count instead. The older response-header approach
+> (`X-Prompt-Tokens` / `X-Completion-Tokens` / `X-Total-Tokens` emitted by a sidecar) is still a
+> valid alternative when you want to keep the SE in streaming pass-through.
 
 ### Avi object mapping
 
 | Policy field | Avi mechanism |
 |---|---|
-| `limits[]` | Two **DataScript** nodes per VS: `<vsname>-ai-tok-req` (HTTP_REQ — enforce budget) and `<vsname>-ai-tok-resp` (HTTP_RESP — read the `X-*-Tokens` headers and update counters). |
+| `limits[]` | Three **DataScript** nodes per VS: `<vsname>-ai-tok-req` (HTTP_REQ — enforce budget), `<vsname>-ai-tok-resp` (HTTP_RESP — enable response-body buffering), and `<vsname>-ai-tok-respdata` (HTTP_RESP_DATA — parse `usage` from the body and update counters). |
 | `requestRateLimit` | Soft token-bucket logic prepended to the `HTTP_REQ` DataScript. |
 
 Counters are stored in the Avi VS string table (`avi.vs.table_lookup` / `table_remove` /

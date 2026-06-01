@@ -149,7 +149,6 @@ func ApplyTokenRateLimitPolicy(key string, policy *AITokenRateLimitPolicy, vsNod
 
 	scripts := GenerateTokenAccountingScripts(policy)
 	reqScript := scripts.ReqScript
-	respScript := scripts.RespScript
 
 	// Prepend RPS rate-limit logic to the REQ DataScript when configured.
 	if hasRateLimit {
@@ -164,7 +163,11 @@ func ApplyTokenRateLimitPolicy(key string, policy *AITokenRateLimitPolicy, vsNod
 		addDataScriptNode(key, vsName, tenant, DSReqName(vsName), DSEvtHTTPReq, reqScript, vsNode)
 	}
 	if hasTokenLimits {
-		addDataScriptNode(key, vsName, tenant, DSRespName(vsName), DSEvtHTTPResp, respScript, vsNode)
+		// HTTP_RESP enables response-body buffering; HTTP_RESP_DATA reads the
+		// buffered body and does the token accounting (parses usage directly
+		// from the JSON body, no backend token-header dependency).
+		addDataScriptNode(key, vsName, tenant, DSRespName(vsName), DSEvtHTTPResp, scripts.RespScript, vsNode)
+		addDataScriptNode(key, vsName, tenant, DSRespDataName(vsName), DSEvtHTTPRespData, scripts.RespDataScript, vsNode)
 	}
 
 	utils.AviLog.Infof("key: %s, msg: AITokenRateLimitPolicy %s/%s: registered token-accounting DataScripts on VS %s",

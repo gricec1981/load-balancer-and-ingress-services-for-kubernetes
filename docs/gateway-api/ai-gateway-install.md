@@ -8,10 +8,12 @@ OpenAI-compatible JSON and — importantly — emits the token-usage **response 
 AI-Gateway DataScript reads.
 
 > **Three things that matter for this guide**
-> 1. **Token usage is read from response headers, not the body.** Avi DataScripts cannot read
->    the response body in the `HTTP_RESP` event, so the backend emits
->    `X-Prompt-Tokens` / `X-Completion-Tokens` / `X-Total-Tokens`. The bundled `mock-llm.yaml`
->    does this; a metrics-only mock will account 0 tokens.
+> 1. **Token usage is parsed from the response body.** The DataScript reads the OpenAI `usage`
+>    block straight from the JSON body in the `HTTP_RESP_DATA` event (buffered via
+>    `set_response_body_buffer_size`) — so it works with **stock vLLM**, no token headers or
+>    sidecar required. (The bundled mock also emits `X-*-Tokens` headers, but they're no longer
+>    used.) Trade-off: the SE buffers the body, which suits non-streaming traffic; for streaming
+>    responses, meter in a proxy instead.
 > 2. **Auth is OAuth/OIDC, and AKO manages the Avi objects.** Applying an `AIGatewayAuthPolicy`
 >    makes AKO create the issuer `Pool`, `AUTH_PROFILE_OAUTH` AuthProfile and `SSO_TYPE_OAUTH`
 >    Policy. You provide an in-cluster **OIDC provider** (`jwt-issuer.yaml`) — the SE runs the
@@ -317,10 +319,12 @@ InferencePool. If you're running a large scale test, many InferencePools all scr
 few single-threaded mock pods can saturate them and fail health checks — scale the mock down or
 add replicas.
 
-**Token limits never fire** — the backend isn't emitting `X-Total-Tokens` (or the prompt/
-completion pair). The DataScript reads usage from those headers, not the JSON body. Note the
-bundled workload-sim mock can report large token counts — reset it (`/set?prompt=25&completion=75`)
-for a clean 100-token-per-request demo.
+**Token limits never fire** — the DataScript parses `usage.total_tokens` from the response
+**body** (in `HTTP_RESP_DATA`). Check the backend actually returns an OpenAI `usage` block, and
+that the body fits within `RespBodyBufferKB` (default 64 KB — `usage` sits at the end of the
+body, so a response larger than the buffer is truncated before the `usage` is reached). Note the
+bundled workload-sim mock can report large token counts — reset it
+(`/set?prompt=25&completion=75`) for a clean 100-token-per-request demo.
 
 **Every request 302-redirects to the issuer / never gets a 200** — that is the OIDC login
 redirect (expected when unauthenticated). Drive the flow with a cookie jar (the B3 harness), make

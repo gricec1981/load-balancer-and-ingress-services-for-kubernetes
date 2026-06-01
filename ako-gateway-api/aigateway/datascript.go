@@ -21,33 +21,50 @@ import (
 
 // DataScript event types used by Avi SE DataScripts.
 const (
-	DSEvtHTTPReq  = "VS_DATASCRIPT_EVT_HTTP_REQ"
-	DSEvtHTTPResp = "VS_DATASCRIPT_EVT_HTTP_RESP"
+	DSEvtHTTPReq      = "VS_DATASCRIPT_EVT_HTTP_REQ"
+	DSEvtHTTPResp     = "VS_DATASCRIPT_EVT_HTTP_RESP"
+	DSEvtHTTPRespData = "VS_DATASCRIPT_EVT_HTTP_RESP_DATA"
 )
 
 // DSTableName is the Avi SE table used to store per-window token counters.
 // The table is shared state across connections on the same SE.
 const DSTableName = "ai_tok"
 
-// DSNameReq / DSNameResp are the suffixes appended to the VS name to generate
-// DataScript set names.  One DataScript set is created per event phase.
+// RespBodyBufferKB is how much of the response body the SE buffers so the
+// HTTP_RESP_DATA script can read the OpenAI `usage` block (which sits at the end
+// of the JSON). Sized generously for the demo; a real vLLM deployment with long
+// completions should raise this to cover the largest expected response body.
+const RespBodyBufferKB = 64
+
+// DSNameReq / DSNameResp / DSNameRespData are the suffixes appended to the VS
+// name to generate DataScript set names.  One DataScript set is created per
+// event phase.
 const (
-	DSNameSuffixReq  = "-ai-tok-req"
-	DSNameSuffixResp = "-ai-tok-resp"
+	DSNameSuffixReq      = "-ai-tok-req"
+	DSNameSuffixResp     = "-ai-tok-resp"
+	DSNameSuffixRespData = "-ai-tok-respdata"
 )
 
-// TokenAccountingScripts holds the two Lua snippets (request-phase enforcement
-// and response-phase accounting) generated from an AITokenRateLimitPolicy.
+// TokenAccountingScripts holds the Lua snippets generated from an
+// AITokenRateLimitPolicy: request-phase enforcement, a response-header-phase
+// buffer-enable, and response-body-phase accounting.
 type TokenAccountingScripts struct {
 	// ReqScript is the HTTP_REQ phase Lua code.  It looks up per-identity token
 	// counters and rejects the request when any limit is already exceeded.
 	ReqScript string
 
-	// RespScript is the HTTP_RESP phase Lua code.  It parses the OpenAI-compatible
-	// `usage` block in the response body and increments every applicable counter.
-	// For streaming (SSE) responses the script parses only the terminal `data:`
-	// chunk that carries `stream_options.include_usage=true`.
+	// RespScript is the HTTP_RESP phase Lua code.  Response headers are parsed
+	// here, but the body is not yet available — so this script only enables
+	// response-body buffering (avi.http.set_response_body_buffer_size) so the
+	// HTTP_RESP_DATA phase can read it.
 	RespScript string
+
+	// RespDataScript is the HTTP_RESP_DATA phase Lua code.  The buffered response
+	// body is available here (avi.http.get_response_body), so it parses the
+	// OpenAI-compatible `usage` block directly from the JSON body and increments
+	// every applicable counter — no dependency on the backend emitting token
+	// headers.
+	RespDataScript string
 }
 
 // GenerateTokenAccountingScripts produces the two Lua DataScript snippets that
@@ -69,7 +86,7 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy) TokenAccount
 		fallback = spec.IdentitySource.Fallback
 	}
 
-	var reqParts, respParts []string
+	var reqParts, respParts, respDataParts []string
 
 	// ── Shared header: resolve identity ────────────────────────────────────
 	identityBlock := buildIdentityBlock(identityHeader, fallback)
@@ -87,20 +104,28 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy) TokenAccount
 		reqParts = append(reqParts, buildReqLimitBlock(limit))
 	}
 
-	// ── Response-phase: account for tokens ────────────────────────────────
-	respParts = append(respParts, "-- AKO AI Gateway: token-usage accounting")
-	respParts = append(respParts, helper)
-	respParts = append(respParts, identityBlock)
-	respParts = append(respParts, "local now = os.time()")
-	respParts = append(respParts, buildUsageParseBlock())
+	// ── Response-header phase: enable body buffering ──────────────────────
+	// The body is not available in HTTP_RESP; this only turns on buffering so
+	// the HTTP_RESP_DATA phase can read it.
+	respParts = append(respParts,
+		"-- AKO AI Gateway: buffer the response body so HTTP_RESP_DATA can read usage",
+		fmt.Sprintf("avi.http.set_response_body_buffer_size(%d)", RespBodyBufferKB))
+
+	// ── Response-body phase: account for tokens ───────────────────────────
+	respDataParts = append(respDataParts, "-- AKO AI Gateway: token-usage accounting (from response body)")
+	respDataParts = append(respDataParts, helper)
+	respDataParts = append(respDataParts, identityBlock)
+	respDataParts = append(respDataParts, "local now = os.time()")
+	respDataParts = append(respDataParts, buildUsageParseBlock())
 
 	for _, limit := range spec.Limits {
-		respParts = append(respParts, buildRespLimitBlock(limit))
+		respDataParts = append(respDataParts, buildRespLimitBlock(limit))
 	}
 
 	return TokenAccountingScripts{
-		ReqScript:  strings.Join(reqParts, "\n"),
-		RespScript: strings.Join(respParts, "\n"),
+		ReqScript:      strings.Join(reqParts, "\n"),
+		RespScript:     strings.Join(respParts, "\n"),
+		RespDataScript: strings.Join(respDataParts, "\n"),
 	}
 }
 
@@ -306,23 +331,35 @@ func buildReqLimitBlock(limit TokenLimit) string {
 }
 
 // buildUsageParseBlock generates the Lua snippet that extracts prompt_tokens,
-// completion_tokens, and total_tokens from the backend response.
+// completion_tokens, and total_tokens directly from the OpenAI-compatible
+// `usage` block in the buffered response body. It runs in the HTTP_RESP_DATA
+// event, where avi.http.get_response_body() returns the body the SE buffered
+// (HTTP_RESP enabled buffering via set_response_body_buffer_size). No dependency
+// on the backend emitting token headers, so it works with stock vLLM.
 //
-// Avi DataScripts cannot read the HTTP response *body* in the HTTP_RESP event
-// (avi.http.get_body is unavailable there; body access requires the
-// HTTP_RESP_DATA buffered-event mechanism). For reliable token accounting the
-// backend reports usage via response headers, which avi.http.get_header reads
-// directly in the HTTP_RESP event:
-//
-//	X-Prompt-Tokens / X-Completion-Tokens / X-Total-Tokens
-//
-// An OpenAI-style proxy/sidecar can surface usage.* from the JSON body into
-// these headers; full in-SE body parsing is a follow-up (HTTP_RESP_DATA).
+// Avi's Lua sandbox lacks string.match, so the numeric value after each quoted
+// JSON key is extracted with plain string.find + a string.byte digit scan. The
+// keys are quoted ("total_tokens") so they don't false-match Prometheus
+// /metrics names like vllm:prompt_tokens_total on a GET (which carry no usage
+// and therefore correctly account 0 tokens).
 func buildUsageParseBlock() string {
-	return `-- token usage from backend response headers (HTTP_RESP cannot read the body)
-local prompt_tokens     = tonumber(avi.http.get_header("X-Prompt-Tokens")) or 0
-local completion_tokens = tonumber(avi.http.get_header("X-Completion-Tokens")) or 0
-local total_tokens      = tonumber(avi.http.get_header("X-Total-Tokens")) or (prompt_tokens + completion_tokens)`
+	return fmt.Sprintf(`-- token usage parsed from the buffered response body (HTTP_RESP_DATA)
+local _body = avi.http.get_response_body(%d)
+local function _num_after(key)
+  if not _body then return 0 end
+  local s = string.find(_body, key, 1, true)
+  if not s then return 0 end
+  local i = s + #key
+  while i <= #_body do local c = string.byte(_body, i); if c >= 48 and c <= 57 then break end; i = i + 1 end
+  local j = i
+  while j <= #_body do local c = string.byte(_body, j); if c < 48 or c > 57 then break end; j = j + 1 end
+  if j > i then return tonumber(string.sub(_body, i, j - 1)) or 0 end
+  return 0
+end
+local prompt_tokens     = _num_after('"prompt_tokens"')
+local completion_tokens = _num_after('"completion_tokens"')
+local total_tokens      = _num_after('"total_tokens"')
+if total_tokens == 0 then total_tokens = prompt_tokens + completion_tokens end`, RespBodyBufferKB)
 }
 
 // buildRespLimitBlock generates the Lua snippet that increments one counter in
@@ -348,5 +385,6 @@ func buildRespLimitBlock(limit TokenLimit) string {
 }
 
 // DSNameForVS returns the DataScript set names for a given VS name.
-func DSReqName(vsName string) string  { return vsName + DSNameSuffixReq }
-func DSRespName(vsName string) string { return vsName + DSNameSuffixResp }
+func DSReqName(vsName string) string      { return vsName + DSNameSuffixReq }
+func DSRespName(vsName string) string     { return vsName + DSNameSuffixResp }
+func DSRespDataName(vsName string) string { return vsName + DSNameSuffixRespData }
