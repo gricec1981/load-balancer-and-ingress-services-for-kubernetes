@@ -104,40 +104,26 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy) TokenAccount
 	}
 }
 
-// jwtClaimHelper returns a Lua function `jwt_claim(claim)` that extracts a string
-// claim directly from the bearer JWT in the Authorization header. It is robust to
-// the Avi DataScript Lua sandbox: it uses only core string functions plus
-// avi.utils.base64_decode, handles base64url (-/_ and missing padding), and never
-// raises (returns "" on any failure). This avoids depending on avi.http.oauth_get_claim
-// (an OAuth-session function) which is not available for direct SSO_TYPE_JWT validation.
+// jwtClaimHelper returns a Lua function `jwt_claim(claim)` that returns a string
+// claim from the OAuth-validated access token. With the OAuth resource-server flow
+// the Avi SE validates the bearer JWT and exposes its claims to the DataScript via
+// avi.http.oauth_get_claim(). The provider index 0 selects the first (only)
+// oauth_settings entry on the VS. Every call is pcall-guarded so a missing claim or
+// an unauthenticated request yields "" rather than raising in the SE sandbox.
 func jwtClaimHelper() string {
-	return `-- AKO AI Gateway: extract a string claim from the bearer JWT
+	return `-- AKO AI Gateway: read a claim from the OAuth-validated access token.
+-- avi.http.oauth_get_claim(provider_index, claim) returns the claim value; for
+-- this Avi build it comes back as a Lua table (claims may be multi-valued), so
+-- unwrap the first scalar. Provider index 0 selects the only oauth_settings entry.
 local function jwt_claim(claim)
-  local auth = avi.http.get_header("authorization", avi.HTTP_REQUEST)
-  if not auth or auth == "" then return "" end
-  local sp = string.find(auth, " ", 1, true)
-  local token = sp and string.sub(auth, sp + 1) or auth
-  local d1 = string.find(token, ".", 1, true)
-  if not d1 then return "" end
-  local d2 = string.find(token, ".", d1 + 1, true)
-  if not d2 then return "" end
-  local b64 = string.sub(token, d1 + 1, d2 - 1)
-  b64 = string.gsub(b64, "-", "+")
-  b64 = string.gsub(b64, "_", "/")
-  local pad = #b64 % 4
-  if pad == 2 then b64 = b64 .. "=="
-  elseif pad == 3 then b64 = b64 .. "=" end
-  local ok, payload = pcall(avi.utils.base64_decode, b64)
-  if not ok or not payload then return "" end
-  local ks = string.find(payload, '"' .. claim .. '"', 1, true)
-  if not ks then return "" end
-  local colon = string.find(payload, ":", ks, true)
-  if not colon then return "" end
-  local q1 = string.find(payload, '"', colon, true)
-  if not q1 then return "" end
-  local q2 = string.find(payload, '"', q1 + 1, true)
-  if not q2 then return "" end
-  return string.sub(payload, q1 + 1, q2 - 1)
+  local ok, v = pcall(avi.http.oauth_get_claim, 0, claim)
+  if not ok or v == nil then return "" end
+  if type(v) == "table" then
+    if v[1] ~= nil then return tostring(v[1]) end
+    for _, val in pairs(v) do return tostring(val) end
+    return ""
+  end
+  return tostring(v)
 end`
 }
 
@@ -265,11 +251,9 @@ func buildReqLimitBlock(limit TokenLimit) string {
 	fmt.Fprintf(&b, "  local cur = tonumber(avi.vs.table_lookup(k) or 0)\n")
 
 	if limit.GroupHeader != "" && len(limit.GroupBudgets) > 0 {
-		// Per-group budget: read the group from the validated JWT claim (decoded
-		// from the bearer token), falling back to a forwarded request header.
+		// Per-group budget: read the group from the OAuth-validated access token.
 		fmt.Fprintf(&b, "  local _ok_g, _g = pcall(jwt_claim, %q)\n", limit.GroupHeader)
 		fmt.Fprintf(&b, "  local group_hdr = (_ok_g and _g) or \"\"\n")
-		fmt.Fprintf(&b, "  if group_hdr == \"\" then group_hdr = avi.http.get_header(%q, avi.HTTP_REQUEST) or \"\" end\n", limit.GroupHeader)
 		fmt.Fprintf(&b, "  local group_budgets = {")
 		first := true
 		for g, budget := range limit.GroupBudgets {
@@ -287,8 +271,7 @@ func buildReqLimitBlock(limit TokenLimit) string {
 		} else {
 			fmt.Fprintf(&b, "  if not budget then\n")
 			fmt.Fprintf(&b, "    avi.http.response(403, {[\"Content-Type\"]=\"application/json\"},\n")
-			fmt.Fprintf(&b, "      string.format('{\"error\":\"unknown_group\",\"limit\":%q,\"group\":\"'..group_hdr..'\"}',%q))\n",
-				limit.Name, limit.Name)
+			fmt.Fprintf(&b, "      '{\"error\":\"unknown_group\",\"group\":\"'..group_hdr..'\"}')\n")
 			fmt.Fprintf(&b, "    return\n  end\n")
 		}
 		fmt.Fprintf(&b, "  if cur >= budget then\n")

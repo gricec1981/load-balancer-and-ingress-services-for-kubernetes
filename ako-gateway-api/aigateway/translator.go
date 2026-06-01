@@ -22,6 +22,7 @@ import (
 
 	avimodels "github.com/vmware/alb-sdk/go/models"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/internal/nodes"
+	akov1alpha2 "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/pkg/apis/ako/v1alpha2"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/pkg/utils"
 )
 
@@ -37,65 +38,84 @@ import (
 //   - Identity header: HTTP request policy rules copy the Avi-injected JWT claim
 //     headers (X-AVI-JWT-<CLAIM>) into the user-configured header names so that
 //     downstream policies (e.g. AITokenRateLimitPolicy) have stable names.
-func ApplyAuthPolicy(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVsEvhSniModel) {
+func ApplyAuthPolicy(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVsEvhSniModel, host string) {
 	if policy == nil {
 		return
 	}
 	spec := policy.Spec
 
-	// ── 1. Ensure JWTServerProfile + SSOPolicy exist in Avi ──────────────────
-	jwtProfileRef, err := EnsureJWTServerProfile(key, policy)
+	// ── 1. Ensure issuer Pool + OAUTH AuthProfile + OAUTH SSOPolicy in Avi ────
+	// SSO_TYPE_JWT validation strips the Authorization header before any
+	// DataScript runs, so a token-rate-limit DataScript cannot read JWT claims.
+	// We use the OAuth resource-server flow instead: the SE validates the bearer
+	// token as an OAuth JWT access token and the DataScript reads claims via
+	// avi.http.oauth_get_claim(). See oauth_rest.go for the object graph.
+	poolName, firstIP, port, err := EnsureIssuerPool(key, policy)
 	if err != nil {
-		utils.AviLog.Errorf("key: %s, msg: AIGatewayAuthPolicy %s/%s: JWTServerProfile error: %v",
+		utils.AviLog.Errorf("key: %s, msg: AIGatewayAuthPolicy %s/%s: issuer Pool error: %v",
 			key, policy.Namespace, policy.Name, err)
 		return
 	}
-	ssoPolicyName, err := EnsureSSOPolicy(key, policy, jwtProfileRef)
+	authProfileName, err := EnsureOAuthAuthProfile(key, policy, poolName, firstIP, port)
 	if err != nil {
-		utils.AviLog.Errorf("key: %s, msg: AIGatewayAuthPolicy %s/%s: SSOPolicy error: %v",
+		utils.AviLog.Errorf("key: %s, msg: AIGatewayAuthPolicy %s/%s: OAuth AuthProfile error: %v",
+			key, policy.Namespace, policy.Name, err)
+		return
+	}
+	ssoPolicyName, err := EnsureOAuthSSOPolicy(key, policy)
+	if err != nil {
+		utils.AviLog.Errorf("key: %s, msg: AIGatewayAuthPolicy %s/%s: OAuth SSOPolicy error: %v",
 			key, policy.Namespace, policy.Name, err)
 		return
 	}
 
-	ssoPolicyRef := fmt.Sprintf("/api/ssopolicy?name=%s", ssoPolicyName)
-	gf := vsNode.GetGeneratedFields()
-	gf.SsoPolicyRef = proto.String(ssoPolicyRef)
-
-	// Avi requires jwt_config on the VS whenever sso_policy_ref is set for
-	// SSO_TYPE_JWT. Set the audience from the first audience in the spec (or a
-	// wildcard if none provided) and fix the token location to the Authorization header.
-	jwtLocation := "JWT_LOCATION_AUTHORIZATION_HEADER"
 	audience := "*"
 	if len(spec.JWT.Audiences) > 0 {
 		audience = spec.JWT.Audiences[0]
 	}
-	gf.JwtConfig = &avimodels.JWTValidationVsConfig{
-		Audience:    proto.String(audience),
-		JwtLocation: proto.String(jwtLocation),
+
+	// ── 2. Attach OauthVsConfig + SsoPolicyRef to the EVH child VS ────────────
+	// Same mechanism the SSORule CRD uses (internal/nodes.BuildL7SSORule): set
+	// the VS GeneratedFields and let AKO publish the VS holistically. OAuth/OIDC
+	// requires the VS to terminate TLS, so the Gateway listener must be HTTPS.
+	if host == "" {
+		if names := vsNode.GetVHDomainNames(); len(names) > 0 {
+			host = names[0]
+		} else {
+			host = "ai-gateway.local"
+		}
 	}
-	utils.AviLog.Infof("key: %s, msg: AIGatewayAuthPolicy %s/%s: set SsoPolicyRef → %s (audience=%s)",
-		key, policy.Namespace, policy.Name, ssoPolicyName, audience)
-
-	// ── 2. Identity-header + forward-claim injection via HTTP request policy ──
-	// The Avi SSO policy copies validated JWT claims into headers of the form
-	// "X-AVI-JWT-<UPPER_CLAIM>".  We copy those into the user-configured header
-	// names so downstream policies have stable names to key off.
-	identityClaim := spec.JWT.EffectiveIdentityClaim()
-	identityHdr := spec.EffectiveIdentityHeader()
-	claimSrcHeader := aviJWTClaimHeader(identityClaim)
-
-	rules := buildClaimForwardRules(claimSrcHeader, identityHdr, spec.JWT.ForwardClaims, 100)
-	if len(rules) == 0 {
-		return
+	gf := vsNode.GetGeneratedFields()
+	gf.SsoPolicyRef = proto.String(fmt.Sprintf("/api/ssopolicy?name=%s", ssoPolicyName))
+	gf.JwtConfig = nil // not used in OAuth mode
+	gf.OauthVsConfig = &akov1alpha2.OAuthVSConfig{
+		CookieName:    proto.String("AVI-OAUTH-SESSION"),
+		CookieTimeout: proto.Int32(60),
+		// The OAuth callback must land on this EVH child VS, which the parent only
+		// content-switches to for the route's path prefix. Put the callback under
+		// that prefix so it reaches the child's OAuth module instead of 404ing.
+		RedirectURI: proto.String(fmt.Sprintf("https://%s/v1/oauth/callback", host)),
+		OauthSettings: []*akov1alpha2.OAuthSettings{{
+			AuthProfileRef: proto.String(fmt.Sprintf("/api/authprofile?name=%s", authProfileName)),
+			// app_settings are mandatory on oauth_vs_config even in resource-server
+			// mode; OIDC interactive login is disabled so only bearer validation runs.
+			AppSettings: &akov1alpha2.OAuthAppSettings{
+				ClientID:     proto.String(audience),
+				ClientSecret: proto.String("unused-resource-server"),
+				OidcConfig: &akov1alpha2.OIDCConfig{
+					OidcEnable: proto.Bool(false),
+					Profile:    proto.Bool(false),
+					Userinfo:   proto.Bool(false),
+				},
+			},
+			ResourceServer: &akov1alpha2.OAuthResourceServer{
+				AccessType: proto.String("ACCESS_TOKEN_TYPE_JWT"),
+				JwtParams:  &akov1alpha2.JWTValidationParams{Audience: proto.String(audience)},
+			},
+		}},
 	}
-
-	// Find or create a dedicated AI-auth HTTP policy set on this VS.
-	policySetName := fmt.Sprintf("%s-ai-auth", vsNode.GetName())
-	policyNode := findOrCreateHTTPPolicySet(policySetName, vsNode)
-	// Prepend rules so they run before any existing request rules.
-	policyNode.RequestRules = append(rules, policyNode.RequestRules...)
-	utils.AviLog.Infof("key: %s, msg: AIGatewayAuthPolicy %s/%s: added %d claim-forward rule(s) to %s",
-		key, policy.Namespace, policy.Name, len(rules), policySetName)
+	utils.AviLog.Infof("key: %s, msg: AIGatewayAuthPolicy %s/%s: set OAuth SsoPolicyRef → %s (audience=%s, host=%s)",
+		key, policy.Namespace, policy.Name, ssoPolicyName, audience, host)
 }
 
 // ApplyTokenRateLimitPolicy configures the Avi VS node model to enforce the

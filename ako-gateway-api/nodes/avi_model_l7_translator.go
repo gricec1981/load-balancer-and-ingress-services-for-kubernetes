@@ -175,8 +175,12 @@ func (o *AviObjectGraph) BuildChildVS(key string, routeModel RouteModel, parentN
 	if lib.IsAIGatewayEnabled() {
 		routeNsName := routeModel.GetNamespace() + "/" + routeModel.GetName()
 		ps := aigateway.SharedPolicyStore()
+		authHost := ""
+		if len(hosts) > 0 {
+			authHost = hosts[0]
+		}
 		for _, authPolicy := range ps.GetAuthPoliciesForRoute(routeNsName) {
-			aigateway.ApplyAuthPolicy(key, authPolicy, childNode)
+			aigateway.ApplyAuthPolicy(key, authPolicy, childNode, authHost)
 		}
 		for _, tokenPolicy := range ps.GetTokenRateLimitPoliciesForRoute(routeNsName) {
 			aigateway.ApplyTokenRateLimitPolicy(key, tokenPolicy, childNode)

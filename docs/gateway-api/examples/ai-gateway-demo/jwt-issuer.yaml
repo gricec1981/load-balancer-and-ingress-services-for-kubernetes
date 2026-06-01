@@ -1,15 +1,25 @@
 ---
 # jwt-issuer.yaml
 #
-# Tiny in-cluster JWT issuer for demo purposes.
-# - Reads an RSA private key from the "jwt-signing-key" Secret (created by setup.sh).
-# - GET /jwks  → public JWKS (pointed at by the Avi JWTServerProfile)
-# - GET /token?sub=alice&tenant=acme&model=gpt-4o
-#              → {"token": "<signed JWT>", "expires_in": 3600}
+# In-cluster OIDC provider for the AI Gateway demo.
 #
-# The Avi SSO Policy is configured to validate against http://<ISSUER_VIP>/jwks,
-# so the Service needs to be reachable from the Avi Controller.
-# setup.sh creates a LoadBalancer Service and waits for its external IP.
+# Avi's OAuth/OIDC SSO is a *browser, session-cookie* flow: the SE itself runs
+# the authorization-code flow (redirect -> /authorize -> code -> exchange at
+# /token -> store the token in a session cookie), then validates the token it
+# obtained and exposes its claims to the DataScript via avi.http.oauth_get_claim().
+# So the issuer must be a real OIDC provider, not just a token-minting endpoint.
+#
+# Endpoints:
+#   GET  /.well-known/openid-configuration  -> OIDC discovery
+#   GET  /jwks                              -> public JWKS (SE validates against this)
+#   GET  /authorize?...                     -> issues an auth code, 302 back to redirect_uri
+#   POST /token                             -> authorization_code -> {access_token,id_token}
+#   GET  /token?sub=&group=                 -> legacy direct token (handy for claim tests)
+#
+# Which user /authorize logs in is selected by the "demo_user" cookie (default
+# alice) so the flow can be driven non-interactively with curl:
+#   curl -c jar -b "demo_user=bob" ...
+# User -> group mapping: alice/carol -> group1, bob -> group2, dave -> admin.
 
 apiVersion: v1
 kind: ConfigMap
@@ -18,103 +28,136 @@ metadata:
   namespace: inference
 data:
   issuer.py: |
-    import os, json, time, base64
+    import os, json, time, base64, secrets
     from http.server import HTTPServer, BaseHTTPRequestHandler
-    from urllib.parse import urlparse, parse_qs
+    from urllib.parse import urlparse, parse_qs, urlencode
 
-    try:
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric import rsa
-        from cryptography.hazmat.backends import default_backend
-        import jwt as pyjwt
-    except ImportError:
-        import subprocess, sys
-        subprocess.check_call([sys.executable, "-m", "pip", "install",
-                               "--quiet", "cryptography", "PyJWT"])
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric import rsa
-        from cryptography.hazmat.backends import default_backend
-        import jwt as pyjwt
+    from cryptography.hazmat.primitives import serialization
+    import jwt as pyjwt
 
     KEY_PATH = os.environ.get("KEY_PATH", "/keys/key.pem")
     ISSUER   = os.environ.get("ISSUER",   "http://jwt-issuer.inference.svc.cluster.local:8080")
     AUDIENCE = os.environ.get("AUDIENCE", "llm-api")
     KID      = "demo-key-1"
 
+    # demo identities -> group claim
+    USERS = {"alice": "group1", "carol": "group1", "bob": "group2", "dave": "admin"}
+
     with open(KEY_PATH, "rb") as f:
         private_key = serialization.load_pem_private_key(f.read(), password=None)
-
-    pub = private_key.public_key()
-    pub_numbers = pub.public_numbers()
-
-    def b64url(n):
-        b = n.to_bytes((n.bit_length() + 7) // 8, "big")
-        return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
-
-    JWK = {
-        "kty": "RSA", "use": "sig", "alg": "RS256", "kid": KID,
-        "n": b64url(pub_numbers.n),
-        "e": b64url(pub_numbers.e),
-    }
-    JWKS = json.dumps({"keys": [JWK]})
-
+    pub_numbers = private_key.public_key().public_numbers()
     private_pem = private_key.private_bytes(
         serialization.Encoding.PEM,
         serialization.PrivateFormat.TraditionalOpenSSL,
         serialization.NoEncryption(),
     )
 
+    def b64url(n):
+        b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+    JWKS = json.dumps({"keys": [{
+        "kty": "RSA", "use": "sig", "alg": "RS256", "kid": KID,
+        "n": b64url(pub_numbers.n), "e": b64url(pub_numbers.e),
+    }]})
+
+    DISCOVERY = json.dumps({
+        "issuer": ISSUER,
+        "authorization_endpoint": ISSUER + "/authorize",
+        "token_endpoint": ISSUER + "/token",
+        "jwks_uri": ISSUER + "/jwks",
+        "userinfo_endpoint": ISSUER + "/userinfo",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"],
+        "scopes_supported": ["openid", "profile", "email", "groups"],
+        "claims_supported": ["sub", "aud", "iss", "exp", "iat", "group", "email"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+    })
+
+    CODES = {}  # auth code -> {sub, group, aud, nonce}
+
+    def mint(sub, group, aud, nonce=None, ttl=3600):
+        now = int(time.time())
+        claims = {"iss": ISSUER, "sub": sub, "aud": aud, "iat": now, "exp": now + ttl,
+                  "tenant": "default", "model": "mock-llm-v1", "group": group,
+                  "email": sub + "@demo.local"}
+        if nonce:
+            claims["nonce"] = nonce
+        return pyjwt.encode(claims, private_pem, algorithm="RS256", headers={"kid": KID})
+
     class H(BaseHTTPRequestHandler):
+        def _send(self, code, body=b"", ctype="application/json", extra=None):
+            self.send_response(code)
+            if body:
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def _cookie(self, name):
+            for c in self.headers.get("Cookie", "").split(";"):
+                if "=" in c:
+                    k, v = c.strip().split("=", 1)
+                    if k == name:
+                        return v
+            return None
+
         def do_GET(self):
-            path = urlparse(self.path).path
-            qs   = parse_qs(urlparse(self.path).query)
-
+            u = urlparse(self.path); path = u.path; qs = parse_qs(u.query)
             if path in ("/jwks", "/.well-known/jwks.json"):
-                body = JWKS.encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            elif path == "/token":
-                now     = int(time.time())
-                sub     = qs.get("sub",    ["alice"])[0]
-                tenant  = qs.get("tenant", ["default"])[0]
-                model   = qs.get("model",  ["mock-llm-v1"])[0]
-                group   = qs.get("group",  ["group1"])[0]
-                payload = {
-                    "iss": ISSUER,
-                    "sub": sub,
-                    "aud": AUDIENCE,
-                    "iat": now,
-                    "exp": now + 3600,
-                    "tenant": tenant,
-                    "model":  model,
-                    "group":  group,
-                }
-                token = pyjwt.encode(
-                    payload, private_pem,
-                    algorithm="RS256",
-                    headers={"kid": KID},
-                )
-                body = json.dumps({"token": token, "expires_in": 3600,
-                                   "sub": sub, "tenant": tenant,
-                                   "group": group}).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
+                self._send(200, JWKS.encode())
+            elif path == "/.well-known/openid-configuration":
+                self._send(200, DISCOVERY.encode())
+            elif path == "/authorize":
+                # Authorization-code endpoint. The logged-in user is taken from the
+                # demo_user cookie (default alice) so curl can drive it headlessly.
+                redirect_uri = qs.get("redirect_uri", [""])[0]
+                state        = qs.get("state", [""])[0]
+                nonce        = qs.get("nonce", [None])[0]
+                aud          = qs.get("client_id", [AUDIENCE])[0]
+                user         = self._cookie("demo_user") or "alice"
+                group        = USERS.get(user, "unknown")
+                code         = secrets.token_urlsafe(24)
+                CODES[code]  = {"sub": user, "group": group, "aud": aud, "nonce": nonce}
+                params = {"code": code}
+                if state:
+                    params["state"] = state
+                sep = "&" if "?" in redirect_uri else "?"
+                self._send(302, extra={"Location": redirect_uri + sep + urlencode(params)})
+            elif path == "/token":  # legacy direct mint (claim tests)
+                sub   = qs.get("sub", ["alice"])[0]
+                group = qs.get("group", [USERS.get(sub, "group1")])[0]
+                tok   = mint(sub, group, AUDIENCE)
+                self._send(200, json.dumps({"token": tok, "expires_in": 3600,
+                                            "sub": sub, "group": group}).encode())
+            elif path == "/userinfo":
+                self._send(200, json.dumps({"sub": "unknown"}).encode())
             elif path == "/health":
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"ok")
-
+                self._send(200, b"ok", "text/plain")
             else:
-                self.send_response(404)
-                self.end_headers()
+                self._send(404)
+
+        def do_POST(self):
+            u = urlparse(self.path)
+            if u.path != "/token":
+                self._send(404); return
+            n = int(self.headers.get("Content-Length", 0))
+            form = parse_qs(self.rfile.read(n).decode() if n else "")
+            code = form.get("code", [""])[0]
+            rec  = CODES.pop(code, None)
+            if not rec:
+                self._send(400, json.dumps({"error": "invalid_grant"}).encode()); return
+            access = mint(rec["sub"], rec["group"], rec["aud"], rec.get("nonce"))
+            idt    = mint(rec["sub"], rec["group"], rec["aud"], rec.get("nonce"))
+            self._send(200, json.dumps({
+                "access_token": access, "id_token": idt,
+                "token_type": "Bearer", "expires_in": 3600, "scope": "openid",
+            }).encode())
 
         def log_message(self, fmt, *args):
             pass
@@ -152,8 +195,7 @@ spec:
         - name: KEY_PATH
           value: /keys/key.pem
         - name: ISSUER
-          # Override this in setup.sh once you know the external IP.
-          # The value must match spec.jwt.issuer in AIGatewayAuthPolicy.
+          # Must match spec.jwt.issuer in AIGatewayAuthPolicy and the token `iss`.
           value: "http://jwt-issuer.inference.svc.cluster.local:8080"
         - name: AUDIENCE
           value: "llm-api"
@@ -185,11 +227,9 @@ spec:
       - name: pylibs
         emptyDir: {}
 ---
-# ClusterIP service — the Avi Controller reaches the issuer via the pod network
-# (same VNet as AKS when using Azure CNI). AKO fetches JWKS from inside the
-# cluster and stores the key material directly in the Avi JWTServerProfile, so
-# no external IP is needed. Use the cluster-internal DNS as the issuer URL:
-#   http://jwt-issuer.inference.svc.cluster.local:8080
+# ClusterIP service. The Avi SE reaches /token and /jwks through an Avi Pool
+# (built by AKO from this service's endpoints) over the Azure CNI VNet; the
+# in-cluster demo client reaches /authorize directly. No external IP needed.
 apiVersion: v1
 kind: Service
 metadata:

@@ -216,9 +216,8 @@ func SetupAuthPolicyEventHandlers(
 			ps.mu.RUnlock()
 			if p != nil {
 				enqueueTargetRoute(ns, p.Spec.TargetRef.Name, lib.AIGatewayAuthPolicy, workqueues, numWorkers)
-				// Clean up AKO-managed Avi objects (SSO Policy, AuthProfile, JWTServerProfile).
-				DeleteSSOPolicy("AIGatewayAuthPolicy/"+ns+"/"+name, p)
-				DeleteJWTServerProfile("AIGatewayAuthPolicy/"+ns+"/"+name, p)
+				// Clean up AKO-managed Avi objects (OAUTH SSO Policy, AuthProfile, issuer Pool).
+				DeleteOAuthObjects("AIGatewayAuthPolicy/"+ns+"/"+name, p)
 			}
 			ps.deleteAuthPolicy(ns, name)
 		},
