@@ -536,6 +536,215 @@ the AKO values and `helm upgrade`.
 
 ---
 
+## Phase 8 — Benchmarking: intelligent routing vs round-robin
+
+This phase quantifies the performance gain from AKO's weight-based routing compared to a
+naive round-robin baseline. The expected result (from the unit tests) is **~4× more traffic
+to idle pods** when one pod is fully loaded, and **~2× lower average latency** under a mixed
+request workload.
+
+### 8.1 Tools
+
+Install [`hey`](https://github.com/rakyll/hey) on any in-cluster pod (or on a machine in the
+same VNet as the VIP):
+
+```bash
+# spin up a scratch pod for load generation
+kubectl run bench --image=golang:1.22-bookworm --restart=Never -it --rm -- bash
+
+# inside the pod:
+go install github.com/rakyll/hey@latest
+export PATH=$PATH:$(go env GOPATH)/bin
+```
+
+You also need `jq` and `curl` in the pod for metric collection.
+
+### 8.2 Establish an uneven load baseline
+
+The intelligent routing only diverges from round-robin when pods carry **different loads**.
+The most reliable way to create that imbalance is to send a burst of **long-context requests**
+to a single pod before the benchmark starts, filling its KV cache while the other pods stay idle.
+
+Pre-load pod-0 directly (bypasses the VIP so AKO routing doesn't interfere):
+
+```bash
+# find pod IPs
+kubectl get pods -n $NS -l app=vllm -o custom-columns="NAME:.metadata.name,IP:.status.podIP"
+
+POD0_IP=<pod-0-IP>
+
+# send 20 long-context requests directly to pod-0 to fill its KV cache
+for i in $(seq 1 20); do
+  curl -s -o /dev/null -X POST http://$POD0_IP:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4",
+      "messages": [{"role": "user", "content": "Write a 2000-word technical essay about the history of distributed computing and MapReduce."}],
+      "max_tokens": 1024
+    }' &
+done
+wait
+```
+
+Confirm the imbalance before running the benchmark:
+
+```bash
+for p in $(kubectl get pod -n $NS -l app=vllm -o jsonpath='{.items[*].status.podIP}'); do
+  echo -n "pod $p — "
+  curl -s http://$p:8000/metrics \
+    | grep -E 'kv_cache_usage_perc|num_requests_(waiting|running)' \
+    | tr '\n' '  '
+  echo
+done
+```
+
+You want to see pod-0 with `kv_cache_usage_perc > 0.75` and/or `num_requests_waiting > 0`
+while pods 1 and 2 show near-zero values.
+
+### 8.3 Benchmark A — round-robin baseline
+
+Disable the inference extension so AKO stops updating Pool Group weights. Avi falls back to
+equal weights (round-robin):
+
+```bash
+# disable intelligent routing
+helm upgrade ako ./helm/ako -n avi-system -f values.yaml \
+  --set inferenceExtension.enabled=false
+kubectl rollout status statefulset/ako -n avi-system
+
+# confirm env var is gone / false
+kubectl get pod ako-0 -n avi-system \
+  -o jsonpath='{range .spec.containers[?(@.name=="ako-gateway-api")].env[*]}{.name}={.value}{"\n"}{end}' \
+  | grep INFERENCE
+```
+
+Then run the load test through the VIP and capture latency:
+
+```bash
+VIP=$(kubectl get gateway avi-gateway -n $NS -o jsonpath='{.status.addresses[0].value}')
+
+hey -z 3m -c 50 -m POST \
+  -H "Content-Type: application/json" \
+  -d '{"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4",
+       "messages":[{"role":"user","content":"Explain transformer attention in detail."}],
+       "max_tokens":512}' \
+  http://$VIP/v1/chat/completions \
+  > bench_round_robin.txt 2>&1
+
+cat bench_round_robin.txt
+```
+
+While the load test runs, capture per-pod queue depths every 15 s (one scrape window):
+
+```bash
+for i in $(seq 1 12); do
+  echo "=== $(date) ==="
+  for p in $(kubectl get pod -n $NS -l app=vllm -o jsonpath='{.items[*].status.podIP}'); do
+    echo -n "  pod $p: waiting="
+    curl -s http://$p:8000/metrics | grep 'vllm:num_requests_waiting ' | awk '{print $2}'
+  done
+  sleep 15
+done
+```
+
+### 8.4 Benchmark B — intelligent routing
+
+Re-enable the extension and repeat **the identical load test** against the same pre-loaded
+pod-0:
+
+```bash
+# re-enable intelligent routing
+helm upgrade ako ./helm/ako -n avi-system -f values.yaml \
+  --set inferenceExtension.enabled=true
+kubectl rollout status statefulset/ako -n avi-system
+
+# wait one scrape window for AKO to recompute and push weights
+sleep 20
+
+# re-create the KV imbalance on pod-0 (extension resets weights on restart)
+for i in $(seq 1 20); do
+  curl -s -o /dev/null -X POST http://$POD0_IP:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4",
+         "messages":[{"role":"user","content":"Write a 2000-word technical essay about the history of distributed computing and MapReduce."}],
+         "max_tokens":1024}' &
+done
+wait
+
+# run the identical benchmark
+hey -z 3m -c 50 -m POST \
+  -H "Content-Type: application/json" \
+  -d '{"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4",
+       "messages":[{"role":"user","content":"Explain transformer attention in detail."}],
+       "max_tokens":512}' \
+  http://$VIP/v1/chat/completions \
+  > bench_intelligent.txt 2>&1
+
+cat bench_intelligent.txt
+```
+
+### 8.5 Compare results
+
+```bash
+echo "=== ROUND-ROBIN ==="
+grep -E "Requests/sec|Average|99th" bench_round_robin.txt
+
+echo ""
+echo "=== INTELLIGENT ROUTING ==="
+grep -E "Requests/sec|Average|99th" bench_intelligent.txt
+```
+
+**What to look for:**
+
+| Metric | Expected direction | Why |
+|---|---|---|
+| Average latency | Lower with intelligent routing | Fewer requests land on the queuing pod |
+| P99 latency | Significantly lower | P99 captures the worst-case queued requests, which drop from ~33% to ~11% of total |
+| Requests/sec | Higher with intelligent routing | More requests complete quickly on idle pods |
+| pod-0 `num_requests_waiting` | Lower during intelligent run | AKO steered traffic away before the queue built |
+
+**Expected numbers** (based on unit test formula with all signals active):
+
+| | Round-robin | Intelligent |
+|---|---|---|
+| Traffic to overloaded pod | ~33% | ~11% |
+| Traffic to idle pods | ~33% each | ~44-45% each |
+| Avg latency improvement | baseline | **~2×** |
+| P99 requests hitting queue | ~33% | ~11% |
+
+### 8.6 Watch the Avi Pool Group ratios shift live
+
+In the Avi UI: **Applications → Virtual Services → llm-route → Pool Group → Members**
+
+With intelligent routing enabled and load running you should see the three Pool Group member
+Ratio values diverge — pod-0 drops toward 10-15, pods 1 and 2 climb toward 42-45. The ratios
+update every `scrapeIntervalSeconds` (default 15s). Lower the interval to 5s for a snappier
+demo:
+
+```bash
+helm upgrade ako ./helm/ako -n avi-system -f values.yaml \
+  --set inferenceExtension.scrapeIntervalSeconds=5
+```
+
+### 8.7 Cost-aware: scale GPU pool to zero between runs
+
+Each benchmark run with 3× NC4as_T4_v3 spot nodes costs ~$0.08–$0.15/hr. Scale to zero
+between sessions to stop the GPU bill:
+
+```bash
+az aks nodepool scale -g $RG --cluster-name $CLUSTER -n gpunp --node-count 0
+```
+
+Scale back up before the next run:
+
+```bash
+az aks nodepool scale -g $RG --cluster-name $CLUSTER -n gpunp --node-count 3
+# wait for GPU nodes and vLLM pods to be ready before benchmarking
+kubectl wait pod -n $NS -l app=vllm --for=condition=Ready --timeout=10m
+```
+
+---
+
 ## Teardown — stop the GPU bill
 
 The GPUs are the expensive part, so scale them to zero between sessions:
