@@ -324,7 +324,7 @@ featureGates:
 
 inferenceExtension:
   enabled: true                     # REQUIRED — defaults to false in the chart
-  scrapeIntervalSeconds: 15         # lower to 5 for a snappier demo
+  scrapeIntervalSeconds: 5          # fast convergence; raise to 15+ in production to reduce scrape load
   alphaKVCache: 1.0                 # KV-cache pressure weight (α). 0 disables the KV signal.
   betaTokenRate: 1.0                # slot-utilisation weight (β). 0 disables the slot signal.
                                     # NOTE: the name says "token rate" but the implemented formula
@@ -718,12 +718,12 @@ In the Avi UI: **Applications → Virtual Services → llm-route → Pool Group 
 
 With intelligent routing enabled and load running you should see the three Pool Group member
 Ratio values diverge — pod-0 drops toward 10-15, pods 1 and 2 climb toward 42-45. The ratios
-update every `scrapeIntervalSeconds` (default 15s). Lower the interval to 5s for a snappier
-demo:
+update every `scrapeIntervalSeconds` (now 5s by default). In production you may want to raise
+this to 15s+ to reduce scrape load:
 
 ```bash
 helm upgrade ako ./helm/ako -n avi-system -f values.yaml \
-  --set inferenceExtension.scrapeIntervalSeconds=5
+  --set inferenceExtension.scrapeIntervalSeconds=15
 ```
 
 ### 8.7 Cost-aware: scale GPU pool to zero between runs

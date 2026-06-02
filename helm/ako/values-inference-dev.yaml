@@ -25,7 +25,7 @@ featureGates:
 # -----------------------------------------------------------------------
 inferenceExtension:
   enabled: true
-  scrapeIntervalSeconds: 15   # lower to 5 for faster demo reaction
+  scrapeIntervalSeconds: 5    # fast convergence for demo and benchmarking
   alphaKVCache: 1.0           # weight of kv_cache_usage_perc signal
   betaTokenRate: 1.0          # weight of token throughput rate signal
 

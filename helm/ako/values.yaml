@@ -15,7 +15,7 @@ inferenceExtension:
   enabled: false
   # scrapeIntervalSeconds controls how often AKO scrapes each pod's /metrics endpoint.
   # Lower values give faster weight convergence at the cost of more HTTP requests.
-  scrapeIntervalSeconds: 15
+  scrapeIntervalSeconds: 5
   # alphaKVCache weights the kv_cache_usage_perc metric relative to the waiting queue
   # depth in the inverse-load scoring formula: score = 1/(waiting + alpha*kv_cache + beta*tokens + ε)
   # Set to 0 to disable KV-cache signal.

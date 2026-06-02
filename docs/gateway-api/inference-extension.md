@@ -49,7 +49,7 @@ featureGates:
 
 inferenceExtension:
   enabled: true
-  scrapeIntervalSeconds: 15   # how often to scrape each pod
+  scrapeIntervalSeconds: 5    # how often to scrape each pod
   alphaKVCache: 1.0           # KV-cache signal weight (above 75% threshold)
   betaTokenRate: 1.0          # slot-utilisation signal weight (running / maxNumSeqs)
 ```
@@ -228,8 +228,8 @@ Other LLM servers (e.g. TGI, Ollama) work if they expose metrics with the same n
 
 ## Limitations
 
-- **Periodic, not per-request:** Weight adjustment happens on a configurable interval (default 15s), not per-request like the EPP ext-proc approach. Rapid load spikes within a scrape window are not reacted to immediately.
-- **Waiting streak delay:** The streak-gated waiting signal requires ≥ 2 consecutive scrapes (≥ 30s at default interval) before sustained queue depth starts penalising a pod. This is intentional but means the signal lags real-world queue build-up by one cycle.
+- **Periodic, not per-request:** Weight adjustment happens on a configurable interval (default 5s), not per-request like the EPP ext-proc approach. Rapid load spikes within a scrape window are not reacted to immediately.
+- **Waiting streak delay:** The streak-gated waiting signal requires ≥ 2 consecutive scrapes (≥ 10s at default interval) before sustained queue depth starts penalising a pod. This is intentional but means the signal lags real-world queue build-up by one cycle.
 - **No LoRA / adapter awareness:** The current implementation does not route based on which LoRA adapters are loaded on a given pod. This is a Phase 2 consideration.
 - **No prefix-cache awareness:** Unlike the EPP's scheduling layer, AKO cannot route requests to pods that have a matching KV-cache prefix. Aggregate load is used instead.
 - **Direct pod IP scraping:** AKO scrapes pod IPs directly. Ensure NetworkPolicies allow traffic from the AKO pod to LLM pods on the `targetPort`.
