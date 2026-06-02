@@ -33,7 +33,11 @@ const (
 	// Gauge metrics — instantaneous values.
 	metricRequestsRunning = "vllm:num_requests_running"
 	metricRequestsWaiting = "vllm:num_requests_waiting"
-	metricKVCacheUsage    = "vllm:kv_cache_usage_perc"
+	// metricKVCacheUsage is the primary KV-cache gauge name used by vLLM ≥ v0.4.
+	// Older vLLM releases (< v0.4) emitted vllm:kv_cache_usage_perc instead;
+	// the scraper falls back to that name when the primary is absent.
+	metricKVCacheUsage         = "vllm:gpu_cache_usage_perc"
+	metricKVCacheUsageLegacy   = "vllm:kv_cache_usage_perc"
 
 	// Counter metrics — cumulative totals used to compute per-interval rates.
 	metricGenerationTokensTotal = "vllm:generation_tokens_total"
@@ -346,6 +350,8 @@ func (s *Scraper) scrapePod(
 		m.NumRequestsWaiting = v
 	}
 	if v, ok := getGaugeValue(families, metricKVCacheUsage); ok {
+		m.KVCacheUsagePerc = v
+	} else if v, ok := getGaugeValue(families, metricKVCacheUsageLegacy); ok {
 		m.KVCacheUsagePerc = v
 	}
 
