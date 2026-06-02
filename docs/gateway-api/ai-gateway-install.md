@@ -92,10 +92,11 @@ kubectl rollout status deployment/mock-llm-1 -n inference
 kubectl rollout status deployment/mock-llm-2 -n inference
 ```
 
-> **⚠️ Selector + headers.** `mock-llm.yaml` labels pods `app: mock-llm`. Your `InferencePool`
+> **⚠️ Selector.** `mock-llm.yaml` labels pods `app: mock-llm`. Your `InferencePool`
 > must select them — if it was created with `selector: {app: vllm}`, either label these pods
 > `app: vllm` or change the pool selector to `app: mock-llm` (and let AKO re-resolve). The mock
-> emits the `X-*-Tokens` response headers the DataScript needs.
+> returns an OpenAI-compatible JSON body with a `usage` block; the DataScript reads token counts
+> directly from the body (no response headers required).
 
 Verify the endpoint and headers:
 
@@ -146,7 +147,8 @@ kubectl logs -n avi-system ako-0 -c ako-gateway-api | grep "registered token-acc
 ```
 
 In the Avi UI: **Applications → Virtual Services → <llm-route VS> → DataScript** shows
-`<vsname>-ai-tok-req` (HTTP_REQ) and `<vsname>-ai-tok-resp` (HTTP_RESP).
+`<vsname>-ai-tok-req` (HTTP_REQ), `<vsname>-ai-tok-resp` (HTTP_RESP), and
+`<vsname>-ai-tok-respdata` (HTTP_RESP_DATA).
 
 ### Run it
 
@@ -228,7 +230,7 @@ kubectl logs -n avi-system ako-0 -c ako-gateway-api | grep -E "issuer Pool|OAuth
 # issuer Pool inference-llm-auth-oauth-pool created
 # OAuth AuthProfile inference-llm-auth-oauth created
 # OAuth SSOPolicy inference-llm-auth-oauth-sso created
-# AIGatewayAuthPolicy inference/llm-auth: set OAuth SsoPolicyRef -> inference-llm-auth-oauth-sso (audience=llm-api, host=llm.demo.local)
+# AIGatewayAuthPolicy inference/llm-auth: set OAuth SsoPolicyRef → inference-llm-auth-oauth-sso (audience=llm-api, host=llm.demo.local)
 ```
 
 In the Avi UI they appear under **Applications → Pools** (`…-oauth-pool`), **Templates →

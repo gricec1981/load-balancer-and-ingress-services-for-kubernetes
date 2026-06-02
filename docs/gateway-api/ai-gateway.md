@@ -457,8 +457,14 @@ the login redirect instead of validating).
 
 **Token limits not enforced / 429 never fires**
 
-- Confirm the backend emits `X-Total-Tokens` (or `X-Prompt-Tokens` + `X-Completion-Tokens`) on
-  the response — without them the DataScript accounts 0 tokens.
+- Confirm the backend returns a non-streaming `application/json` response that contains a JSON
+  `usage` block with `total_tokens`, `prompt_tokens`, and/or `completion_tokens` — the DataScript
+  parses these directly from the response body in the `HTTP_RESP_DATA` event. Without a parseable
+  `usage` block the DataScript accounts 0 tokens (or charges `FailClosedTokens` if the body has
+  `"choices"` / `"chat.completion"` markers but no readable `usage`).
+- Confirm the body fits within `RespBodyBufferKB` (default 256 KB). `usage` sits at the end of
+  the JSON, so if the response is larger than the buffer, the tail is lost and the fail-closed
+  penalty fires instead of the real token count.
 - For a clean single-counter demo, cap the SE group at 1 SE so all requests hit the same SE.
 
 **`AI_GATEWAY_ENABLED` set but informers don't start**
