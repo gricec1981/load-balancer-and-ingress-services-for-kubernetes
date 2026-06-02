@@ -369,6 +369,181 @@ func TestComputeWeights_OverloadedPodGetsMinimumRatio(t *testing.T) {
 		result[0].Ratio, result[1].Ratio, result[2].Ratio)
 }
 
+// TestComputeWeights_ScenarioTable runs a grid of realistic load scenarios and
+// logs exact ratios so the output serves as a deterministic benchmark table.
+// Run with:  go test -v -run TestComputeWeights_ScenarioTable ./ako-gateway-api/inference/
+//
+// No GPU or external infrastructure is needed — ComputeWeights is pure math.
+func TestComputeWeights_ScenarioTable(t *testing.T) {
+	const maxSeqs = 128.0
+
+	type scenario struct {
+		name     string
+		metrics  []PodMetrics
+		alpha    float64
+		beta     float64
+		wantDesc string // what makes this scenario interesting
+	}
+
+	scenarios := []scenario{
+		{
+			name:     "Baseline: all pods idle (equal load)",
+			alpha:    1.0, beta: 1.0,
+			metrics: []PodMetrics{
+				{PodIP: "pod-0", Reachable: true},
+				{PodIP: "pod-1", Reachable: true},
+				{PodIP: "pod-2", Reachable: true},
+			},
+			wantDesc: "should equal round-robin 33/33/33",
+		},
+		{
+			name:     "KV cache: pod-0 at 80% (just above threshold)",
+			alpha:    1.0, beta: 0.0,
+			metrics: []PodMetrics{
+				{PodIP: "pod-0", KVCacheUsagePerc: 0.80, Reachable: true},
+				{PodIP: "pod-1", Reachable: true},
+				{PodIP: "pod-2", Reachable: true},
+			},
+			wantDesc: "mild KV pressure",
+		},
+		{
+			name:     "KV cache: pod-0 at 85%",
+			alpha:    1.0, beta: 0.0,
+			metrics: []PodMetrics{
+				{PodIP: "pod-0", KVCacheUsagePerc: 0.85, Reachable: true},
+				{PodIP: "pod-1", Reachable: true},
+				{PodIP: "pod-2", Reachable: true},
+			},
+			wantDesc: "moderate KV pressure",
+		},
+		{
+			name:     "KV cache: pod-0 at 90%",
+			alpha:    1.0, beta: 0.0,
+			metrics: []PodMetrics{
+				{PodIP: "pod-0", KVCacheUsagePerc: 0.90, Reachable: true},
+				{PodIP: "pod-1", Reachable: true},
+				{PodIP: "pod-2", Reachable: true},
+			},
+			wantDesc: "high KV pressure",
+		},
+		{
+			name:     "KV cache: pod-0 at 100% (full)",
+			alpha:    1.0, beta: 0.0,
+			metrics: []PodMetrics{
+				{PodIP: "pod-0", KVCacheUsagePerc: 1.00, Reachable: true},
+				{PodIP: "pod-1", Reachable: true},
+				{PodIP: "pod-2", Reachable: true},
+			},
+			wantDesc: "KV saturated",
+		},
+		{
+			name:     "Queue only: pod-0 has sustained queue (streak=2)",
+			alpha:    1.0, beta: 0.0,
+			metrics: []PodMetrics{
+				{PodIP: "pod-0", NumRequestsWaiting: 20, WaitingSustainedStreak: 2, Reachable: true},
+				{PodIP: "pod-1", Reachable: true},
+				{PodIP: "pod-2", Reachable: true},
+			},
+			wantDesc: "queue depth normalised to 1.0 (only pod with queue)",
+		},
+		{
+			name:     "Slot utilisation only: pod-0 at 50% capacity",
+			alpha:    0.0, beta: 1.0,
+			metrics: []PodMetrics{
+				{PodIP: "pod-0", NumRequestsRunning: 64, Reachable: true},
+				{PodIP: "pod-1", Reachable: true},
+				{PodIP: "pod-2", Reachable: true},
+			},
+			wantDesc: "slot signal only, half capacity",
+		},
+		{
+			name:     "Slot utilisation only: pod-0 at 100% capacity",
+			alpha:    0.0, beta: 1.0,
+			metrics: []PodMetrics{
+				{PodIP: "pod-0", NumRequestsRunning: 128, Reachable: true},
+				{PodIP: "pod-1", Reachable: true},
+				{PodIP: "pod-2", Reachable: true},
+			},
+			wantDesc: "slot signal only, fully saturated",
+		},
+		{
+			name:     "KV + queue: pod-0 at 100% KV with sustained queue",
+			alpha:    1.0, beta: 0.0,
+			metrics: []PodMetrics{
+				{PodIP: "pod-0", KVCacheUsagePerc: 1.0, NumRequestsWaiting: 20,
+					WaitingSustainedStreak: 3, Reachable: true},
+				{PodIP: "pod-1", Reachable: true},
+				{PodIP: "pod-2", Reachable: true},
+			},
+			wantDesc: "two signals: KV + queue",
+		},
+		{
+			name:     "All 3 signals: pod-0 fully overloaded (unit test scenario)",
+			alpha:    1.0, beta: 1.0,
+			metrics: []PodMetrics{
+				{PodIP: "pod-0", KVCacheUsagePerc: 1.0, NumRequestsWaiting: 50,
+					WaitingSustainedStreak: 3, NumRequestsRunning: 128, Reachable: true},
+				{PodIP: "pod-1", Reachable: true},
+				{PodIP: "pod-2", Reachable: true},
+			},
+			wantDesc: "all three signals maxed",
+		},
+		{
+			name:     "Graduated: pod-0 heavy, pod-1 medium, pod-2 idle",
+			alpha:    1.0, beta: 1.0,
+			metrics: []PodMetrics{
+				{PodIP: "pod-0", KVCacheUsagePerc: 1.0, NumRequestsWaiting: 20,
+					WaitingSustainedStreak: 3, NumRequestsRunning: 128, Reachable: true},
+				{PodIP: "pod-1", KVCacheUsagePerc: 0.85, NumRequestsRunning: 64, Reachable: true},
+				{PodIP: "pod-2", Reachable: true},
+			},
+			wantDesc: "graduated load: heavy/medium/idle",
+		},
+		{
+			name:     "Transient spike: queue not yet sustained (streak=1)",
+			alpha:    1.0, beta: 0.0,
+			metrics: []PodMetrics{
+				{PodIP: "pod-0", NumRequestsWaiting: 50, WaitingSustainedStreak: 1, Reachable: true},
+				{PodIP: "pod-1", Reachable: true},
+				{PodIP: "pod-2", Reachable: true},
+			},
+			wantDesc: "transient spike suppressed → should equal round-robin",
+		},
+	}
+
+	t.Log("")
+	t.Log("┌─────────────────────────────────────────────────────────────────────────────────┐")
+	t.Log("│            ComputeWeights scenario table  (round-robin baseline = 33/33/33)     │")
+	t.Log("├──────────────────────────────────────────────────────┬──────────┬───────────────┤")
+	t.Log("│ Scenario                                             │ Ratios   │ RR reduction  │")
+	t.Log("├──────────────────────────────────────────────────────┼──────────┼───────────────┤")
+
+	for _, s := range scenarios {
+		result := ComputeWeights(s.metrics, s.alpha, s.beta, maxSeqs)
+		if len(result) != 3 {
+			t.Errorf("%s: expected 3 results, got %d", s.name, len(result))
+			continue
+		}
+		r0, r1, r2 := result[0].Ratio, result[1].Ratio, result[2].Ratio
+		rrReduction := float64(roundRobinRatio3-int(r0)) / float64(roundRobinRatio3) * 100
+
+		if total := sumRatios(result); total != 100 {
+			t.Errorf("%s: ratios sum to %d, want 100", s.name, total)
+		}
+
+		label := s.name
+		if len(label) > 52 {
+			label = label[:49] + "..."
+		}
+		t.Logf("│ %-52s │ %2d/%2d/%2d │ %+.0f%%           │",
+			label, r0, r1, r2, rrReduction)
+	}
+
+	t.Log("└──────────────────────────────────────────────────────┴──────────┴───────────────┘")
+	t.Log("")
+	t.Log("  pod-0 = stressed pod    pod-1/2 = idle pods    RR reduction = % less traffic to stressed pod vs round-robin")
+}
+
 // TestComputeWeights_AllSignalsCombined verifies that enabling all three signals
 // together produces greater skew than any single signal alone.
 func TestComputeWeights_AllSignalsCombined(t *testing.T) {
