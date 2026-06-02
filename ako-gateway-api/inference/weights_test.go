@@ -18,6 +18,10 @@ import (
 	"testing"
 )
 
+// roundRobinRatio3 is the ratio each of 3 equal pods receives under a naive
+// round-robin policy (100 / 3, integer division).
+const roundRobinRatio3 = 33
+
 // sumRatios returns the sum of all Ratio values in a WeightedPod slice.
 func sumRatios(pods []WeightedPod) uint32 {
 	var s uint32
@@ -27,8 +31,10 @@ func sumRatios(pods []WeightedPod) uint32 {
 	return s
 }
 
+// ── Basic correctness ────────────────────────────────────────────────────────
+
 func TestComputeWeights_Empty(t *testing.T) {
-	result := ComputeWeights(nil, 1.0, 0.5)
+	result := ComputeWeights(nil, 1.0, 1.0, 0)
 	if result != nil {
 		t.Errorf("expected nil for empty input, got %v", result)
 	}
@@ -38,7 +44,7 @@ func TestComputeWeights_SinglePod(t *testing.T) {
 	metrics := []PodMetrics{
 		{PodIP: "10.0.0.1", NumRequestsWaiting: 0, KVCacheUsagePerc: 0.1, Reachable: true},
 	}
-	result := ComputeWeights(metrics, 1.0, 0.0)
+	result := ComputeWeights(metrics, 1.0, 0.0, 0)
 	if len(result) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(result))
 	}
@@ -47,63 +53,55 @@ func TestComputeWeights_SinglePod(t *testing.T) {
 	}
 }
 
-func TestComputeWeights_EqualLoad_RatiosSumTo100(t *testing.T) {
-	metrics := []PodMetrics{
-		{PodIP: "10.0.0.1", NumRequestsWaiting: 3, KVCacheUsagePerc: 0.30, Reachable: true},
-		{PodIP: "10.0.0.2", NumRequestsWaiting: 3, KVCacheUsagePerc: 0.30, Reachable: true},
-		{PodIP: "10.0.0.3", NumRequestsWaiting: 3, KVCacheUsagePerc: 0.30, Reachable: true},
-	}
-	result := ComputeWeights(metrics, 1.0, 0.0)
-	if len(result) != 3 {
-		t.Fatalf("expected 3 results, got %d", len(result))
-	}
-	total := sumRatios(result)
-	if total != 100 {
-		t.Errorf("ratios should sum to 100, got %d", total)
-	}
-	// Equal load → each pod should get roughly equal share (~33)
-	for i, w := range result {
-		if w.Ratio < 30 || w.Ratio > 37 {
-			t.Errorf("pod[%d] ratio %d out of expected equal-load range [30,37]", i, w.Ratio)
-		}
-	}
-}
-
 func TestComputeWeights_RatiosAlwaysSumTo100(t *testing.T) {
-	// Asymmetric load - rounding must still produce sum=100
+	// Asymmetric load — rounding must still produce sum=100.
 	metrics := []PodMetrics{
-		{PodIP: "10.0.0.1", NumRequestsWaiting: 30, KVCacheUsagePerc: 0.95, Reachable: true},
+		{PodIP: "10.0.0.1", NumRequestsWaiting: 30, KVCacheUsagePerc: 0.95,
+			WaitingSustainedStreak: 3, Reachable: true},
 		{PodIP: "10.0.0.2", NumRequestsWaiting: 1, KVCacheUsagePerc: 0.10, Reachable: true},
 		{PodIP: "10.0.0.3", NumRequestsWaiting: 0, KVCacheUsagePerc: 0.05, Reachable: true},
 	}
-	result := ComputeWeights(metrics, 1.0, 0.0)
-	total := sumRatios(result)
-	if total != 100 {
+	result := ComputeWeights(metrics, 1.0, 0.0, 0)
+	if total := sumRatios(result); total != 100 {
 		t.Errorf("ratios should sum to 100, got %d (results: %v)", total, result)
 	}
 }
 
-func TestComputeWeights_OverloadedPodGetsMinimumRatio(t *testing.T) {
-	// Pod-1 is heavily loaded; it should get a much smaller ratio than pods 2 & 3
+func TestComputeWeights_MinRatioEnforced(t *testing.T) {
+	// Extremely high load on pod-0 should still give it at least minRatio=1.
 	metrics := []PodMetrics{
-		{PodIP: "10.0.0.1", NumRequestsWaiting: 30, KVCacheUsagePerc: 0.95, Reachable: true},
-		{PodIP: "10.0.0.2", NumRequestsWaiting: 0, KVCacheUsagePerc: 0.05, Reachable: true},
-		{PodIP: "10.0.0.3", NumRequestsWaiting: 0, KVCacheUsagePerc: 0.05, Reachable: true},
+		{PodIP: "10.0.0.1", NumRequestsWaiting: 10000, KVCacheUsagePerc: 1.0,
+			WaitingSustainedStreak: 5, Reachable: true},
+		{PodIP: "10.0.0.2", NumRequestsWaiting: 0, KVCacheUsagePerc: 0.0, Reachable: true},
 	}
-	result := ComputeWeights(metrics, 1.0, 0.0)
-	total := sumRatios(result)
-	if total != 100 {
+	result := ComputeWeights(metrics, 1.0, 0.0, 0)
+	for i, w := range result {
+		if w.Ratio < minRatio {
+			t.Errorf("pod[%d] ratio %d is below minRatio=%d", i, w.Ratio, minRatio)
+		}
+		if w.Ratio > maxRatio {
+			t.Errorf("pod[%d] ratio %d exceeds maxRatio=%d", i, w.Ratio, maxRatio)
+		}
+	}
+	if total := sumRatios(result); total != 100 {
 		t.Errorf("ratios should sum to 100, got %d", total)
 	}
-	if result[0].Ratio >= result[1].Ratio {
-		t.Errorf("overloaded pod[0] ratio %d should be less than idle pod[1] ratio %d",
-			result[0].Ratio, result[1].Ratio)
+}
+
+func TestComputeWeights_PodIPsPreserved(t *testing.T) {
+	metrics := []PodMetrics{
+		{PodIP: "192.168.1.10", NumRequestsWaiting: 1, Reachable: true},
+		{PodIP: "192.168.1.11", NumRequestsWaiting: 2, Reachable: true},
 	}
-	if result[0].Ratio >= result[2].Ratio {
-		t.Errorf("overloaded pod[0] ratio %d should be less than idle pod[2] ratio %d",
-			result[0].Ratio, result[2].Ratio)
+	result := ComputeWeights(metrics, 1.0, 0.0, 0)
+	for i, w := range result {
+		if w.PodIP != metrics[i].PodIP {
+			t.Errorf("pod[%d] IP mismatch: expected %s, got %s", i, metrics[i].PodIP, w.PodIP)
+		}
 	}
 }
+
+// ── Unreachable pods ─────────────────────────────────────────────────────────
 
 func TestComputeWeights_UnreachablePodGetsMinRatio(t *testing.T) {
 	metrics := []PodMetrics{
@@ -111,15 +109,13 @@ func TestComputeWeights_UnreachablePodGetsMinRatio(t *testing.T) {
 		{PodIP: "10.0.0.2", NumRequestsWaiting: 2, KVCacheUsagePerc: 0.20, Reachable: true},
 		{PodIP: "10.0.0.3", NumRequestsWaiting: 2, KVCacheUsagePerc: 0.20, Reachable: true},
 	}
-	result := ComputeWeights(metrics, 1.0, 0.0)
-	total := sumRatios(result)
-	if total != 100 {
+	result := ComputeWeights(metrics, 1.0, 0.0, 0)
+	if total := sumRatios(result); total != 100 {
 		t.Errorf("ratios should sum to 100, got %d", total)
 	}
 	if result[0].Ratio != minRatio {
 		t.Errorf("unreachable pod should get minRatio=%d, got %d", minRatio, result[0].Ratio)
 	}
-	// Reachable pods should get significantly more traffic than the unreachable one
 	if result[1].Ratio <= result[0].Ratio {
 		t.Errorf("reachable pod[1] ratio %d should exceed unreachable pod[0] ratio %d",
 			result[1].Ratio, result[0].Ratio)
@@ -132,7 +128,7 @@ func TestComputeWeights_AllUnreachable(t *testing.T) {
 		{PodIP: "10.0.0.2", Reachable: false},
 		{PodIP: "10.0.0.3", Reachable: false},
 	}
-	result := ComputeWeights(metrics, 1.0, 0.0)
+	result := ComputeWeights(metrics, 1.0, 0.0, 0)
 	for i, w := range result {
 		if w.Ratio != minRatio {
 			t.Errorf("unreachable pod[%d] should get minRatio=%d, got %d", i, minRatio, w.Ratio)
@@ -140,69 +136,268 @@ func TestComputeWeights_AllUnreachable(t *testing.T) {
 	}
 }
 
-func TestComputeWeights_MinRatioEnforced(t *testing.T) {
-	// Extremely high load on pod-1 should still give it at least minRatio=1
+// ── KV-cache signal ──────────────────────────────────────────────────────────
+
+// TestComputeWeights_KVThreshold verifies the KV signal only fires above the
+// 75% threshold. Below the threshold the overloaded pod scores the same as idle
+// pods — weights are equal (round-robin behaviour). Above it the pod is penalised.
+func TestComputeWeights_KVThreshold(t *testing.T) {
+	below := []PodMetrics{
+		{PodIP: "10.0.0.1", KVCacheUsagePerc: 0.74, Reachable: true}, // just below threshold
+		{PodIP: "10.0.0.2", KVCacheUsagePerc: 0.00, Reachable: true},
+	}
+	above := []PodMetrics{
+		{PodIP: "10.0.0.1", KVCacheUsagePerc: 0.76, Reachable: true}, // just above threshold
+		{PodIP: "10.0.0.2", KVCacheUsagePerc: 0.00, Reachable: true},
+	}
+
+	resBelow := ComputeWeights(below, 1.0, 0.0, 0)
+	resAbove := ComputeWeights(above, 1.0, 0.0, 0)
+
+	// Below threshold: KV contributes nothing → equal weights (round-robin)
+	if resBelow[0].Ratio != resBelow[1].Ratio {
+		t.Errorf("below KV threshold: expected equal ratios, got %d vs %d",
+			resBelow[0].Ratio, resBelow[1].Ratio)
+	}
+	// Above threshold: pod-0 is penalised → lower ratio
+	if resAbove[0].Ratio >= resAbove[1].Ratio {
+		t.Errorf("above KV threshold: stressed pod[0] ratio %d should be less than idle pod[1] ratio %d",
+			resAbove[0].Ratio, resAbove[1].Ratio)
+	}
+}
+
+func TestComputeWeights_HighKVReducesRatio(t *testing.T) {
+	// Pod-0 KV at full capacity; pods 1 & 2 idle.
+	// Expects pod-0 to receive less traffic than round-robin's ~33.
 	metrics := []PodMetrics{
-		{PodIP: "10.0.0.1", NumRequestsWaiting: 10000, KVCacheUsagePerc: 1.0, Reachable: true},
-		{PodIP: "10.0.0.2", NumRequestsWaiting: 0, KVCacheUsagePerc: 0.0, Reachable: true},
+		{PodIP: "10.0.0.1", KVCacheUsagePerc: 1.0, Reachable: true},
+		{PodIP: "10.0.0.2", KVCacheUsagePerc: 0.0, Reachable: true},
+		{PodIP: "10.0.0.3", KVCacheUsagePerc: 0.0, Reachable: true},
 	}
-	result := ComputeWeights(metrics, 1.0, 0.0)
-	for i, w := range result {
-		if w.Ratio < minRatio {
-			t.Errorf("pod[%d] ratio %d is below minRatio=%d", i, w.Ratio, minRatio)
-		}
-		if w.Ratio > maxRatio {
-			t.Errorf("pod[%d] ratio %d exceeds maxRatio=%d", i, w.Ratio, maxRatio)
-		}
+	result := ComputeWeights(metrics, 1.0, 0.0, 0)
+	if sumRatios(result) != 100 {
+		t.Fatalf("ratios should sum to 100, got %d", sumRatios(result))
 	}
-	total := sumRatios(result)
-	if total != 100 {
+	if result[0].Ratio >= roundRobinRatio3 {
+		t.Errorf("full-KV pod[0] ratio %d should be below round-robin (%d)", result[0].Ratio, roundRobinRatio3)
+	}
+	if result[1].Ratio <= roundRobinRatio3 {
+		t.Errorf("idle pod[1] ratio %d should exceed round-robin (%d)", result[1].Ratio, roundRobinRatio3)
+	}
+	t.Logf("KV-only (α=1): %d/%d/%d vs round-robin 33/33/33", result[0].Ratio, result[1].Ratio, result[2].Ratio)
+}
+
+// ── Waiting-queue signal ─────────────────────────────────────────────────────
+
+// TestComputeWeights_WaitingRequiresSustainedStreak verifies that a transient
+// single-cycle queue spike (streak < 2) does NOT affect routing — the formula
+// degrades to round-robin until the queue has been sustained.
+func TestComputeWeights_WaitingRequiresSustainedStreak(t *testing.T) {
+	transient := []PodMetrics{
+		{PodIP: "10.0.0.1", NumRequestsWaiting: 50, WaitingSustainedStreak: 1, Reachable: true}, // streak too short
+		{PodIP: "10.0.0.2", NumRequestsWaiting: 0, WaitingSustainedStreak: 0, Reachable: true},
+	}
+	sustained := []PodMetrics{
+		{PodIP: "10.0.0.1", NumRequestsWaiting: 50, WaitingSustainedStreak: 2, Reachable: true}, // streak meets threshold
+		{PodIP: "10.0.0.2", NumRequestsWaiting: 0, WaitingSustainedStreak: 0, Reachable: true},
+	}
+
+	resTransient := ComputeWeights(transient, 1.0, 0.0, 0)
+	resSustained := ComputeWeights(sustained, 1.0, 0.0, 0)
+
+	// Transient spike: waiting term is suppressed → equal weights (round-robin)
+	if resTransient[0].Ratio != resTransient[1].Ratio {
+		t.Errorf("transient spike: expected equal ratios (round-robin), got %d vs %d",
+			resTransient[0].Ratio, resTransient[1].Ratio)
+	}
+	// Sustained queue: waiting term fires → pod-0 penalised
+	if resSustained[0].Ratio >= resSustained[1].Ratio {
+		t.Errorf("sustained queue: stressed pod[0] ratio %d should be less than idle pod[1] ratio %d",
+			resSustained[0].Ratio, resSustained[1].Ratio)
+	}
+}
+
+// ── Slot-utilisation signal (beta) ───────────────────────────────────────────
+
+// TestComputeWeights_SlotUtilisationContribution verifies the beta / slot term.
+// beta weights NumRequestsRunning / maxNumSeqs, not token throughput.
+func TestComputeWeights_SlotUtilisationContribution(t *testing.T) {
+	const maxSeqs = 128.0
+
+	// Pod-0 runs at full slot capacity; pod-1 is idle.
+	noBeta := []PodMetrics{
+		{PodIP: "10.0.0.1", NumRequestsRunning: 128, Reachable: true},
+		{PodIP: "10.0.0.2", NumRequestsRunning: 0, Reachable: true},
+	}
+	withBeta := []PodMetrics{
+		{PodIP: "10.0.0.1", NumRequestsRunning: 128, Reachable: true},
+		{PodIP: "10.0.0.2", NumRequestsRunning: 0, Reachable: true},
+	}
+
+	resNoBeta := ComputeWeights(noBeta, 1.0, 0.0, maxSeqs)
+	resWithBeta := ComputeWeights(withBeta, 1.0, 1.0, maxSeqs)
+
+	// beta=0: slot term disabled → pod-0 and pod-1 look identical → equal ratios
+	if resNoBeta[0].Ratio != resNoBeta[1].Ratio {
+		t.Errorf("beta=0: expected equal ratios, got %d vs %d",
+			resNoBeta[0].Ratio, resNoBeta[1].Ratio)
+	}
+	// beta=1.0: fully-utilised pod-0 → higher load → lower ratio
+	if resWithBeta[0].Ratio >= resWithBeta[1].Ratio {
+		t.Errorf("beta=1.0: full-slot pod[0] ratio %d should be less than idle pod[1] ratio %d",
+			resWithBeta[0].Ratio, resWithBeta[1].Ratio)
+	}
+	if total := sumRatios(resWithBeta); total != 100 {
 		t.Errorf("ratios should sum to 100, got %d", total)
 	}
+	t.Logf("slot-only (β=1, maxSeqs=128): %d/%d vs round-robin 50/50",
+		resWithBeta[0].Ratio, resWithBeta[1].Ratio)
 }
 
-func TestComputeWeights_TokenRateContribution(t *testing.T) {
-	// With beta>0, a high token rate should increase load → lower ratio
-	metricsNoBeta := []PodMetrics{
-		{PodIP: "10.0.0.1", NumRequestsWaiting: 0, KVCacheUsagePerc: 0.0, TotalTokensPerSec: 1000, Reachable: true},
-		{PodIP: "10.0.0.2", NumRequestsWaiting: 0, KVCacheUsagePerc: 0.0, TotalTokensPerSec: 0, Reachable: true},
-	}
-	metricsWithBeta := []PodMetrics{
-		{PodIP: "10.0.0.1", NumRequestsWaiting: 0, KVCacheUsagePerc: 0.0, TotalTokensPerSec: 1000, Reachable: true},
-		{PodIP: "10.0.0.2", NumRequestsWaiting: 0, KVCacheUsagePerc: 0.0, TotalTokensPerSec: 0, Reachable: true},
-	}
-	noBeta := ComputeWeights(metricsNoBeta, 1.0, 0.0)
-	withBeta := ComputeWeights(metricsWithBeta, 1.0, 2.0)
+// ── Intelligent routing vs round-robin ──────────────────────────────────────
 
-	// Without beta, token rate has no effect so ratios should be equal
-	if noBeta[0].Ratio != noBeta[1].Ratio {
-		// Both have waiting=0, kv=0; equal load → should be ~equal
-		// (may differ by 1 due to rounding but not significantly)
-		diff := int(noBeta[0].Ratio) - int(noBeta[1].Ratio)
-		if diff > 1 || diff < -1 {
-			t.Errorf("without beta, equal-load pods should have equal ratios, got %d vs %d",
-				noBeta[0].Ratio, noBeta[1].Ratio)
-		}
-	}
-	// With beta>0, high-throughput pod[0] has more load → smaller ratio
-	if withBeta[0].Ratio >= withBeta[1].Ratio {
-		t.Errorf("with beta, high-throughput pod[0] ratio %d should be less than idle pod[1] ratio %d",
-			withBeta[0].Ratio, withBeta[1].Ratio)
-	}
-	if sumRatios(withBeta) != 100 {
-		t.Errorf("ratios with beta should sum to 100, got %d", sumRatios(withBeta))
-	}
-}
+// TestComputeWeights_IntelligentVsRoundRobin is the headline demo test: it
+// quantifies the maximum divergence from round-robin achievable with all three
+// signals firing together on one pod.
+//
+// Setup (3 pods, α=β=1.0, maxNumSeqs=128):
+//
+//	Pod-0 (overloaded): waiting=50 (streak≥2), KV=1.0, running=128
+//	  waitingLoad = 50/50 = 1.0
+//	  kvLoad      = 1.0 × (1.0−0.75)/(1−0.75) = 1.0
+//	  slotLoad    = 1.0 × 128/128 = 1.0
+//	  total load  = 3.0  →  score = 1/(3+1) = 0.25
+//
+//	Pods 1 & 2 (idle): all signals zero → score = 1/(0+1) = 1.0
+//
+//	Ratios: pod0 ≈ 11  |  pod1/2 ≈ 44–45  (sum = 100)
+//
+// Round-robin would give 33/33/33.
+// The intelligent formula delivers ~4× more traffic to healthy pods.
+func TestComputeWeights_IntelligentVsRoundRobin(t *testing.T) {
+	const maxSeqs = 128.0
 
-func TestComputeWeights_PodIPsPreserved(t *testing.T) {
 	metrics := []PodMetrics{
-		{PodIP: "192.168.1.10", NumRequestsWaiting: 1, Reachable: true},
-		{PodIP: "192.168.1.11", NumRequestsWaiting: 2, Reachable: true},
+		{
+			PodIP:                  "10.0.0.1",
+			NumRequestsWaiting:     50,
+			WaitingSustainedStreak: 3, // >= waitingSustainedScrapes (2)
+			KVCacheUsagePerc:       1.0,
+			NumRequestsRunning:     128,
+			Reachable:              true,
+		},
+		{PodIP: "10.0.0.2", Reachable: true},
+		{PodIP: "10.0.0.3", Reachable: true},
 	}
-	result := ComputeWeights(metrics, 1.0, 0.0)
+
+	result := ComputeWeights(metrics, 1.0, 1.0, maxSeqs)
+
+	if total := sumRatios(result); total != 100 {
+		t.Fatalf("ratios should sum to 100, got %d", total)
+	}
+
+	overloaded := int(result[0].Ratio)
+	idle1 := int(result[1].Ratio)
+	idle2 := int(result[2].Ratio)
+
+	// Overloaded pod must receive substantially less traffic than round-robin's 33.
+	if overloaded >= roundRobinRatio3 {
+		t.Errorf("overloaded pod ratio %d should be well below round-robin (%d)",
+			overloaded, roundRobinRatio3)
+	}
+	// Idle pods must receive substantially more traffic than round-robin's 33.
+	if idle1 <= roundRobinRatio3 {
+		t.Errorf("idle pod[1] ratio %d should exceed round-robin (%d)", idle1, roundRobinRatio3)
+	}
+	if idle2 <= roundRobinRatio3 {
+		t.Errorf("idle pod[2] ratio %d should exceed round-robin (%d)", idle2, roundRobinRatio3)
+	}
+	// Healthy pods should receive at least 3× more traffic than the stressed pod.
+	if idle1 < 3*overloaded || idle2 < 3*overloaded {
+		t.Errorf("idle pods (%d, %d) should get at least 3× the traffic of the overloaded pod (%d)",
+			idle1, idle2, overloaded)
+	}
+
+	t.Logf("round-robin baseline:   33 / 33 / 33")
+	t.Logf("intelligent routing:    %2d / %2d / %2d  (overloaded / idle / idle)",
+		overloaded, idle1, idle2)
+	t.Logf("traffic gain to idle pods: %.1f×", float64(idle1)/float64(overloaded))
+}
+
+// TestComputeWeights_EqualLoad_RatiosSumTo100 proves that when all pods carry
+// identical load the formula degrades to round-robin (equal weights).
+func TestComputeWeights_EqualLoad_RatiosSumTo100(t *testing.T) {
+	metrics := []PodMetrics{
+		{PodIP: "10.0.0.1", NumRequestsWaiting: 3, KVCacheUsagePerc: 0.30, Reachable: true},
+		{PodIP: "10.0.0.2", NumRequestsWaiting: 3, KVCacheUsagePerc: 0.30, Reachable: true},
+		{PodIP: "10.0.0.3", NumRequestsWaiting: 3, KVCacheUsagePerc: 0.30, Reachable: true},
+	}
+	result := ComputeWeights(metrics, 1.0, 0.0, 0)
+	if total := sumRatios(result); total != 100 {
+		t.Fatalf("ratios should sum to 100, got %d", total)
+	}
 	for i, w := range result {
-		if w.PodIP != metrics[i].PodIP {
-			t.Errorf("pod[%d] IP mismatch: expected %s, got %s", i, metrics[i].PodIP, w.PodIP)
+		if w.Ratio < 30 || w.Ratio > 37 {
+			t.Errorf("pod[%d] ratio %d out of expected equal-load range [30,37]", i, w.Ratio)
 		}
 	}
+}
+
+// TestComputeWeights_OverloadedPodGetsMinimumRatio checks the directional
+// ordering: a pod with high KV and a sustained waiting queue should receive
+// significantly less traffic than idle pods.
+func TestComputeWeights_OverloadedPodGetsMinimumRatio(t *testing.T) {
+	metrics := []PodMetrics{
+		{PodIP: "10.0.0.1", NumRequestsWaiting: 30, WaitingSustainedStreak: 3,
+			KVCacheUsagePerc: 0.95, Reachable: true},
+		{PodIP: "10.0.0.2", NumRequestsWaiting: 0, KVCacheUsagePerc: 0.05, Reachable: true},
+		{PodIP: "10.0.0.3", NumRequestsWaiting: 0, KVCacheUsagePerc: 0.05, Reachable: true},
+	}
+	result := ComputeWeights(metrics, 1.0, 0.0, 0)
+	if total := sumRatios(result); total != 100 {
+		t.Errorf("ratios should sum to 100, got %d", total)
+	}
+	if result[0].Ratio >= result[1].Ratio {
+		t.Errorf("overloaded pod[0] ratio %d should be less than idle pod[1] ratio %d",
+			result[0].Ratio, result[1].Ratio)
+	}
+	if result[0].Ratio >= result[2].Ratio {
+		t.Errorf("overloaded pod[0] ratio %d should be less than idle pod[2] ratio %d",
+			result[0].Ratio, result[2].Ratio)
+	}
+	t.Logf("overloaded vs idle: %d / %d / %d (round-robin would be 33/33/33)",
+		result[0].Ratio, result[1].Ratio, result[2].Ratio)
+}
+
+// TestComputeWeights_AllSignalsCombined verifies that enabling all three signals
+// together produces greater skew than any single signal alone.
+func TestComputeWeights_AllSignalsCombined(t *testing.T) {
+	const maxSeqs = 128.0
+
+	kvOnly := []PodMetrics{
+		{PodIP: "10.0.0.1", KVCacheUsagePerc: 1.0, Reachable: true},
+		{PodIP: "10.0.0.2", Reachable: true},
+	}
+	allSignals := []PodMetrics{
+		{
+			PodIP:                  "10.0.0.1",
+			KVCacheUsagePerc:       1.0,
+			NumRequestsWaiting:     50,
+			WaitingSustainedStreak: 3,
+			NumRequestsRunning:     128,
+			Reachable:              true,
+		},
+		{PodIP: "10.0.0.2", Reachable: true},
+	}
+
+	resKVOnly := ComputeWeights(kvOnly, 1.0, 0.0, maxSeqs)
+	resAll := ComputeWeights(allSignals, 1.0, 1.0, maxSeqs)
+
+	// All-signals combo should penalise pod-0 more than KV alone.
+	if resAll[0].Ratio >= resKVOnly[0].Ratio {
+		t.Errorf("combined signals pod[0] ratio %d should be lower than KV-only ratio %d",
+			resAll[0].Ratio, resKVOnly[0].Ratio)
+	}
+	t.Logf("KV-only:      pod0=%d pod1=%d", resKVOnly[0].Ratio, resKVOnly[1].Ratio)
+	t.Logf("All signals:  pod0=%d pod1=%d  (greater skew with combined signals)", resAll[0].Ratio, resAll[1].Ratio)
 }
