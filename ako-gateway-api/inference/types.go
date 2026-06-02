@@ -13,7 +13,7 @@
 */
 
 // Package inference implements AKO-native support for the Gateway API Inference
-// Extension (gateway.inference.x-k8s.io). Instead of using ext-proc/EPP, AKO
+// Extension (inference.networking.x-k8s.io). Instead of using ext-proc/EPP, AKO
 // scrapes LLM Prometheus endpoints directly and adjusts Avi Pool Group member
 // weights on each scrape cycle.
 package inference

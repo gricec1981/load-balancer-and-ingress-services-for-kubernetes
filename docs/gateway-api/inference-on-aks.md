@@ -361,8 +361,11 @@ The AKO pod has two containers: `ako` (main) and `ako-gateway-api` (the inferenc
 feature actually loaded:
 
 ```bash
-# The inference env vars live on the ako-gateway-api container:
-kubectl exec -n avi-system ako-0 -c ako-gateway-api -- env | grep INFERENCE
+# The ako-gateway-api container is distroless (no shell, no env binary).
+# Read the env vars from the pod spec instead:
+kubectl get pod ako-0 -n avi-system \
+  -o jsonpath='{range .spec.containers[?(@.name=="ako-gateway-api")].env[*]}{.name}={.value}{"\n"}{end}' \
+  | grep INFERENCE
 ```
 
 You want `INFERENCE_EXTENSION_ENABLED=true` in that output (plus
