@@ -11,6 +11,11 @@ sidecars, no external rate-limit servers, no changes to the data-plane binary.
 This feature builds directly on top of the [AKO Inference Extension](inference-extension.md).
 It is designed to protect and govern the same LLM endpoints that `InferencePool` load-balances.
 
+A Phase 3 `AIMCPPolicy` extension will bring the same governance to **MCP tool servers**,
+making the AI Gateway the single control plane for the entire agent execution loop — inference
+calls to LLMs and tool calls to MCP servers, authenticated and budget-governed by the same
+policies and the same verified identity.
+
 > **Why OAuth/OIDC and not raw JWT validation?** Avi's `SSO_TYPE_JWT` validates a bearer token
 > but **strips the `Authorization` header before any DataScript runs**, and this Avi build has no
 > mechanism to inject validated claims as headers — so a token-budget DataScript cannot read the
@@ -485,6 +490,109 @@ Install the CRDs and restart the `ako-gateway-api` pod.
 | 2 | Verified claims in the DataScript via `oauth_get_claim` | ✅ Done |
 | 2.5 | Native distributed rate limiter (`avi.vs.rate_limiter()`) for exact cross-SE limits | Planned |
 | 2.5 | `AIObservabilityPolicy` — per-request token usage logging | Planned |
+| 3 | `AIMCPPolicy` — route and govern MCP tool server endpoints from a registry using the same `targetRef` attachment model | Planned |
+| 3 | MCP registry integration — auto-discover registered MCP servers from the registry, materialise them as AKO-managed Avi Pool backends | Planned |
+| 3 | Cross-resource budget — unified per-consumer spend limit spanning token consumption (LLM) and call count (MCP tools) in a single rolling window | Planned |
+
+---
+
+## MCP Tool Governance (Phase 3 — Planned)
+
+### The Gap Today
+
+The AI Gateway governs the *inference path*: authenticating callers and enforcing token budgets
+on LLM endpoints load-balanced by `InferencePool`. Modern AI agents, however, make two kinds
+of calls:
+
+- **Inference calls** → LLMs (already governed)
+- **Tool calls** → MCP servers for retrieval, code execution, external APIs (not yet governed)
+
+An [MCP registry](https://modelcontextprotocol.io) bridges this gap. It is the catalog of
+available tool servers — the tool-side equivalent of the Kubernetes API that backs
+`InferencePool`.
+
+### Expanded Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Agent (AI workload)                            │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │ HTTPS
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  AKO AI Gateway  (Avi Virtual Service)                           │
+│                                                                  │
+│  AIGatewayAuthPolicy    → OAuth/OIDC session, claim resolution   │
+│  AITokenRateLimitPolicy → per-consumer token + call budgets      │
+│  AIMCPPolicy (Phase 3)  → MCP server routing + governance        │
+│                                                                  │
+│  ┌────────────────────┐      ┌──────────────────────────────┐   │
+│  │  /v1/chat  route   │      │  /mcp/* routes  (Phase 3)    │   │
+│  └──────────┬─────────┘      └──────────────┬───────────────┘   │
+└─────────────┼──────────────────────────────┼────────────────────┘
+              │                              │
+              ▼                              ▼
+┌─────────────────────┐        ┌────────────────────────────────┐
+│  InferencePool      │        │  MCP Registry                  │
+│  (LLM backends)     │        │  (tool server catalog)         │
+│                     │        │                                │
+│  vLLM pod A         │        │  MCP server: web-search        │
+│  vLLM pod B         │        │  MCP server: code-exec         │
+│  vLLM pod C         │        │  MCP server: internal-api      │
+└─────────────────────┘        └────────────────────────────────┘
+```
+
+### How `AIMCPPolicy` Extends the Existing Pattern
+
+`AIMCPPolicy` follows the same `targetRef` attachment model as the existing policies. AKO reads
+the MCP registry at the configured endpoint, materialises the registered tool servers as Avi
+Pool backends, and applies auth and call-budget governance to the `/mcp/*` HTTPRoute — no
+manual Pool configuration required.
+
+```yaml
+apiVersion: ai.ako.vmware.com/v1alpha1
+kind: AIMCPPolicy
+metadata:
+  name: mcp-governance
+  namespace: inference
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: mcp-route
+  registry:
+    url: "https://mcp-registry.internal/v1"   # MCP registry endpoint
+    refreshInterval: 5m                        # how often AKO re-syncs the catalog
+  auth:
+    policyRef: llm-auth     # re-use the same AIGatewayAuthPolicy on this route
+  limits:
+    callBudget:
+      per: consumer         # one call counter per verified sub claim
+      window: 1h
+      max: 500              # max tool calls per consumer per hour
+      action:
+        type: Reject
+        statusCode: 429
+        retryAfter: true
+```
+
+### What the MCP Registry Provides
+
+| Registry capability | AI GW use |
+|---|---|
+| Tool server catalog (name, endpoint, schema) | GW routes `/mcp/<tool>` calls to the correct backend Pool |
+| Server health / availability | GW skips unavailable servers (same health-check model as `InferencePool`) |
+| Tool ACLs (which identities may call which tools) | GW enforces via the verified `sub` / `group` claim from `AIGatewayAuthPolicy` |
+| Tool versioning | GW can pin routes to specific tool server versions from the registry |
+
+### Governance Continuity — One Identity, Both Paths
+
+Because `AIGatewayAuthPolicy` already resolves a verified identity (`sub`) and group claim from
+the OIDC token, that same verified principal governs tool access — **no second authentication
+hop**. An agent authenticated to call the LLM endpoint is the same identity whose tool-call
+budget is enforced on the MCP route. A Phase 3 cross-resource budget will let operators express
+a *unified* per-consumer spend limit that spans both token consumption (LLM) and call count
+(MCP tools) within a single rolling window.
 
 ---
 
