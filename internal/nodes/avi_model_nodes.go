@@ -1516,6 +1516,15 @@ func (v *AviHTTPDataScriptNode) CalculateCheckSum() {
 	if len(v.PoolGroupRefs) == 1 {
 		checksum += utils.Hash(fmt.Sprintf(utils.HTTP_DS_SCRIPT_MODIFIED, v.PoolGroupRefs[0]))
 	}
+	// Include the script name, event and body so that content-only changes are
+	// detected and re-pushed. DataScripts that carry no PoolGroupRefs (e.g. the
+	// AI-gateway token-accounting scripts) otherwise all hash to the same value,
+	// so edits to the script — a changed budget, a renamed counter key, a new
+	// event phase — would be skipped by the REST diff until the next full sync.
+	checksum += utils.Hash(v.Name)
+	if v.DataScript != nil {
+		checksum += utils.Hash(v.DataScript.Evt) + utils.Hash(v.DataScript.Script)
+	}
 	v.CloudConfigCksum = checksum
 }
 

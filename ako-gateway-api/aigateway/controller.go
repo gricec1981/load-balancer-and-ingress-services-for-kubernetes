@@ -367,6 +367,7 @@ func unstructuredToTokenRateLimitPolicy(obj *unstructured.Unstructured) (*AIToke
 	p := &AITokenRateLimitPolicy{}
 	p.Name = obj.GetName()
 	p.Namespace = obj.GetNamespace()
+	p.CounterEpoch = obj.GetAnnotations()[CounterEpochAnnotation]
 
 	spec, found, err := unstructured.NestedMap(obj.Object, "spec")
 	if err != nil || !found {

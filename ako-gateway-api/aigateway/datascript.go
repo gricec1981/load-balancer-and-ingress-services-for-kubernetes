@@ -113,7 +113,7 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy) TokenAccount
 	reqParts = append(reqParts, "local now = os.time()")
 
 	for _, limit := range spec.Limits {
-		reqParts = append(reqParts, buildReqLimitBlock(limit))
+		reqParts = append(reqParts, buildReqLimitBlock(limit, policy.CounterEpoch))
 	}
 
 	// ── Response-header phase: enable body buffering ──────────────────────
@@ -129,7 +129,7 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy) TokenAccount
 	respDataParts = append(respDataParts, buildUsageParseBlock())
 
 	for _, limit := range spec.Limits {
-		respDataParts = append(respDataParts, buildRespLimitBlock(limit))
+		respDataParts = append(respDataParts, buildRespLimitBlock(limit, policy.CounterEpoch))
 	}
 
 	return TokenAccountingScripts{
@@ -213,12 +213,17 @@ func windowSeconds(w string) int64 {
 }
 
 // counterKey returns a unique Lua expression for the counter table key that
-// incorporates the limit name, identity dimension, and current window boundary.
-func counterKeyExpr(limit TokenLimit) string {
+// incorporates an optional reset epoch, the limit name, identity dimension, and
+// current window boundary. Bumping epoch moves to a fresh keyspace (counter reset).
+func counterKeyExpr(limit TokenLimit, epoch string) string {
 	windowSec := windowSeconds(limit.Window)
 	keyExpr := counterKeyIdentityExpr(limit.Key)
+	prefix := limit.Name
+	if epoch != "" {
+		prefix = epoch + ":" + limit.Name
+	}
 	return fmt.Sprintf(`%q..":"..%s..":"..math.floor(now/%d)*%d`,
-		limit.Name, keyExpr, windowSec, windowSec)
+		prefix, keyExpr, windowSec, windowSec)
 }
 
 // counterKeyIdentityExpr returns the Lua expression that evaluates to the key
@@ -254,9 +259,9 @@ func tokenDimensionExpr(tokens string) string {
 // the HTTP_REQ phase: look up the counter and reject if already at budget.
 // When limit.GroupHeader is set it emits a per-group budget table so each group
 // gets its own ceiling while the counter is still keyed per-consumer.
-func buildReqLimitBlock(limit TokenLimit) string {
+func buildReqLimitBlock(limit TokenLimit, epoch string) string {
 	windowSec := windowSeconds(limit.Window)
-	keyExpr := counterKeyExpr(limit)
+	keyExpr := counterKeyExpr(limit, epoch)
 	action := limit.Action
 
 	statusCode := 429
@@ -413,9 +418,9 @@ end`, RespBodyBufferKB, FailClosedTokens, FailClosedTokens, FailClosedTokens)
 
 // buildRespLimitBlock generates the Lua snippet that increments one counter in
 // the HTTP_RESP phase, with a TTL equal to the window length.
-func buildRespLimitBlock(limit TokenLimit) string {
+func buildRespLimitBlock(limit TokenLimit, epoch string) string {
 	windowSec := windowSeconds(limit.Window)
-	keyExpr := counterKeyExpr(limit)
+	keyExpr := counterKeyExpr(limit, epoch)
 	dimVar := tokenDimensionExpr(limit.Tokens)
 
 	var b strings.Builder

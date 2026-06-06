@@ -106,7 +106,18 @@ type AITokenRateLimitPolicy struct {
 
 	Spec   AITokenRateLimitPolicySpec   `json:"spec"`
 	Status AITokenRateLimitPolicyStatus `json:"status,omitempty"`
+
+	// CounterEpoch is read from the CounterEpochAnnotation. It is folded into the
+	// SE counter key, so changing it (e.g. `kubectl annotate ...
+	// ai.ako.vmware.com/counter-epoch=2`) moves every limit to a fresh keyspace —
+	// effectively resetting the running token counters without touching the
+	// budgets or any other config. Empty means no prefix (back-compatible).
+	CounterEpoch string `json:"-"`
 }
+
+// CounterEpochAnnotation, when set on an AITokenRateLimitPolicy, prefixes the SE
+// token-counter keys. Bumping it clears all of that policy's running counters.
+const CounterEpochAnnotation = "ai.ako.vmware.com/counter-epoch"
 
 // AITokenRateLimitPolicySpec is the desired state of an AITokenRateLimitPolicy.
 type AITokenRateLimitPolicySpec struct {
