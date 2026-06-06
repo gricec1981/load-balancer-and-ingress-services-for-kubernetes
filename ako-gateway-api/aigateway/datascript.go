@@ -340,66 +340,74 @@ func buildReqLimitBlock(limit TokenLimit) string {
 	return b.String()
 }
 
-// buildBufferEnableBlock generates the HTTP_RESP Lua that turns on response-body
-// buffering — but only for POST requests with a JSON response content-type. This
-// skips GET /metrics scrapes, health checks, and streaming (text/event-stream)
-// responses, so the SE doesn't buffer + scan bodies that never carry a usage
-// block. get_method is pcall-guarded so the gate degrades to content-type-only
-// if the function isn't available in this event.
+// buildBufferEnableBlock generates the HTTP_RESP Lua that decides whether a
+// response should be metered and, if so, enables response-body buffering and
+// records the decision in a request-scoped variable (ai_meter) for HTTP_RESP_DATA
+// to read. A response is metered only when it is a successful (2xx) POST with a
+// JSON content-type — so GET /metrics scrapes, health checks, streaming
+// text/event-stream responses, and error responses are all skipped (the SE never
+// buffers/scans a body that carries no usage, and errors aren't penalized).
+// get_method and status are pcall-guarded, so the gate degrades gracefully if a
+// function is unavailable in this event.
+//
+// HTTP_RESP_DATA can't read headers, so the ai_meter reqvar is how that phase
+// learns "this response is metered" without re-sniffing the body.
 func buildBufferEnableBlock() string {
-	return fmt.Sprintf(`-- AKO AI Gateway: buffer the JSON response body so HTTP_RESP_DATA can read usage
+	return fmt.Sprintf(`-- AKO AI Gateway: decide+flag a metered response, buffer its body for HTTP_RESP_DATA
 do
   local ct = avi.http.get_header("Content-Type") or ""
   local is_json = string.find(ct, "application/json", 1, true) ~= nil
   local is_post = true
   do local ok, m = pcall(avi.http.get_method); if ok and m then is_post = (m == "POST") end end
-  if is_json and is_post then
+  local is_ok = true
+  do local ok, s = pcall(avi.http.status); if ok then local n = tonumber(s); if n then is_ok = (n >= 200 and n < 300) end end end
+  if is_json and is_post and is_ok then
     avi.http.set_response_body_buffer_size(%d)
+    avi.http.set_reqvar("ai_meter", "1")
   end
 end`, RespBodyBufferKB)
 }
 
 // buildUsageParseBlock generates the Lua snippet that extracts prompt_tokens,
-// completion_tokens, and total_tokens directly from the OpenAI-compatible
-// `usage` block in the buffered response body. It runs in the HTTP_RESP_DATA
-// event, where avi.http.get_response_body() returns the body the SE buffered
-// (HTTP_RESP enabled buffering via set_response_body_buffer_size). No dependency
-// on the backend emitting token headers, so it works with stock vLLM.
+// completion_tokens, and total_tokens from the OpenAI-compatible `usage` block in
+// the buffered response body. It runs in the HTTP_RESP_DATA event and only acts on
+// responses HTTP_RESP flagged as metered (the ai_meter reqvar) — so it never reads
+// the body for non-metered responses and the fail-closed decision is exact rather
+// than a body-content guess. No dependency on the backend emitting token headers,
+// so it works with stock vLLM.
 //
 // Avi's Lua sandbox lacks string.match, so the numeric value after each quoted
-// JSON key is extracted with plain string.find + a string.byte digit scan. The
-// keys are quoted ("total_tokens") so they don't false-match Prometheus
-// /metrics names like vllm:prompt_tokens_total on a GET (which carry no usage
-// and therefore correctly account 0 tokens).
+// JSON key is extracted with plain string.find + a string.byte digit scan.
 func buildUsageParseBlock() string {
 	return fmt.Sprintf(`-- token usage parsed from the buffered response body (HTTP_RESP_DATA)
-local _body = avi.http.get_response_body(%d)
-local function _num_after(key)
-  if not _body then return 0 end
-  local s = string.find(_body, key, 1, true)
-  if not s then return 0 end
-  local i = s + #key
-  while i <= #_body do local c = string.byte(_body, i); if c >= 48 and c <= 57 then break end; i = i + 1 end
-  local j = i
-  while j <= #_body do local c = string.byte(_body, j); if c < 48 or c > 57 then break end; j = j + 1 end
-  if j > i then return tonumber(string.sub(_body, i, j - 1)) or 0 end
-  return 0
-end
-local prompt_tokens     = _num_after('"prompt_tokens"')
-local completion_tokens = _num_after('"completion_tokens"')
-local total_tokens      = _num_after('"total_tokens"')
-if total_tokens == 0 then total_tokens = prompt_tokens + completion_tokens end
--- Fail-closed: a buffered JSON completion (it reached here, so HTTP_RESP saw a
--- JSON content-type) with no parseable usage was truncated (body > buffer) or
--- compressed. The "object":"chat.completion" / "choices" markers sit at the head
--- of the body and survive a tail truncation, so their presence means this really
--- was a completion that should have been metered. Charge a penalty so it cannot
--- slip through the budget unmetered.
-if total_tokens == 0 and _body and
-   (string.find(_body, "chat.completion", 1, true) or string.find(_body, '"choices"', 1, true)) then
-  total_tokens      = %d
-  prompt_tokens     = %d
-  completion_tokens = %d
+local prompt_tokens     = 0
+local completion_tokens = 0
+local total_tokens      = 0
+if avi.http.get_reqvar("ai_meter") == "1" then
+  local _body = avi.http.get_response_body(%d)
+  local function _num_after(key)
+    if not _body then return 0 end
+    local s = string.find(_body, key, 1, true)
+    if not s then return 0 end
+    local i = s + #key
+    while i <= #_body do local c = string.byte(_body, i); if c >= 48 and c <= 57 then break end; i = i + 1 end
+    local j = i
+    while j <= #_body do local c = string.byte(_body, j); if c < 48 or c > 57 then break end; j = j + 1 end
+    if j > i then return tonumber(string.sub(_body, i, j - 1)) or 0 end
+    return 0
+  end
+  prompt_tokens     = _num_after('"prompt_tokens"')
+  completion_tokens = _num_after('"completion_tokens"')
+  total_tokens      = _num_after('"total_tokens"')
+  if total_tokens == 0 then total_tokens = prompt_tokens + completion_tokens end
+  -- Fail-closed: HTTP_RESP flagged this as a metered (2xx JSON POST) response, so
+  -- if its usage didn't parse the body was truncated (larger than the buffer) or
+  -- compressed. Charge a penalty so it can't slip through the budget unmetered.
+  if total_tokens == 0 then
+    total_tokens      = %d
+    prompt_tokens     = %d
+    completion_tokens = %d
+  end
 end`, RespBodyBufferKB, FailClosedTokens, FailClosedTokens, FailClosedTokens)
 }
 
