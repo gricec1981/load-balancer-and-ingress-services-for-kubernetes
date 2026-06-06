@@ -43,7 +43,11 @@ func InformersToRegister(kclient *kubernetes.Clientset) ([]string, error) {
 		utils.EndpointSlicesInformer,
 	}
 
-	if lib.GetServiceType() == lib.NodePortLocal {
+	// The PodInformer is required by NodePortLocal and by the inference extension:
+	// InferencePool members are resolved from a pod label selector, so membership
+	// must be watched and reconciled on pod Add/Update/Delete events on any CNI
+	// (not only NPL). Without it, Avi pool members go stale after pod IP churn.
+	if lib.GetServiceType() == lib.NodePortLocal || lib.IsInferenceExtensionEnabled() {
 		allInformers = append(allInformers, utils.PodInformer)
 	}
 

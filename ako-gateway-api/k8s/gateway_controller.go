@@ -99,7 +99,7 @@ func (c *GatewayController) Start(stopCh <-chan struct{}) {
 	go c.informers.EpSlicesInformer.Informer().Run(stopCh)
 	informersList = append(informersList, c.informers.EpSlicesInformer.Informer().HasSynced)
 
-	if lib.GetServiceType() == lib.NodePortLocal {
+	if lib.GetServiceType() == lib.NodePortLocal || lib.IsInferenceExtensionEnabled() {
 		go c.informers.PodInformer.Informer().Run(stopCh)
 		informersList = append(informersList, c.informers.PodInformer.Informer().HasSynced)
 	}
@@ -363,6 +363,58 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 		}
 		c.informers.PodInformer.Informer().AddEventHandler(podEventHandler)
 	}
+
+	// Inference extension: InferencePool members are resolved from the pool's pod
+	// label selector, so membership must be reconciled on pod Add/Update/Delete on
+	// ANY CNI — not only NodePortLocal (the handler above is NPL-gated). Without
+	// this, the Avi pools keep stale pod IPs after pod churn and the VS goes down.
+	// HandlePodEvent re-enqueues every InferencePool whose cached selector matches
+	// the pod (idempotent — safe even if the NPL handler also fired).
+	if lib.IsInferenceExtensionEnabled() {
+		inferencePodHandler := cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				if c.DisableSync {
+					return
+				}
+				if pod, ok := obj.(*corev1.Pod); ok {
+					if ic := akogatewayapiinference.SharedInferenceController(); ic != nil {
+						ic.HandlePodEvent(pod)
+					}
+				}
+			},
+			UpdateFunc: func(_, cur interface{}) {
+				if c.DisableSync {
+					return
+				}
+				if pod, ok := cur.(*corev1.Pod); ok {
+					if ic := akogatewayapiinference.SharedInferenceController(); ic != nil {
+						ic.HandlePodEvent(pod)
+					}
+				}
+			},
+			DeleteFunc: func(obj interface{}) {
+				if c.DisableSync {
+					return
+				}
+				pod, ok := obj.(*corev1.Pod)
+				if !ok {
+					tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+					if !ok {
+						return
+					}
+					pod, ok = tombstone.Obj.(*corev1.Pod)
+					if !ok {
+						return
+					}
+				}
+				if ic := akogatewayapiinference.SharedInferenceController(); ic != nil {
+					ic.HandlePodEvent(pod)
+				}
+			},
+		}
+		c.informers.PodInformer.Informer().AddEventHandler(inferencePodHandler)
+	}
+
 	svcEventHandler := cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			if c.DisableSync {
