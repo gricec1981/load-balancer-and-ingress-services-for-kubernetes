@@ -169,6 +169,13 @@ func ApplyTokenRateLimitPolicy(key string, policy *AITokenRateLimitPolicy, vsNod
 		addDataScriptNode(key, vsName, tenant, DSRespName(vsName), DSEvtHTTPResp, scripts.RespScript, vsNode)
 		addDataScriptNode(key, vsName, tenant, DSRespDataName(vsName), DSEvtHTTPRespData, scripts.RespDataScript, vsNode)
 	}
+	// Tier-dependent budgets enforce in HTTP_REQ_DATA so they can read the ai_tier
+	// reqvar set by the AIModelRoutePolicy script. ApplyModelRoutePolicy is invoked
+	// before this, so its DataScript carries a lower index and runs first (verified:
+	// reqvars cross DataScriptSets and execution follows index order).
+	if scripts.ReqDataEnforceScript != "" {
+		addDataScriptNode(key, vsName, tenant, DSReqDataEnforceName(vsName), DSEvtHTTPReqData, scripts.ReqDataEnforceScript, vsNode)
+	}
 
 	utils.AviLog.Infof("key: %s, msg: AITokenRateLimitPolicy %s/%s: registered token-accounting DataScripts on VS %s",
 		key, policy.Namespace, policy.Name, vsName)

@@ -52,9 +52,10 @@ const FailClosedTokens = RespBodyBufferKB * 1024 / 4
 // name to generate DataScript set names.  One DataScript set is created per
 // event phase.
 const (
-	DSNameSuffixReq      = "-ai-tok-req"
-	DSNameSuffixResp     = "-ai-tok-resp"
-	DSNameSuffixRespData = "-ai-tok-respdata"
+	DSNameSuffixReq            = "-ai-tok-req"
+	DSNameSuffixResp           = "-ai-tok-resp"
+	DSNameSuffixRespData       = "-ai-tok-respdata"
+	DSNameSuffixReqDataEnforce = "-ai-tok-reqdata"
 )
 
 // TokenAccountingScripts holds the Lua snippets generated from an
@@ -77,6 +78,15 @@ type TokenAccountingScripts struct {
 	// every applicable counter — no dependency on the backend emitting token
 	// headers.
 	RespDataScript string
+
+	// ReqDataEnforceScript is the HTTP_REQ_DATA phase Lua for limits whose budget
+	// ceiling depends on a value that is only known after the request body is read
+	// — specifically a per-tier budget keyed on the `ai_tier` reqvar that an
+	// AIModelRoutePolicy sets in its own HTTP_REQ_DATA script. It is empty unless a
+	// limit's groupHeader names a "reqvar:" source. It must run *after* the
+	// model-route script (lower DataScript index sets ai_tier first — verified that
+	// reqvars cross DataScriptSets and execution follows index order).
+	ReqDataEnforceScript string
 }
 
 // GenerateTokenAccountingScripts produces the two Lua DataScript snippets that
@@ -121,8 +131,29 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy) TokenAccount
 	reqParts = append(reqParts, identityBlock)
 	reqParts = append(reqParts, "local now = os.time()")
 
+	// Limits whose budget depends on the tier (groupHeader "reqvar:ai_tier") are
+	// enforced in HTTP_REQ_DATA instead, because the tier is only set there (by the
+	// model-route script). All other limits enforce in HTTP_REQ as before.
+	var reqDataEnforceParts []string
+	needReqData := false
 	for _, limit := range spec.Limits {
+		if limitUsesReqvar(limit) {
+			needReqData = true
+			continue
+		}
 		reqParts = append(reqParts, buildReqLimitBlock(limit, policy.CounterEpoch))
+	}
+	if needReqData {
+		reqDataEnforceParts = append(reqDataEnforceParts,
+			"-- AKO AI Gateway: tier-dependent token-budget enforcement (HTTP_REQ_DATA, after model routing sets ai_tier)")
+		reqDataEnforceParts = append(reqDataEnforceParts, helper)
+		reqDataEnforceParts = append(reqDataEnforceParts, identityBlock)
+		reqDataEnforceParts = append(reqDataEnforceParts, "local now = os.time()")
+		for _, limit := range spec.Limits {
+			if limitUsesReqvar(limit) {
+				reqDataEnforceParts = append(reqDataEnforceParts, buildReqLimitBlock(limit, policy.CounterEpoch))
+			}
+		}
 	}
 
 	// ── Response-header phase: enable body buffering ──────────────────────
@@ -142,10 +173,31 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy) TokenAccount
 	}
 
 	return TokenAccountingScripts{
-		ReqScript:      strings.Join(reqParts, "\n"),
-		RespScript:     strings.Join(respParts, "\n"),
-		RespDataScript: strings.Join(respDataParts, "\n"),
+		ReqScript:            strings.Join(reqParts, "\n"),
+		RespScript:           strings.Join(respParts, "\n"),
+		RespDataScript:       strings.Join(respDataParts, "\n"),
+		ReqDataEnforceScript: strings.Join(reqDataEnforceParts, "\n"),
 	}
+}
+
+// limitUsesReqvar reports whether a limit's budget ceiling is selected by a value
+// carried in a request-scoped variable (e.g. the `ai_tier` reqvar set by an
+// AIModelRoutePolicy) rather than a JWT claim/header. Such limits must be enforced
+// in HTTP_REQ_DATA, after the reqvar is set.
+func limitUsesReqvar(l TokenLimit) bool {
+	return strings.HasPrefix(l.GroupHeader, "reqvar:")
+}
+
+// groupReadExpr returns the Lua that resolves the per-group budget selector into
+// the local `group_hdr`. A "reqvar:<name>" source reads avi.http.get_reqvar
+// (e.g. the tier set by model routing); anything else is read as an OAuth-verified
+// claim via jwt_claim.
+func groupReadExpr(groupHeader string) string {
+	if strings.HasPrefix(groupHeader, "reqvar:") {
+		name := strings.TrimPrefix(groupHeader, "reqvar:")
+		return fmt.Sprintf("  local group_hdr = avi.http.get_reqvar(%q) or \"\"\n", name)
+	}
+	return fmt.Sprintf("  local _ok_g, _g = pcall(jwt_claim, %q)\n  local group_hdr = (_ok_g and _g) or \"\"\n", groupHeader)
 }
 
 // jwtClaimHelper returns a Lua function `jwt_claim(claim)` that returns a string
@@ -356,9 +408,9 @@ func buildReqLimitBlock(limit TokenLimit, epoch string) string {
 	fmt.Fprintf(&b, "  local cur = tonumber(avi.vs.table_lookup(k) or 0)\n")
 
 	if limit.GroupHeader != "" && len(limit.GroupBudgets) > 0 {
-		// Per-group budget: read the group from the OAuth-validated access token.
-		fmt.Fprintf(&b, "  local _ok_g, _g = pcall(jwt_claim, %q)\n", limit.GroupHeader)
-		fmt.Fprintf(&b, "  local group_hdr = (_ok_g and _g) or \"\"\n")
+		// Per-group budget: read the group selector (an OAuth claim, or a "reqvar:"
+		// source such as the ai_tier set by model routing) into group_hdr.
+		b.WriteString(groupReadExpr(limit.GroupHeader))
 		fmt.Fprintf(&b, "  local group_budgets = {")
 		first := true
 		for g, budget := range limit.GroupBudgets {
@@ -504,6 +556,7 @@ func buildRespLimitBlock(limit TokenLimit, epoch string) string {
 }
 
 // DSNameForVS returns the DataScript set names for a given VS name.
-func DSReqName(vsName string) string      { return vsName + DSNameSuffixReq }
-func DSRespName(vsName string) string     { return vsName + DSNameSuffixResp }
-func DSRespDataName(vsName string) string { return vsName + DSNameSuffixRespData }
+func DSReqName(vsName string) string            { return vsName + DSNameSuffixReq }
+func DSRespName(vsName string) string           { return vsName + DSNameSuffixResp }
+func DSRespDataName(vsName string) string       { return vsName + DSNameSuffixRespData }
+func DSReqDataEnforceName(vsName string) string { return vsName + DSNameSuffixReqDataEnforce }

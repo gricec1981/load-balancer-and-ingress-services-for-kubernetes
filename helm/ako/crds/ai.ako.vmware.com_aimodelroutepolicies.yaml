@@ -1,0 +1,212 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: aimodelroutepolicies.ai.ako.vmware.com
+spec:
+  group: ai.ako.vmware.com
+  names:
+    kind: AIModelRoutePolicy
+    listKind: AIModelRoutePolicyList
+    plural: aimodelroutepolicies
+    singular: aimodelroutepolicy
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    subresources:
+      status: {}
+    schema:
+      openAPIV3Schema:
+        description: |-
+          AIModelRoutePolicy routes inference requests to different backends based on
+          the requested model, organised into quality/cost tiers. The requested model
+          is read from the request body (modelField) by an SE DataScript, mapped to a
+          tier, optionally gated by the caller's verified group claim, and the request
+          is routed to that tier's backend Pool Group via avi.poolgroup.select().
+
+          Tier access can reuse the verified group claim produced by AIGatewayAuthPolicy
+          on the same route. A caller requesting a tier they are not entitled to is
+          either downgraded to their best allowed tier or rejected (onUnentitled).
+        type: object
+        required:
+        - spec
+        properties:
+          apiVersion:
+            type: string
+          kind:
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: Spec defines the desired model-routing configuration.
+            type: object
+            required:
+            - targetRef
+            - tiers
+            - modelTiers
+            - defaultTier
+            properties:
+              targetRef:
+                description: |-
+                  targetRef identifies the HTTPRoute (or Gateway) this policy applies to.
+                type: object
+                required:
+                - group
+                - kind
+                - name
+                properties:
+                  group:
+                    type: string
+                  kind:
+                    type: string
+                    enum:
+                    - HTTPRoute
+                    - Gateway
+                  name:
+                    type: string
+              modelField:
+                description: |-
+                  modelField is the JSON body key the DataScript reads to determine the
+                  requested model. OpenAI-compatible APIs use "model".
+                type: string
+                default: model
+              tiers:
+                description: |-
+                  tiers lists the routing destinations, ordered most-preferred first.
+                  Each tier maps to one backend (an InferencePool to retain per-pod
+                  metric-weighted load balancing, or a Service). AKO builds one Avi Pool
+                  Group per tier and the DataScript selects it directly.
+                type: array
+                minItems: 1
+                items:
+                  type: object
+                  required:
+                  - name
+                  - backendRef
+                  properties:
+                    name:
+                      description: |-
+                        Unique tier identifier. Becomes the ai_tier reqvar value and part
+                        of the generated Pool Group name.
+                      type: string
+                    backendRef:
+                      description: |-
+                        backendRef is the backend that serves this tier. Typically an
+                        InferencePool (group gateway.inference.x-k8s.io); a core Service
+                        is also supported.
+                      type: object
+                      required:
+                      - kind
+                      - name
+                      properties:
+                        group:
+                          type: string
+                          default: ""
+                        kind:
+                          type: string
+                          enum:
+                          - InferencePool
+                          - Service
+                        name:
+                          type: string
+              modelTiers:
+                description: |-
+                  modelTiers maps a requested model name to a tier name. Keys may be an
+                  exact model name or a single trailing "*" prefix glob (e.g. "mistral-7b*").
+                  The longest matching prefix wins. A model not matched here uses defaultTier.
+                  Example: {"llama-3-70b-instruct": "premium", "mistral-7b*": "standard"}
+                type: object
+                additionalProperties:
+                  type: string
+              defaultTier:
+                description: |-
+                  defaultTier is the tier used for any requested model not matched by
+                  modelTiers. Must be the name of one of the tiers above.
+                type: string
+              entitlements:
+                description: |-
+                  entitlements restricts which auth groups may reach which tiers. Requires
+                  an AIGatewayAuthPolicy on the same route so the group claim is verified
+                  and readable by the DataScript. When omitted, routing is by model only.
+                type: object
+                properties:
+                  groupClaim:
+                    description: |-
+                      groupClaim names the verified JWT claim (or forwarded header) that
+                      carries the caller's group.
+                    type: string
+                    default: group
+                  rules:
+                    description: |-
+                      rules lists, per group, the tiers that group is allowed to reach.
+                      A group not listed is treated as entitled to no tier (subject to
+                      onUnentitled).
+                    type: array
+                    items:
+                      type: object
+                      required:
+                      - group
+                      - allow
+                      properties:
+                        group:
+                          description: The group claim value this rule applies to.
+                          type: string
+                        allow:
+                          description: Tier names this group may be routed to.
+                          type: array
+                          items:
+                            type: string
+              onUnentitled:
+                description: |-
+                  onUnentitled controls behaviour when a caller requests (or defaults to)
+                  a tier they are not entitled to, or when the requested model is unknown
+                  and the default tier is not allowed.
+                type: object
+                properties:
+                  type:
+                    description: |-
+                      "Downgrade" routes the request to the highest tier the caller IS
+                      entitled to (rejecting only if none). "Reject" returns statusCode.
+                    type: string
+                    default: Downgrade
+                    enum:
+                    - Downgrade
+                    - Reject
+                  statusCode:
+                    description: HTTP status returned when type is Reject (or downgrade finds no allowed tier).
+                    type: integer
+                    default: 403
+                    minimum: 400
+                    maximum: 599
+          status:
+            description: Status reflects the observed state of the policy.
+            type: object
+            properties:
+              conditions:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    type:
+                      type: string
+                    status:
+                      type: string
+                    reason:
+                      type: string
+                    message:
+                      type: string
+                    lastTransitionTime:
+                      type: string
+                      format: date-time
+    additionalPrinterColumns:
+    - name: Target
+      type: string
+      jsonPath: .spec.targetRef.name
+    - name: DefaultTier
+      type: string
+      jsonPath: .spec.defaultTier
+    - name: Age
+      type: date
+      jsonPath: .metadata.creationTimestamp
