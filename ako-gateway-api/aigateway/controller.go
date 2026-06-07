@@ -16,6 +16,7 @@ package aigateway
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"sync"
 
@@ -65,8 +66,8 @@ type PolicyStore struct {
 }
 
 var (
-	globalPolicyStore     *PolicyStore
-	policyStoreOnce       sync.Once
+	globalPolicyStore *PolicyStore
+	policyStoreOnce   sync.Once
 )
 
 // SharedPolicyStore returns the process-wide singleton PolicyStore.
@@ -309,7 +310,46 @@ func parseTokenRateLimitPolicy(client dynamic.Interface, ns, name string) (*AITo
 	if err != nil {
 		return nil, fmt.Errorf("get AITokenRateLimitPolicy %s/%s: %w", ns, name, err)
 	}
-	return unstructuredToTokenRateLimitPolicy(obj)
+	p, err := unstructuredToTokenRateLimitPolicy(obj)
+	if err != nil {
+		return nil, err
+	}
+	// Resolve the admin-token Secret (for the read-only counters endpoint) if the
+	// annotation is present. Read via the dynamic client (not an informer cache)
+	// so a freshly-created Secret is picked up on the next policy reconcile.
+	if secretName := obj.GetAnnotations()[AdminTokenSecretAnnotation]; secretName != "" {
+		p.AdminToken = resolveAdminToken(client, ns, secretName)
+	}
+	return p, nil
+}
+
+// resolveAdminToken fetches the "token" key from the named Secret in ns and
+// returns its decoded value, or "" (with a warning) if it cannot be read. An
+// empty result simply suppresses the counters endpoint — it never fails the
+// policy reconcile.
+func resolveAdminToken(client dynamic.Interface, ns, secretName string) string {
+	secretGVR := schema.GroupVersionResource{Version: "v1", Resource: "secrets"}
+	sec, err := client.Resource(secretGVR).Namespace(ns).Get(context.TODO(), secretName, metav1.GetOptions{})
+	if err != nil {
+		utils.AviLog.Warnf("AITokenRateLimitPolicy: admin-token secret %s/%s not readable: %v", ns, secretName, err)
+		return ""
+	}
+	data, found, _ := unstructured.NestedMap(sec.Object, "data")
+	if !found {
+		utils.AviLog.Warnf("AITokenRateLimitPolicy: admin-token secret %s/%s has no data", ns, secretName)
+		return ""
+	}
+	enc, ok := data["token"].(string)
+	if !ok || enc == "" {
+		utils.AviLog.Warnf("AITokenRateLimitPolicy: admin-token secret %s/%s missing key %q", ns, secretName, "token")
+		return ""
+	}
+	dec, err := base64.StdEncoding.DecodeString(enc)
+	if err != nil {
+		utils.AviLog.Warnf("AITokenRateLimitPolicy: admin-token secret %s/%s value not base64: %v", ns, secretName, err)
+		return ""
+	}
+	return string(dec)
 }
 
 // unstructuredToAuthPolicy converts an unstructured object to AIGatewayAuthPolicy.

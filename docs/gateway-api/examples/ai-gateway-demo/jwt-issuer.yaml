@@ -15,6 +15,7 @@
 #   GET  /authorize?...                     -> issues an auth code, 302 back to redirect_uri
 #   POST /token                             -> authorization_code -> {access_token,id_token}
 #   GET  /token?sub=&group=                 -> legacy direct token (handy for claim tests)
+#   GET  /users                             -> demo identity->group map (consumed by the AI Gateway UI)
 #
 # Which user /authorize logs in is selected by the "demo_user" cookie (default
 # alice) so the flow can be driven non-interactively with curl:
@@ -137,6 +138,8 @@ data:
                                             "sub": sub, "group": group}).encode())
             elif path == "/userinfo":
                 self._send(200, json.dumps({"sub": "unknown"}).encode())
+            elif path == "/users":  # demo identity -> group map (consumed by the AI Gateway UI)
+                self._send(200, json.dumps(USERS).encode())
             elif path == "/health":
                 self._send(200, b"ok", "text/plain")
             else:

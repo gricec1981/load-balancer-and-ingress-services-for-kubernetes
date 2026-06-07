@@ -106,6 +106,15 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy) TokenAccount
 	// jwt_claim helper is shared by both phases (identity + group extraction).
 	helper := jwtClaimHelper()
 
+	// ── Read-only counters endpoint (dashboard UI) ────────────────────────
+	// Prepended *before* enforcement so it intercepts GET /v1/admin/counters and
+	// returns the live per-user token usage as JSON, then returns. Only emitted
+	// when an admin token is configured (AdminTokenSecretAnnotation); the SE table
+	// cannot be enumerated, so the caller passes the users it wants in ?users=.
+	if policy.AdminToken != "" && len(spec.Limits) > 0 {
+		reqParts = append(reqParts, buildCountersEndpointBlock(spec.Limits[0], policy.CounterEpoch, policy.AdminToken))
+	}
+
 	// ── Request-phase: enforce limits ─────────────────────────────────────
 	reqParts = append(reqParts, "-- AKO AI Gateway: token-budget enforcement")
 	reqParts = append(reqParts, helper)
@@ -224,6 +233,62 @@ func counterKeyExpr(limit TokenLimit, epoch string) string {
 	}
 	return fmt.Sprintf(`%q..":"..%s..":"..math.floor(now/%d)*%d`,
 		prefix, keyExpr, windowSec, windowSec)
+}
+
+// buildCountersEndpointBlock returns the Lua for a read-only admin endpoint that
+// the dashboard UI polls to render per-user token usage. It runs in HTTP_REQ
+// before enforcement: on GET /v1/admin/counters it checks the X-Admin-Token
+// header (auth is SKIP_AUTHENTICATION'd for this path in the SSO policy, so the
+// DataScript is the gate), then for each user passed in ?users=a,b,c it rebuilds
+// the *same* counter key the response-phase accounting writes and returns the
+// running total. The SE string table has no enumeration API, which is why the
+// caller must supply the identities it cares about.
+//
+// Key parsing avoids Lua patterns (string.match/gmatch are restricted in the SE
+// sandbox); it uses plain string.find/string.sub only.
+func buildCountersEndpointBlock(limit TokenLimit, epoch, adminToken string) string {
+	windowSec := windowSeconds(limit.Window)
+	prefix := limit.Name
+	if epoch != "" {
+		prefix = epoch + ":" + limit.Name
+	}
+	return fmt.Sprintf(`-- AKO AI Gateway: read-only token-counters endpoint (dashboard UI)
+do
+  if avi.http.get_path() == "/v1/admin/counters" then
+    if avi.http.get_header("X-Admin-Token", avi.HTTP_REQUEST) ~= %q then
+      avi.http.response(403, {["Content-Type"]="application/json"}, '{"error":"forbidden"}')
+      return
+    end
+    local q = avi.http.get_query() or ""
+    local users = ""
+    do
+      local s = string.find(q, "users=", 1, true)
+      if s then
+        local rest = string.sub(q, s + 6)
+        local amp = string.find(rest, "&", 1, true)
+        users = amp and string.sub(rest, 1, amp - 1) or rest
+      end
+    end
+    local wb = math.floor(os.time() / %d) * %d
+    local parts = {}
+    if users ~= "" then
+      local start = 1
+      while true do
+        local c = string.find(users, ",", start, true)
+        local u = c and string.sub(users, start, c - 1) or string.sub(users, start)
+        if u ~= "" then
+          local used = tonumber(avi.vs.table_lookup(%q..":"..u..":"..wb) or 0) or 0
+          parts[#parts + 1] = '{"user":"'..u..'","used":'..used..'}'
+        end
+        if not c then break end
+        start = c + 1
+      end
+    end
+    avi.http.response(200, {["Content-Type"]="application/json"},
+      '{"window":'..wb..',"limit":%q,"counters":['..table.concat(parts, ",")..']}')
+    return
+  end
+end`, adminToken, windowSec, windowSec, prefix, limit.Name)
 }
 
 // counterKeyIdentityExpr returns the Lua expression that evaluates to the key

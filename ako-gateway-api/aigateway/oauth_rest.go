@@ -255,6 +255,25 @@ func EnsureOAuthSSOPolicy(key string, policy *AIGatewayAuthPolicy) (string, erro
 		Name:      proto.String(name),
 		TenantRef: proto.String("/api/tenant/?name=" + lib.GetEscapedValue(tenant)),
 		Type:      proto.String("SSO_TYPE_OAUTH"),
+		// Exempt the read-only dashboard counters endpoint from the OAuth
+		// authorization-code flow. Without this, GET /v1/admin/counters would be
+		// 302'd into the login redirect and never reach the DataScript that gates
+		// it on X-Admin-Token. The path lives under the route's /v1 prefix so the
+		// EVH parent still content-switches it to this child VS.
+		AuthenticationPolicy: &avimodels.AuthenticationPolicy{
+			AuthnRules: []*avimodels.AuthenticationRule{{
+				Name:   proto.String("ai-admin-skip"),
+				Index:  proto.Int32(1),
+				Enable: proto.Bool(true),
+				Action: &avimodels.AuthenticationAction{Type: proto.String("SKIP_AUTHENTICATION")},
+				Match: &avimodels.AuthenticationMatch{
+					Path: &avimodels.PathMatch{
+						MatchCriteria: proto.String("BEGINS_WITH"),
+						MatchStr:      []string{"/v1/admin/"},
+					},
+				},
+			}},
+		},
 	}
 
 	var check struct {

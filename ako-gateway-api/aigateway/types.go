@@ -113,11 +113,23 @@ type AITokenRateLimitPolicy struct {
 	// effectively resetting the running token counters without touching the
 	// budgets or any other config. Empty means no prefix (back-compatible).
 	CounterEpoch string `json:"-"`
+
+	// AdminToken is the resolved value of the Secret named by
+	// AdminTokenSecretAnnotation (key "token"). When non-empty, AKO emits a
+	// read-only GET /v1/admin/counters endpoint in the request DataScript that the
+	// dashboard UI polls for per-user token usage, gated by this token in the
+	// X-Admin-Token header. Empty means the endpoint is not generated.
+	AdminToken string `json:"-"`
 }
 
 // CounterEpochAnnotation, when set on an AITokenRateLimitPolicy, prefixes the SE
 // token-counter keys. Bumping it clears all of that policy's running counters.
 const CounterEpochAnnotation = "ai.ako.vmware.com/counter-epoch"
+
+// AdminTokenSecretAnnotation names a Secret (in the policy's namespace, key
+// "token") whose value gates the read-only GET /v1/admin/counters endpoint used
+// by the dashboard UI. Absent annotation = no counters endpoint is generated.
+const AdminTokenSecretAnnotation = "ai.ako.vmware.com/admin-token-secret"
 
 // AITokenRateLimitPolicySpec is the desired state of an AITokenRateLimitPolicy.
 type AITokenRateLimitPolicySpec struct {
