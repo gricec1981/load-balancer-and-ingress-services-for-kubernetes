@@ -1,11 +1,19 @@
 # AKO AI Gateway — Model-Based (Quality/Cost Tier) Routing
 
-> **Status: Design draft (Phase 2.x).** This document specifies a new
-> `AIModelRoutePolicy` CRD that routes inference requests to different backends
-> based on the requested **model**, organised into **quality/cost tiers**. It has
-> not been implemented yet. It builds on the [AI Gateway](ai-gateway.md) and
+> **Status: Implemented (Phase 2.x) — verified end-to-end on a live cluster
+> (Avi 31.2.2).** The `AIModelRoutePolicy` CRD routes inference requests to
+> different backends based on the requested **model**, organised into
+> **quality/cost tiers**. It builds on the [AI Gateway](ai-gateway.md) and
 > [Inference Extension](inference-extension.md) and reuses their existing
-> machinery (DataScript body parsing, OAuth claim access, per-rule Pool Groups).
+> machinery (request-body DataScript parsing, OAuth claim access, scraper-weighted
+> InferencePool Pool Groups).
+>
+> The control-plane path (CR → AKO → per-tier Avi Pool Groups + model-route
+> DataScripts) is verified live; the data-plane primitive
+> (`avi.http.get_req_body` + `avi.poolgroup.select` keyed on the body `model`) was
+> confirmed by spike on the same build. Current limitations: tier backends must be
+> **InferencePools** (Service backends are not built yet) and the request-body
+> buffer is **32 KB** — see [Limitations](#limitations).
 
 ---
 
@@ -109,24 +117,23 @@ so that logic must be made callable from the policy path — see
 │  AKO (ako-gateway-api)                                       │
 │   BuildChildVS → ApplyModelRoutePolicy                       │
 │    • one Pool Group per tier  (from each tier's backendRef)  │
-│    • one content-switch rule per tier (match X-AI-Tier)      │
-│    • one HTTP_REQ DataScript (parse model → set X-AI-Tier)   │
+│    • DataScriptSet pool_group_refs = the tier Pool Groups    │
+│    • HTTP_REQ DataScript     (enable request-body buffering) │
+│    • HTTP_REQ_DATA DataScript(parse model → poolgroup.select)│
 └───────────────────────────┬─────────────────────────────────┘
                             │ Avi REST API
                             ▼
 ┌──────────────────────────────────────────────────────────────┐
 │  Avi Virtual Service (HTTPS)                                  │
-│   HTTP_REQ DataScript:                                        │
-│     1. parse "model" from buffered request body              │
-│     2. tier = modelTierMap[model]   (else defaultTier)       │
-│     3. group = avi.http.oauth_get_claim(0,"group")          │
-│     4. if group not entitled to tier → downgrade or reject   │
-│     5. avi.http.add_header("X-AI-Tier", tier)               │
-│                                                              │
-│   Content-switch rules (native):                             │
-│     X-AI-Tier == premium  → PoolGroup premium-pg            │
-│     X-AI-Tier == standard → PoolGroup standard-pg          │
-│     X-AI-Tier == economy  → PoolGroup economy-pg           │
+│   HTTP_REQ:      avi.http.set_request_body_buffer_size(32768) │
+│   HTTP_REQ_DATA:                                             │
+│     1. body  = avi.http.get_req_body(32768)                 │
+│     2. model = json_str(body, "model")                      │
+│     3. tier  = MODEL_TIERS[model]   (else prefix / default) │
+│     4. group = avi.http.oauth_get_claim(0,"group")          │
+│     5. if group not entitled to tier → downgrade or reject   │
+│     6. avi.poolgroup.select(TIER_PG[tier])                  │
+│     7. avi.http.set_reqvar("ai_tier", tier)                 │
 └───────┬───────────────┬───────────────┬─────────────────────┘
         ▼               ▼               ▼
   InferencePool   InferencePool   InferencePool
@@ -138,7 +145,8 @@ so that logic must be made callable from the policy path — see
 **Control flow**
 
 1. User creates an `AIModelRoutePolicy` targeting an `HTTPRoute`. Each tier names
-   a `backendRef` (an `InferencePool`, or a plain `Service`).
+   a `backendRef` — currently an **`InferencePool`** (Service backends are
+   accepted by the schema but not yet built; see [Limitations](#limitations)).
 2. AKO's informer parses the CR, caches it, and re-enqueues the targeted route.
 3. During `BuildChildVS`, `ApplyModelRoutePolicy` builds **one Pool Group per
    tier** (reusing the existing InferencePool→Pool Group translation, so each
@@ -153,16 +161,26 @@ so that logic must be made callable from the policy path — see
 ## Prerequisites
 
 - Everything in the [AI Gateway prerequisites](ai-gateway.md#prerequisites)
-  (`featureGates.GatewayAPI: true`, `aiGateway.enabled: true`, an AKO image from
-  this branch).
+  (`featureGates.GatewayAPI: true`, `aiGateway.enabled: true`).
+- The **inference extension enabled** (`inferenceExtension.enabled: true`) — tier
+  backends are `InferencePool`s, so the scraper must be running.
+- **Install the CRD**:
+  ```bash
+  kubectl apply -f helm/ako/crds/ai.ako.vmware.com_aimodelroutepolicies.yaml
+  ```
+- **RBAC**: the `ako` ClusterRole must allow `aimodelroutepolicies` (+ `/status`).
+  The Helm chart grants this automatically when `aiGateway.enabled: true`; if you
+  are running an AKO whose ClusterRole predates this feature, the informer logs
+  `aimodelroutepolicies ... is forbidden` until you add the grant.
+- One **`InferencePool` per tier** deployed (each selecting that tier's pods) and
+  named in the policy's `tiers[].backendRef`.
 - For **group-based entitlement**: an `AIGatewayAuthPolicy` on the same route, so
   the SE-verified `group` claim is available via `avi.http.oauth_get_claim()`.
-  Without it, entitlement falls back to an identity header or is skipped (route
-  by model only).
-- Each tier's backend deployed and referenced as a `backendRef` (an
-  `InferencePool` to get metric-weighted load balancing per tier, or a `Service`).
-- **Request-body buffering must be available on the Avi build** — see
-  [Feasibility / validation items](#feasibility--validation-items).
+  Without it, entitlement is skipped (route by model only).
+
+> **Note on the InferencePool API group.** AKO selects tier backends by `kind:
+> InferencePool` (the `group` field is informational). Use whichever group your
+> installed InferencePool CRD serves — e.g. `inference.networking.x-k8s.io`.
 
 ---
 
@@ -519,13 +537,32 @@ groups, since torn down. Results:
 
 ---
 
+## Limitations
+
+- **InferencePool tier backends only.** The schema accepts a `Service` backend,
+  but `ApplyModelRoutePolicy` currently builds Pool Groups only for
+  `kind: InferencePool` tiers (others are logged and skipped). Service-tier
+  support is a follow-up.
+- **32 KB request-body buffer.** `avi.http.set_request_body_buffer_size` caps at
+  32768 on this Avi build. `model` sits at the JSON start so the buffered head is
+  enough; behaviour for a request body larger than 32 KB (does `get_req_body`
+  return the head, or fail closed?) is not yet validated.
+- **Per-tier budget enforcement runs in `HTTP_REQ_DATA`.** The classic
+  `HTTP_REQ`-phase token check cannot see `ai_tier` (set later), so tier-keyed
+  limits use `groupHeader: "reqvar:ai_tier"` and enforce in the body phase. See
+  [Composition](#composition-with-auth-and-token-budgets).
+- **Eventually-consistent counters / soft RPS** — inherited from the token policy.
+
+---
+
 ## Roadmap
 
 | Phase | Feature | Status |
 |---|---|---|
-| 2.x | `AIModelRoutePolicy` — model→tier routing via request-body DataScript + `avi.poolgroup.select` | Design (this doc); Avi mechanism spike-verified |
-| 2.x | Group-based tier entitlement (reuse verified `group` claim) | Design |
-| 2.x | Per-tier token budgets (key token counters on the `ai_tier` reqvar) | Design |
+| 2.x | `AIModelRoutePolicy` — model→tier routing via request-body DataScript + `avi.poolgroup.select` | ✅ Done — verified end-to-end on a live cluster |
+| 2.x | Group-based tier entitlement (reuse verified `group` claim) | ✅ Done |
+| 2.x | Per-tier token budgets (`groupHeader: "reqvar:ai_tier"`, enforced in `HTTP_REQ_DATA`) | ✅ Done |
+| 2.x | Service (non-InferencePool) tier backends | Planned |
 | 3 | Budget-aware downgrade (over-budget premium → economy instead of 429) | Idea |
 | 3 | LoRA-adapter-aware routing (route to pods with a matching adapter) | Idea |
 | 3 | Weighted canary within a tier (split a model name across two versions) | Idea |

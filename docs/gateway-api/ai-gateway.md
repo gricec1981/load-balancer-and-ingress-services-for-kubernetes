@@ -469,8 +469,8 @@ AKO applies both policies during the same `BuildChildVS` reconcile cycle.
 | `spec.limits[].tokens` | string | no | `total` (default), `prompt`, or `completion` |
 | `spec.limits[].budget` | int64 | yes | Max token count in the window. With `groupBudgets`, `0` rejects unknown groups; `>0` is the fallback ceiling |
 | `spec.limits[].window` | string | yes | Time window: `30s`, `1m`, `1h`, `24h`, etc. |
-| `spec.limits[].groupHeader` | string | no | JWT claim / header whose value selects a per-group budget |
-| `spec.limits[].groupBudgets` | map[string]int64 | no | Group value → budget (e.g. `{group1: 500, group2: 1000}`). Requires `groupHeader` |
+| `spec.limits[].groupHeader` | string | no | Selector whose value picks a per-group budget. A verified JWT claim name (e.g. `group`), or `reqvar:<name>` to read a request-scoped variable — e.g. `reqvar:ai_tier` for **per-tier budgets** set by an [`AIModelRoutePolicy`](model-routing.md). A `reqvar:` limit is enforced in `HTTP_REQ_DATA` (after the variable is set), not `HTTP_REQ`. |
+| `spec.limits[].groupBudgets` | map[string]int64 | no | Group/tier value → budget (e.g. `{group1: 500, group2: 1000}` or `{premium: 500, economy: 100000}`). Requires `groupHeader` |
 | `spec.limits[].action.type` | string | no | `Reject` (default) or `Log` |
 | `spec.limits[].action.statusCode` | int | no | HTTP status on rejection. Default: `429` |
 | `spec.limits[].action.retryAfter` | bool | no | Add `Retry-After` header on rejection |
@@ -536,6 +536,7 @@ Install the CRDs and restart the `ako-gateway-api` pod.
 | 1.5 | Per-group token budgets (`groupHeader` / `groupBudgets`) | ✅ Done |
 | 2 | `AIGatewayAuthPolicy` — OAuth/OIDC auth, AKO-managed `Pool` + `AuthProfile` + `SSOPolicy` lifecycle | ✅ Done |
 | 2 | Verified claims in the DataScript via `oauth_get_claim` | ✅ Done |
+| 2.x | [`AIModelRoutePolicy`](model-routing.md) — route by request-body `model` to per-tier `InferencePool` backends (`avi.poolgroup.select`), group entitlement, per-tier token budgets | ✅ Done |
 | 2.5 | Native distributed rate limiter (`avi.vs.rate_limiter()`) for exact cross-SE limits | Planned |
 | 2.5 | `AIObservabilityPolicy` — per-request token usage logging | Planned |
 | 3 | `AIMCPPolicy` — route and govern MCP tool server endpoints from a registry using the same `targetRef` attachment model | Planned |
@@ -648,5 +649,6 @@ a *unified* per-consumer spend limit that spans both token consumption (LLM) and
 
 - [AI Gateway Install Guide](ai-gateway-install.md) — end-to-end demo walkthrough
 - [AI Gateway Release Notes](ai-gateway-release-notes.md) — features, fixes, and known limitations
+- [Model-Based Routing](model-routing.md) — `AIModelRoutePolicy`: route by the request `model` to per-tier (quality/cost) `InferencePool` backends, with per-tier token budgets
 - [Inference Extension](inference-extension.md) — LLM-aware load balancing via `InferencePool`
 - [Inference Install Guide](inference-install.md) — end-to-end cluster setup walkthrough

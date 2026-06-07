@@ -233,7 +233,7 @@ Other LLM servers (e.g. TGI, Ollama) work if they expose metrics with the same n
 - **No LoRA / adapter awareness:** The current implementation does not route based on which LoRA adapters are loaded on a given pod. This is a Phase 2 consideration.
 - **No prefix-cache awareness:** Unlike the EPP's scheduling layer, AKO cannot route requests to pods that have a matching KV-cache prefix. Aggregate load is used instead.
 - **Direct pod IP scraping:** AKO scrapes pod IPs directly. Ensure NetworkPolicies allow traffic from the AKO pod to LLM pods on the `targetPort`.
-- **InferenceObjective not yet supported:** The `InferenceObjective` CRD (model-name based traffic split) is a Phase 2 item.
+- **Model-name routing is a separate policy:** This extension load-balances *within* one model fleet. To route to **different** backends by the requested model (quality/cost tiers), use the [`AIModelRoutePolicy`](model-routing.md) — it inspects the request-body `model` and selects a per-tier `InferencePool` Pool Group, so each tier still gets this extension's scraper-weighted balancing. (Upstream `InferenceObjective` is not consumed directly.)
 - **IPv4 only:** The current implementation constructs pool servers as `V4` address type. IPv6 support is not yet implemented.
 - **`maxNumSeqs` is pool-wide:** All pods in the pool share one `maxNumSeqs` value. If pods have different model configurations, set the annotation to the lowest common denominator.
 

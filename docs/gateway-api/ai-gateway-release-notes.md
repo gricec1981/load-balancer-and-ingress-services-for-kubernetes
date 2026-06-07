@@ -1,5 +1,63 @@
 # AKO AI Gateway — Release Notes
 
+## Model-Based (Quality/Cost Tier) Routing — 2026-06-07
+
+Adds **`AIModelRoutePolicy`** — route inference requests to different backends
+based on the requested **model**, organised into quality/cost **tiers**. Like the
+other AI Gateway policies it attaches to an `HTTPRoute` via `targetRef` and runs
+**entirely on the Avi Service Engine** (no proxy/sidecar). Verified end-to-end on
+a live cluster (Avi 31.2.2). Full doc: `docs/gateway-api/model-routing.md`.
+
+### New features
+
+**Route by request `model` → per-tier `InferencePool`**
+The SE reads the OpenAI-style `model` from the request body and selects that tier's
+Avi Pool Group directly:
+- `HTTP_REQ` enables request-body buffering (`set_request_body_buffer_size`, 32 KB);
+  `HTTP_REQ_DATA` reads it (`get_req_body`), extracts `model`, resolves the tier
+  (exact name or trailing-`*` prefix glob, else `defaultTier`), and calls
+  `avi.poolgroup.select(<tier Pool Group>)`.
+- Each tier's `InferencePool` keeps its [Inference Extension](inference-extension.md)
+  scraper-weighted pod members — model routing chooses the *tier*, the scraper
+  chooses the *pod*.
+- Backends are declared **in the policy** (`tiers[].backendRef`), so a missing/
+  unreconciled policy degrades to the route's own backend (no tiering, no outage).
+
+**Group-based tier entitlement**
+Reuse the verified `group` claim from [`AIGatewayAuthPolicy`](ai-gateway.md): a
+caller who requests a tier above their entitlement is **downgraded** to their best
+allowed tier (or rejected, per `onUnentitled`).
+
+**Per-tier token budgets**
+`AITokenRateLimitPolicy` limits can set their budget ceiling by tier via
+`groupHeader: "reqvar:ai_tier"` + `groupBudgets` (e.g. `{premium: 500,
+economy: 100000}`). The model-route script sets the `ai_tier` reqvar; because the
+tier is known only after the body is read, such limits enforce in `HTTP_REQ_DATA`
+(classic limits are unchanged).
+
+### Fixes
+
+- **ClusterRole RBAC** — the AKO `ako` ClusterRole now grants
+  `aimodelroutepolicies` (+ `/status`); without it the informer was forbidden from
+  listing the CRD.
+
+### Known limitations
+
+- **InferencePool tier backends only** — `Service` backends are accepted by the
+  schema but not yet built (logged and skipped).
+- **32 KB request-body buffer** — `model` is at the JSON start so the head
+  suffices; bodies larger than 32 KB are not yet validated.
+- Inherits the token policy's **eventually-consistent** counters and **soft RPS**.
+
+### Upgrade notes
+
+- Install the CRD: `kubectl apply -f helm/ako/crds/ai.ako.vmware.com_aimodelroutepolicies.yaml`.
+- Requires `inferenceExtension.enabled: true` (tier backends are InferencePools).
+- Additive and **gated** — existing routes are unaffected until an
+  `AIModelRoutePolicy` targets them.
+
+---
+
 ## Token Counters, Dashboard Reset & UI Integration — 2026-06-07
 
 This release adds a read-only usage API and a one-click reset to the AKO AI Gateway,
