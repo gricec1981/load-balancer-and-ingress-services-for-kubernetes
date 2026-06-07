@@ -448,6 +448,47 @@ Because every write is "the §8 CRDs, plus a backend Service," Option A adds **n
 integration surface to AKO** and **no new CRD** — it is entirely a console feature against
 the existing objects.
 
+### 9.6 Approved registry & governance — the enforced allow-list
+
+The private subregistry is not merely a catalog; it is the **approved allow-list** the MCP
+Gateway enforces. This is the product's **north-star governance object** — the single,
+auditable place that decides which agent tools exist in the fleet. "Approved registry" does
+three distinct jobs:
+
+| Job | What it means | Where it lives |
+|---|---|---|
+| **Catalog** | vetted, discoverable MCP servers | the subregistry (§9.1) |
+| **Approval** | how a server earns its place | curation = approval (MVP) → request/review workflow (future) |
+| **Allow-list enforcement** | the gateway routes **only** to approved servers; unapproved are unreachable through it | the onboarding control plane (§9.5) — structural in Option A, reconciled in Option B |
+
+**Approval model — phased.**
+
+- *MVP — curation **is** approval.* A server is approved iff it is present in the private
+  subregistry; importing a vetted entry from upstream is the approval act. The subregistry's
+  contents are the allow-list — no separate workflow, no new state.
+- *Future — explicit workflow.* Entries carry `Requested → UnderReview → Approved/Rejected`
+  with approver roles and an **audit trail** (who approved what, when), enabling CVE-driven
+  **revocation** as a first-class action. This is the enterprise-governance differentiator;
+  it rides on Option B's controller.
+
+**Enforcement — default-deny, honestly scoped.** Because the console (A) / controller (B)
+generates an MCP Gateway route **only** for an approved entry, an unapproved server has **no
+path through the gateway** — default-deny is *structural*, not a rule to maintain. Two honest
+boundaries:
+
+- The gateway can only deny traffic **it sees**. True egress lockdown — an agent must not be
+  able to reach an MCP server *except* through the gateway — requires forcing all MCP egress
+  through the MCP Gateway with Kubernetes **NetworkPolicy** and/or **NSX/vDefend DFW**. The
+  registry is the allow-list; the security fabric makes it inescapable. This is the concrete
+  vDefend tie-in the strategy memo
+  ([ai-gateway-multicluster-strategy.md](ai-gateway-multicluster-strategy.md) §4.2) is
+  reaching for — a per-cluster proxy with a hand-edited list cannot claim it the same way.
+- **Revocation.** An approved server later withdrawn (deprecated / CVE) is removed from the
+  registry → its route is torn down → in-flight calls fail closed. In Option A this leans on
+  the drift/withdrawal report (§9.4 annotations); in Option B the controller reconciles it
+  automatically — so **revocation latency is a function of which option ships**, and is a
+  reason the governed product ultimately wants B.
+
 ---
 
 ## 10. Feasibility — spikes to run on Avi 32.1.1 ⚠️
@@ -522,7 +563,9 @@ Mirrors how `AIModelRoutePolicy` was wired (commits `c05fc5bc` → `a2e7b995` �
 | 3 | Per-tool call budgets via `AITokenRateLimitPolicy` on the MCP route | Design (reuse) |
 | 3.x | UI "MCP Gateways" section (external repo) | Spec (§8) |
 | 3.x | Registry-driven catalog onboarding — **Option A** (console browses a private subregistry, writes the §8 CRDs + provenance annotations) | Spec (§9) |
+| 3.x | **Approved-registry allow-list** — default-deny: the gateway routes only to approved servers (structural) | Spec (§9.6) |
 | 4 | `MCPServer` CRD — **Option B** (AKO reconciles catalog entries; version/withdrawal/tool-drift tracking; adopts Option A's annotated routes) | Idea (§9 intro) |
+| 4 | Approval **workflow** (Requested→Approved, audit trail) + **CVE-driven revocation**; egress lockdown via NetworkPolicy / NSX-vDefend DFW | Idea (§9.6) |
 | 4 | Cross-site MCP delivery (compose with [ai-gateway-multisite.md](ai-gateway-multisite.md) GSLB) | Idea |
 
 ---
