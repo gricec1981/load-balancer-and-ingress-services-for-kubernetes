@@ -233,7 +233,8 @@ Two safeguards keep the body-parse path honest:
 - **Gated to POST + JSON.** `HTTP_RESP` only enables buffering when the request was a `POST` and
   the response `Content-Type` is `application/json`. So `GET /metrics` scrapes, health checks,
   and streaming `text/event-stream` responses are never buffered or scanned — no wasted SE work
-  and no accidental parsing of non-completion bodies.
+  and no accidental parsing of non-completion bodies. **Caveat:** this also means streamed
+  responses are *not metered* — see the streaming limitation below.
 - **Fail-closed on unreadable usage.** If a buffered JSON completion (it has the
   `"object":"chat.completion"` / `"choices"` markers, which survive a tail truncation) yields no
   parseable `usage` — because the body was larger than the buffer, or compressed — the script
@@ -241,16 +242,24 @@ Two safeguards keep the body-parse path honest:
   so the consumer's **next** request is blocked rather than letting an over-buffer response slip
   through the budget unmetered.
 
-> **Buffering cost / streaming.** `usage` sits at the *end* of the body, so the SE buffers the
-> whole response before parsing — controlled by `RespBodyBufferKB` (default 256 KB ≈ ~40K output
-> tokens; size it to your model's `max_tokens` — roughly `max_tokens * 6` bytes). This buffers
-> (store-and-forward) rather than streams, so it suits non-streaming API traffic. The memory cost
-> is the buffered body per in-flight response, so very high concurrency × large responses eats SE
-> memory (and competes with connection capacity). For **streaming** (SSE) responses, buffering
-> the whole stream defeats token-by-token delivery — there, meter in a proxy/sidecar and report
-> out-of-band, or rate-limit by request count instead. The response-header approach
-> (`X-Prompt-Tokens` / `X-Completion-Tokens` / `X-Total-Tokens` emitted by a sidecar) remains a
-> valid alternative when you want to keep the SE in streaming pass-through.
+> **Streaming is not metered today (known limitation).** `usage` sits at the *end* of the body,
+> so metering requires the SE to buffer the whole response — controlled by `RespBodyBufferKB`
+> (default 256 KB ≈ ~40K output tokens; roughly `max_tokens * 6` bytes). That store-and-forward
+> model suits non-streaming JSON traffic, but for **streaming** (`stream:true` /
+> `text/event-stream`) it's a dead end: the SE's `HTTP_RESP_DATA` event is **buffer-complete**
+> (verified by probe) — reading the body forces full buffering, which collapses token-by-token
+> delivery. So streamed responses are currently **not metered — they bypass the budget (count 0)**;
+> use non-streaming where budgets must hold.
+>
+> The fix belongs **in the SE, not a sidecar** — the gateway is the only proxy in the path. The SE
+> already relays every chunk; it needs a *tap*: either a native per-chunk response-body event
+> (so the existing DataScript meters streaming), or native LLM token metering that inspects the
+> live stream and writes to a **distributed counter** (which also makes budgets consistent across
+> a multi-SE / multi-cluster fabric). See the
+> [release notes](ai-gateway-release-notes.md#known-limitations).
+>
+> *Memory note:* the buffered body is held per in-flight metered (non-streaming) response, so very
+> high concurrency × large responses competes with SE connection capacity.
 
 ### Avi object mapping
 
@@ -638,5 +647,6 @@ a *unified* per-consumer spend limit that spans both token consumption (LLM) and
 ## Related docs
 
 - [AI Gateway Install Guide](ai-gateway-install.md) — end-to-end demo walkthrough
+- [AI Gateway Release Notes](ai-gateway-release-notes.md) — features, fixes, and known limitations
 - [Inference Extension](inference-extension.md) — LLM-aware load balancing via `InferencePool`
 - [Inference Install Guide](inference-install.md) — end-to-end cluster setup walkthrough
