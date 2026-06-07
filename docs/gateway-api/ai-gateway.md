@@ -350,6 +350,45 @@ spec:
 When `retryAfter: true` is set, the DataScript adds a `Retry-After` header pointing to the
 current window boundary.
 
+### Dashboard counters endpoint
+
+For a UI/dashboard to display live per-user usage, AKO can expose a **read-only counters
+endpoint** on the same VS, gated by an admin token. It is opt-in: set the
+`ai.ako.vmware.com/admin-token-secret` annotation on the `AITokenRateLimitPolicy` to the
+name of a Secret (key `token`) in the policy namespace.
+
+```bash
+kubectl create secret generic ai-admin-token -n inference \
+  --from-literal=token=$(openssl rand -hex 16)
+kubectl annotate aitokenratelimitpolicy llm-limits -n inference \
+  ai.ako.vmware.com/admin-token-secret=ai-admin-token
+```
+
+AKO then prepends a branch to the request DataScript (before enforcement):
+
+- `GET /v1/admin/counters?users=alice,bob,carol` with header `X-Admin-Token: <token>`
+  → `200 {"window":<epoch-sec>,"limit":"<name>","counters":[{"user":"alice","used":300}, …]}`
+- Missing / wrong token → `403 {"error":"forbidden"}`
+
+The SE counter table has no enumeration API, so the **caller passes the identities it wants**
+(`?users=`). Each is looked up at the *same* key the response-phase accounting writes
+(`<epoch>:<limit>:<user>:<window>`), so the values are exactly what enforcement sees. When an
+`AIGatewayAuthPolicy` is attached, AKO adds an SSO `SKIP_AUTHENTICATION` rule for `/v1/admin/`
+so the endpoint is reachable without the OAuth browser redirect — the `X-Admin-Token` check is
+the gate. (The demo OIDC issuer exposes its identity→group roster at `GET /users` so a UI knows
+which users to query.)
+
+### Resetting counters
+
+Bump the **`ai.ako.vmware.com/counter-epoch`** annotation. AKO folds the epoch into every
+counter key, so changing it moves all of the policy's counters to a fresh keyspace — an instant
+reset that leaves budgets and every other field untouched (unlike renaming a limit):
+
+```bash
+kubectl annotate aitokenratelimitpolicy llm-limits -n inference \
+  ai.ako.vmware.com/counter-epoch=2 --overwrite
+```
+
 ---
 
 ## Combining Auth and Group-based Rate Limiting

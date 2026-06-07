@@ -286,6 +286,46 @@ Expected (with the bundled 100-token mock): `alice [200×5, 429]`, `bob [200×10
 
 ---
 
+## Part C — Dashboard counters endpoint & reset
+
+A UI can read live per-user usage from a token-gated, read-only endpoint AKO adds to the same
+VS. Enable it by pointing the policy at a Secret holding the admin token:
+
+```bash
+kubectl create secret generic ai-admin-token -n inference \
+  --from-literal=token=$(openssl rand -hex 16)
+kubectl annotate aitokenratelimitpolicy llm-limits -n inference \
+  ai.ako.vmware.com/admin-token-secret=ai-admin-token
+```
+
+AKO regenerates the request DataScript with a `/v1/admin/counters` branch and adds an SSO
+`SKIP_AUTHENTICATION` rule for `/v1/admin/` (so it isn't OAuth-redirected). Read it from an
+in-cluster pod — pass the users you want, since the SE counter table can't be enumerated:
+
+```bash
+TOKEN=$(kubectl get secret ai-admin-token -n inference -o jsonpath='{.data.token}' | base64 -d)
+curl -sk "https://llm.demo.local/v1/admin/counters?users=alice,bob,carol" \
+  -H "X-Admin-Token: $TOKEN"
+# {"window":...,"limit":"hourly-group-budget","counters":[{"user":"alice","used":300}, …]}
+# missing / wrong token -> 403 {"error":"forbidden"}
+```
+
+Each user is looked up at the *same* key the response-phase accounting writes, so the values are
+exactly what enforcement sees. The demo OIDC issuer exposes its identity→group roster at
+`GET /users`, so a UI knows which users to query.
+
+### Reset all counters
+
+Bump the `counter-epoch` annotation — AKO folds it into every counter key, moving them all to a
+fresh keyspace (an instant reset that leaves budgets and the limit name untouched):
+
+```bash
+kubectl annotate aitokenratelimitpolicy llm-limits -n inference \
+  ai.ako.vmware.com/counter-epoch=2 --overwrite
+```
+
+---
+
 ## Tuning the demo
 
 | Goal | How |

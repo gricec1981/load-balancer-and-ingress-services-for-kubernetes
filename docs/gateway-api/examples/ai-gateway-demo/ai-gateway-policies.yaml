@@ -45,6 +45,15 @@ kind: AITokenRateLimitPolicy
 metadata:
   name: llm-limits
   namespace: inference
+  # Optional annotations (uncomment to enable):
+  #   admin-token-secret -> AKO generates a read-only GET /v1/admin/counters endpoint
+  #     (gated by X-Admin-Token) so a dashboard UI can read live per-user usage. The
+  #     named Secret in this namespace holds the token under key "token".
+  #   counter-epoch -> bump this value to reset every counter to a fresh keyspace
+  #     (instant reset; budgets and the limit name are untouched).
+  # annotations:
+  #   ai.ako.vmware.com/admin-token-secret: ai-admin-token
+  #   ai.ako.vmware.com/counter-epoch: "1"
 spec:
   targetRef:
     group: gateway.networking.k8s.io
