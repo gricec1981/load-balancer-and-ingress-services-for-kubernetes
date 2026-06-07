@@ -63,6 +63,12 @@ type PolicyStore struct {
 
 	// routeToTokenPolicies: routeNsName → []policyNsName
 	routeToTokenPolicies map[string][]string
+
+	// modelRoutePolicyByNsName: "namespace/name" → *AIModelRoutePolicy
+	modelRoutePolicyByNsName map[string]*AIModelRoutePolicy
+
+	// routeToModelRoutePolicies: routeNsName → []policyNsName
+	routeToModelRoutePolicies map[string][]string
 }
 
 var (
@@ -74,10 +80,12 @@ var (
 func SharedPolicyStore() *PolicyStore {
 	policyStoreOnce.Do(func() {
 		globalPolicyStore = &PolicyStore{
-			authPolicyByNsName:   make(map[string]*AIGatewayAuthPolicy),
-			tokenPolicyByNsName:  make(map[string]*AITokenRateLimitPolicy),
-			routeToAuthPolicies:  make(map[string][]string),
-			routeToTokenPolicies: make(map[string][]string),
+			authPolicyByNsName:        make(map[string]*AIGatewayAuthPolicy),
+			tokenPolicyByNsName:       make(map[string]*AITokenRateLimitPolicy),
+			routeToAuthPolicies:       make(map[string][]string),
+			routeToTokenPolicies:      make(map[string][]string),
+			modelRoutePolicyByNsName:  make(map[string]*AIModelRoutePolicy),
+			routeToModelRoutePolicies: make(map[string][]string),
 		}
 	})
 	return globalPolicyStore

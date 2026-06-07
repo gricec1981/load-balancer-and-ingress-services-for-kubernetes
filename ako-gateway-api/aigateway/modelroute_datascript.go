@@ -38,6 +38,11 @@ const (
 	DSNameSuffixModelRouteReqData = "-ai-mr-reqdata"
 )
 
+// DSModelRouteReqName / DSModelRouteReqDataName build the DataScript-set names for
+// the model-route scripts on a given VS.
+func DSModelRouteReqName(vsName string) string     { return vsName + DSNameSuffixModelRouteReq }
+func DSModelRouteReqDataName(vsName string) string { return vsName + DSNameSuffixModelRouteReqData }
+
 // ModelRouteScripts holds the two Lua snippets generated from an
 // AIModelRoutePolicy: the HTTP_REQ phase that enables request-body buffering and
 // the HTTP_REQ_DATA phase that reads the body, resolves the tier, applies

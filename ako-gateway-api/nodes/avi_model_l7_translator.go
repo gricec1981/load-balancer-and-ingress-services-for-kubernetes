@@ -32,10 +32,10 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
 
-	akogatewayapilib "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/lib"
-	akogatewayapiinference "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/inference"
-	akogatewayapiobjects "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/objects"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/aigateway"
+	akogatewayapiinference "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/inference"
+	akogatewayapilib "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/lib"
+	akogatewayapiobjects "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/objects"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/internal/lib"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/internal/nodes"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/pkg/utils"
@@ -181,6 +181,12 @@ func (o *AviObjectGraph) BuildChildVS(key string, routeModel RouteModel, parentN
 		}
 		for _, authPolicy := range ps.GetAuthPoliciesForRoute(routeNsName) {
 			aigateway.ApplyAuthPolicy(key, authPolicy, childNode, authHost)
+		}
+		// Model routing must run before token rate limiting: it sets the ai_tier
+		// reqvar (in HTTP_REQ_DATA) that per-tier token budgets read, and lower
+		// DataScript index = runs first.
+		for _, modelPolicy := range ps.GetModelRoutePoliciesForRoute(routeNsName) {
+			o.ApplyModelRoutePolicy(key, modelPolicy, childNode, parentNsName, routeModel, rule)
 		}
 		for _, tokenPolicy := range ps.GetTokenRateLimitPoliciesForRoute(routeNsName) {
 			aigateway.ApplyTokenRateLimitPolicy(key, tokenPolicy, childNode)

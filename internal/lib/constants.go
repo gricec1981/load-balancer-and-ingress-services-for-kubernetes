@@ -121,6 +121,7 @@ const (
 	InferencePool                              = "InferencePool"
 	AIGatewayAuthPolicy                        = "AIGatewayAuthPolicy"
 	AITokenRateLimitPolicy                     = "AITokenRateLimitPolicy"
+	AIModelRoutePolicy                         = "AIModelRoutePolicy"
 	TCPRoute                                   = "TCPRoute"
 	TLSRoute                                   = "TLSRoute"
 	UDPRoute                                   = "UDPRoute"

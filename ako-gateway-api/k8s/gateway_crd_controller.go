@@ -17,9 +17,9 @@ package k8s
 import (
 	"strings"
 
+	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/aigateway"
 	akogatewayapilib "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/lib"
 	akogatewayapiobjects "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/objects"
-	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/aigateway"
 
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/internal/lib"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/pkg/utils"
@@ -56,6 +56,14 @@ func (c *GatewayController) SetupCRDEventHandlers(numWorkers uint32) {
 		if c.dynamicInformers.AITokenRateLimitPolicyInformer != nil {
 			aigateway.SetupTokenRateLimitPolicyEventHandlers(
 				c.dynamicInformers.AITokenRateLimitPolicyInformer,
+				dynClient,
+				c.workqueue,
+				numWorkers,
+			)
+		}
+		if c.dynamicInformers.AIModelRoutePolicyInformer != nil {
+			aigateway.SetupModelRoutePolicyEventHandlers(
+				c.dynamicInformers.AIModelRoutePolicyInformer,
 				dynClient,
 				c.workqueue,
 				numWorkers,
