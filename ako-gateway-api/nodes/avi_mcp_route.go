@@ -47,10 +47,13 @@ func ApplyMCPRoutePolicy(key string, policy *akogatewayapiaigateway.AIMCPRoutePo
 	// 1. MCP application profile (native, Avi 32.1.1).
 	childVsNode.ApplicationProfile = akogatewayapiaigateway.MCPApplicationProfile
 
-	// 2. Reference Avi's built-in MCP session-persistence DataScriptSet by name.
+	// 2. Reference Avi's built-in MCP session-persistence DataScriptSet. VsDatascriptRefs
+	// entries must be full "/api/vsdatascriptset?name=<name>" refs (the EVH builder emits
+	// them verbatim) — matching how HostRule attaches existing DataScriptSets.
+	sessionDSRef := "/api/vsdatascriptset?name=" + akogatewayapiaigateway.MCPSessionDataScript
 	refs := childVsNode.GetVsDatascriptRefs()
-	if !utils.HasElem(refs, akogatewayapiaigateway.MCPSessionDataScript) {
-		childVsNode.SetVsDatascriptRefs(append(refs, akogatewayapiaigateway.MCPSessionDataScript))
+	if !utils.HasElem(refs, sessionDSRef) {
+		childVsNode.SetVsDatascriptRefs(append(refs, sessionDSRef))
 	}
 
 	// 3. Share the LLM IdP: resolve authRef and apply its OAuth graph to this VS.
