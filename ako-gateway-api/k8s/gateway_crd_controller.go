@@ -69,6 +69,14 @@ func (c *GatewayController) SetupCRDEventHandlers(numWorkers uint32) {
 				numWorkers,
 			)
 		}
+		if c.dynamicInformers.AIMCPRoutePolicyInformer != nil {
+			aigateway.SetupMCPRoutePolicyEventHandlers(
+				c.dynamicInformers.AIMCPRoutePolicyInformer,
+				dynClient,
+				c.workqueue,
+				numWorkers,
+			)
+		}
 	}
 }
 

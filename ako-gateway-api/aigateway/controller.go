@@ -69,6 +69,12 @@ type PolicyStore struct {
 
 	// routeToModelRoutePolicies: routeNsName → []policyNsName
 	routeToModelRoutePolicies map[string][]string
+
+	// mcpRoutePolicyByNsName: "namespace/name" → *AIMCPRoutePolicy
+	mcpRoutePolicyByNsName map[string]*AIMCPRoutePolicy
+
+	// routeToMCPRoutePolicies: routeNsName → []policyNsName
+	routeToMCPRoutePolicies map[string][]string
 }
 
 var (
@@ -86,6 +92,8 @@ func SharedPolicyStore() *PolicyStore {
 			routeToTokenPolicies:      make(map[string][]string),
 			modelRoutePolicyByNsName:  make(map[string]*AIModelRoutePolicy),
 			routeToModelRoutePolicies: make(map[string][]string),
+			mcpRoutePolicyByNsName:    make(map[string]*AIMCPRoutePolicy),
+			routeToMCPRoutePolicies:   make(map[string][]string),
 		}
 	})
 	return globalPolicyStore

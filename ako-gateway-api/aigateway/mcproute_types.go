@@ -31,6 +31,20 @@ var AIMCPRoutePolicyGVR = schema.GroupVersionResource{
 	Resource: "aimcproutepolicies",
 }
 
+// Built-in Avi 32.1.1 MCP objects the translator reuses (verified live — see
+// docs/gateway-api/ai-gateway-mcp.md §2). AKO references these system objects on
+// the MCP VS rather than generating its own session logic.
+const (
+	// MCPApplicationProfile is the system HTTP application profile with
+	// app_service_type APP_SERVICE_TYPE_HTTP_MCP (websockets + HTTP/2).
+	MCPApplicationProfile = "System-Secure-HTTP-MCP"
+
+	// MCPSessionDataScript is the system DataScriptSet that pins MCP sessions to
+	// the same pool+server via VS persistence tables keyed on Mcp-Session-Id
+	// (create-on-response, delete-on-DELETE).
+	MCPSessionDataScript = "System-Standard-MCP"
+)
+
 // WatchedAIGatewayPolicyGVRs lists every AI Gateway policy CRD the controller
 // registers an informer for. It is the single source of truth shared by the
 // informer wiring and the RBAC guardrail test (see rbac_clusterrole_test.go), so

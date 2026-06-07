@@ -191,6 +191,12 @@ func (o *AviObjectGraph) BuildChildVS(key string, routeModel RouteModel, parentN
 		for _, tokenPolicy := range ps.GetTokenRateLimitPoliciesForRoute(routeNsName) {
 			aigateway.ApplyTokenRateLimitPolicy(key, tokenPolicy, childNode)
 		}
+		// MCP routes: attach the native MCP application profile + session
+		// DataScript, the shared-IdP OAuth graph (via authRef), and the per-role
+		// tool-authorization DataScript.
+		for _, mcpPolicy := range ps.GetMCPRoutePoliciesForRoute(routeNsName) {
+			ApplyMCPRoutePolicy(key, mcpPolicy, childNode, authHost)
+		}
 	}
 
 	foundEvhModel := nodes.FindAndReplaceEvhInModel(childNode, parentNode, key)
