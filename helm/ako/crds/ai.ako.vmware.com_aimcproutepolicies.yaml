@@ -1,0 +1,175 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: aimcproutepolicies.ai.ako.vmware.com
+spec:
+  group: ai.ako.vmware.com
+  names:
+    kind: AIMCPRoutePolicy
+    listKind: AIMCPRoutePolicyList
+    plural: aimcproutepolicies
+    singular: aimcproutepolicy
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    subresources:
+      status: {}
+    schema:
+      openAPIV3Schema:
+        description: |-
+          AIMCPRoutePolicy governs Model Context Protocol (agent↔tool) traffic on an
+          HTTPRoute attached to an MCP Gateway. It ties enforcement to the same identity
+          provider as the LLM gateway (authRef → an AIGatewayAuthPolicy whose issuer Pool
+          and OAuth AuthProfile are reused), keeps stateful MCP sessions pinned via header
+          persistence (session.header, default Mcp-Session-Id), and authorizes individual
+          tool calls by the caller's verified role (toolAccess). The per-tool decision is
+          enforced by an SE DataScript that reads the JSON-RPC body (method / params.name).
+        type: object
+        required:
+        - spec
+        properties:
+          apiVersion:
+            type: string
+          kind:
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: Spec defines the desired MCP-route configuration.
+            type: object
+            required:
+            - targetRef
+            properties:
+              targetRef:
+                description: |-
+                  targetRef identifies the MCP HTTPRoute (or Gateway) this policy applies to.
+                type: object
+                required:
+                - group
+                - kind
+                - name
+                properties:
+                  group:
+                    type: string
+                  kind:
+                    type: string
+                    enum:
+                    - HTTPRoute
+                    - Gateway
+                  name:
+                    type: string
+              authRef:
+                description: |-
+                  authRef references an AIGatewayAuthPolicy in the same namespace whose
+                  identity provider this MCP route shares. AKO reuses that policy's issuer
+                  Pool and OAuth AuthProfile (same IdP / login) and emits a separate SSO
+                  policy for the MCP VS. Omit to run the MCP route unauthenticated.
+                type: object
+                required:
+                - name
+                properties:
+                  name:
+                    description: Name of the AIGatewayAuthPolicy to share the IdP with.
+                    type: string
+              session:
+                description: session configures MCP session persistence.
+                type: object
+                properties:
+                  header:
+                    description: |-
+                      header is the request header carrying the MCP session id, used as the
+                      persistence key. Defaults to "Mcp-Session-Id".
+                    type: string
+                    default: Mcp-Session-Id
+                  timeout:
+                    description: timeout is the idle session lifetime (e.g. "30m").
+                    type: string
+                    default: 30m
+              toolAccess:
+                description: |-
+                  toolAccess restricts which MCP tools a caller's role may invoke. Requires
+                  an AIGatewayAuthPolicy (via authRef) so the role claim is verified and
+                  readable by the DataScript. When omitted, tool calls are authorized by
+                  OAuth alone.
+                type: object
+                properties:
+                  roleClaim:
+                    description: |-
+                      roleClaim names the verified JWT claim that carries the caller's role.
+                    type: string
+                    default: role
+                  rules:
+                    description: |-
+                      rules lists, per role, the tool names that role may invoke. A role not
+                      listed is treated as authorized for no tool (subject to onUnauthorized).
+                    type: array
+                    items:
+                      type: object
+                      required:
+                      - role
+                      - allow
+                      properties:
+                        role:
+                          description: The role-claim value this rule applies to.
+                          type: string
+                        allow:
+                          description: |-
+                            Tool names (or JSON-RPC methods) this role may invoke. A single
+                            "*" allows all tools; a trailing "*" is a prefix glob (e.g. "docs.*").
+                          type: array
+                          items:
+                            type: string
+              onUnauthorized:
+                description: |-
+                  onUnauthorized controls behaviour when a caller invokes a tool their role
+                  is not authorized to use.
+                type: object
+                properties:
+                  type:
+                    description: |-
+                      "Reject" returns a JSON-RPC error with statusCode. "Log" tags the
+                      request and lets it through (for observing denials before enforcing).
+                    type: string
+                    default: Reject
+                    enum:
+                    - Reject
+                    - Log
+                  statusCode:
+                    description: HTTP status returned when type is Reject.
+                    type: integer
+                    default: 403
+                    minimum: 400
+                    maximum: 599
+          status:
+            description: Status reflects the observed state of the policy.
+            type: object
+            properties:
+              conditions:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    type:
+                      type: string
+                    status:
+                      type: string
+                    reason:
+                      type: string
+                    message:
+                      type: string
+                    lastTransitionTime:
+                      type: string
+                      format: date-time
+    additionalPrinterColumns:
+    - name: Target
+      type: string
+      jsonPath: .spec.targetRef.name
+    - name: Auth
+      type: string
+      jsonPath: .spec.authRef.name
+    - name: Age
+      type: date
+      jsonPath: .metadata.creationTimestamp

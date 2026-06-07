@@ -73,7 +73,7 @@ rules:
 {{- end }}
 {{- if and (eq .Values.featureGates.GatewayAPI true) .Values.aiGateway.enabled }}
   - apiGroups: ["ai.ako.vmware.com"]
-    resources: ["aigatewayauthpolicies","aigatewayauthpolicies/status","aitokenratelimitpolicies","aitokenratelimitpolicies/status","aimodelroutepolicies","aimodelroutepolicies/status"]
+    resources: ["aigatewayauthpolicies","aigatewayauthpolicies/status","aitokenratelimitpolicies","aitokenratelimitpolicies/status","aimodelroutepolicies","aimodelroutepolicies/status","aimcproutepolicies","aimcproutepolicies/status"]
     verbs: ["get","watch","list","patch","update"]
 {{- end }}
 {{- if .Values.rbac.pspEnable }}
