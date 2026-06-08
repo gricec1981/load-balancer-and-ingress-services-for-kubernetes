@@ -38,17 +38,25 @@ const guardrailRuleIDBase = 4000000
 var builtinSecretSignatures = map[string]string{
 	"aws-access-key": `AKIA[0-9A-Z]{16}`,
 	"gcp-api-key":    `AIza[0-9A-Za-z_-]{35}`,
-	"openai-api-key": `sk-[A-Za-z0-9]{20,}`,
-	"github-token":   `gh[pousr]_[A-Za-z0-9]{36}`,
-	"slack-token":    `xox[baprs]-[0-9A-Za-z-]{10,}`,
-	"private-key":    `-----BEGIN [A-Z ]+PRIVATE KEY-----`,
-	"jwt":            `eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+`,
+	// Covers legacy sk-<48 chars>, and newer sk-proj-<token> / sk-svcacct-<token> formats.
+	"openai-api-key": `sk-(?:proj-|svcacct-)?[A-Za-z0-9]{20,}`,
+	// Classic PATs: ghp_/gho_/ghu_/ghs_/ghr_ + 36 alphanum chars.
+	"github-token": `gh[pousr]_[A-Za-z0-9]{36}`,
+	// Fine-grained PATs (2022+): github_pat_ + ~82 alphanum/underscore chars.
+	"github-fine-grained-pat": `github_pat_[A-Za-z0-9_]{82,}`,
+	"slack-token":             `xox[baprs]-[0-9A-Za-z-]{10,}`,
+	"private-key":             `-----BEGIN [A-Z ]+PRIVATE KEY-----`,
+	"jwt":                     `eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+`,
 }
 
 // builtinPIISignatures maps a PII-detector name to its @rx regex.
 var builtinPIISignatures = map[string]string{
-	"ssn":         `[0-9]{3}-[0-9]{2}-[0-9]{4}`,
-	"credit-card": `[0-9]{13,16}`,
+	"ssn": `[0-9]{3}-[0-9]{2}-[0-9]{4}`,
+	// IIN-prefix anchored pattern covering Visa, Mastercard, Amex, Diners, Discover.
+	// A bare \d{13,16} produces excessive false positives on any numeric sequence;
+	// encoding the known IIN prefixes eliminates most noise without a Luhn check
+	// (which requires runtime logic unavailable in a WAF regex).
+	"credit-card": `\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|3(?:0[0-5]|[68][0-9])[0-9]{11}|6(?:011|5[0-9]{2})[0-9]{12})\b`,
 	"email":       `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`,
 }
 
