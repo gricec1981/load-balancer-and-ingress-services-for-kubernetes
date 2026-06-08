@@ -35,7 +35,7 @@ import (
 //
 // The tool-authz script runs in HTTP_REQ_DATA, a different event from the system
 // session DataScript (HTTP_REQ/HTTP_RESP), so the two coexist on the same VS.
-func ApplyMCPRoutePolicy(key string, policy *akogatewayapiaigateway.AIMCPRoutePolicy, childVsNode *nodes.AviEvhVsNode, authHost string) {
+func ApplyMCPRoutePolicy(key string, policy *akogatewayapiaigateway.AIMCPRoutePolicy, childVsNode *nodes.AviEvhVsNode, authHost, routePrefix string) {
 	if policy == nil {
 		return
 	}
@@ -47,20 +47,22 @@ func ApplyMCPRoutePolicy(key string, policy *akogatewayapiaigateway.AIMCPRoutePo
 	// 1. MCP application profile (native, Avi 32.1.1).
 	childVsNode.ApplicationProfile = akogatewayapiaigateway.MCPApplicationProfile
 
-	// 2. Reference Avi's built-in MCP session-persistence DataScriptSet. VsDatascriptRefs
-	// entries must be full "/api/vsdatascriptset?name=<name>" refs (the EVH builder emits
-	// them verbatim) — matching how HostRule attaches existing DataScriptSets.
-	sessionDSRef := "/api/vsdatascriptset?name=" + akogatewayapiaigateway.MCPSessionDataScript
-	refs := childVsNode.GetVsDatascriptRefs()
-	if !utils.HasElem(refs, sessionDSRef) {
-		childVsNode.SetVsDatascriptRefs(append(refs, sessionDSRef))
-	}
+	// 2. MCP session affinity. The system System-Standard-MCP DataScript pins a
+	// session to its backend via avi.pool.select(name, ip), which RAISES (HTTP 500)
+	// on AKO's EVH-child-VS + PoolGroup topology — verified live (a tools/call with
+	// an Mcp-Session-Id 500s; the same call without it succeeds). Author our own
+	// pcall-guarded equivalent instead of referencing the system script.
+	sess := akogatewayapiaigateway.GenerateMCPSessionScripts()
+	attachModelRouteDS(childVsNode, akogatewayapiaigateway.DSMCPSessReqName(childVsNode.Name),
+		akogatewayapiaigateway.DSEvtHTTPReq, sess.ReqScript, nil)
+	attachModelRouteDS(childVsNode, akogatewayapiaigateway.DSMCPSessRespName(childVsNode.Name),
+		akogatewayapiaigateway.DSEvtHTTPResp, sess.RespScript, nil)
 
 	// 3. Share the LLM IdP: resolve authRef and apply its OAuth graph to this VS.
 	if policy.Spec.AuthRef != nil && policy.Spec.AuthRef.Name != "" {
 		authPolicy := akogatewayapiaigateway.SharedPolicyStore().GetAuthPolicyByNsName(policy.Namespace, policy.Spec.AuthRef.Name)
 		if authPolicy != nil {
-			akogatewayapiaigateway.ApplyAuthPolicy(key, authPolicy, childVsNode, authHost)
+			akogatewayapiaigateway.ApplyAuthPolicy(key, authPolicy, childVsNode, authHost, routePrefix)
 		} else {
 			utils.AviLog.Warnf("key: %s, msg: AIMCPRoutePolicy %s/%s authRef %q not found; MCP route left unauthenticated",
 				key, policy.Namespace, policy.Name, policy.Spec.AuthRef.Name)

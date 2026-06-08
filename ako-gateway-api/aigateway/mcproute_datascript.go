@@ -31,6 +31,81 @@ const (
 func DSMCPReqName(vsName string) string     { return vsName + DSNameSuffixMCPReq }
 func DSMCPReqDataName(vsName string) string { return vsName + DSNameSuffixMCPReqData }
 
+// DataScript-set name suffixes for the MCP session-affinity scripts (AKO's
+// EVH-safe replacement for the system System-Standard-MCP DataScript).
+const (
+	DSNameSuffixMCPSessReq  = "-ai-mcp-sess-req"
+	DSNameSuffixMCPSessResp = "-ai-mcp-sess-resp"
+)
+
+func DSMCPSessReqName(vsName string) string  { return vsName + DSNameSuffixMCPSessReq }
+func DSMCPSessRespName(vsName string) string { return vsName + DSNameSuffixMCPSessResp }
+
+// MCPSessionScripts holds the session-affinity Lua for an MCP route: pin each
+// Mcp-Session-Id to the backend server that created it.
+type MCPSessionScripts struct {
+	ReqScript  string // HTTP_REQ: re-select the session's backend
+	RespScript string // HTTP_RESP: capture (or forget, on DELETE) the mapping
+}
+
+// GenerateMCPSessionScripts authors AKO's own MCP session-affinity DataScripts in
+// place of the system System-Standard-MCP DataScript. The system script calls
+// avi.pool.select(name, ip) unguarded, which RAISES (HTTP 500) on AKO's
+// EVH-child-VS + PoolGroup topology — verified live: a tools/call carrying an
+// Mcp-Session-Id 500s, the same call without the header succeeds. Here the
+// re-select is pcall-guarded, so it pins the session's backend where the
+// primitive resolves and otherwise falls back to normal load balancing instead
+// of failing the request (exact for single-server pools; graceful for
+// multi-server until a native EVH server-pin primitive exists). Tables are
+// namespaced (mcp_pool/mcp_srv) and the response-phase capture remove-then-inserts
+// because avi.vs.table_insert does not overwrite.
+func GenerateMCPSessionScripts() MCPSessionScripts {
+	req := `-- AKO AI Gateway: MCP session affinity (HTTP_REQ) — re-pin a known session
+do
+  local sid = avi.http.get_header("mcp-session-id")
+  if sid then
+    local pool_name = avi.vs.table_lookup("mcp_pool", sid, 600)
+    local server_ip = avi.vs.table_lookup("mcp_srv", sid, 600)
+    if pool_name and server_ip then
+      -- EVH/PoolGroup: avi.pool.select(name, ip) can raise here, so guard it;
+      -- on failure the request simply load-balances.
+      pcall(avi.pool.select, pool_name, server_ip)
+    end
+  end
+end`
+	resp := `-- AKO AI Gateway: MCP session affinity (HTTP_RESP) — capture/forget the mapping
+do
+  local resp_sid = avi.http.get_header("mcp-session-id")
+  local req_sid = avi.http.get_header("mcp-session-id", avi.HTTP_REQUEST)
+  local method = ""
+  do local ok, m = pcall(avi.http.method); if ok and m then method = m end end
+  if method == "DELETE" then
+    local sid = resp_sid or req_sid
+    if sid then
+      local n = nil
+      do local ok, sc = pcall(avi.http.status); if ok then n = tonumber(sc) end end
+      if n and n >= 200 and n < 300 then
+        pcall(avi.vs.table_remove, "mcp_pool", sid)
+        pcall(avi.vs.table_remove, "mcp_srv", sid)
+      end
+    end
+    return
+  end
+  if resp_sid then
+    local pool_name, server_ip
+    do local ok, v = pcall(avi.pool.name); if ok then pool_name = v end end
+    do local ok, v = pcall(avi.pool.server_ip); if ok then server_ip = v end end
+    if pool_name and server_ip then
+      pcall(avi.vs.table_remove, "mcp_pool", resp_sid)
+      pcall(avi.vs.table_remove, "mcp_srv", resp_sid)
+      pcall(avi.vs.table_insert, "mcp_pool", resp_sid, pool_name, 600)
+      pcall(avi.vs.table_insert, "mcp_srv", resp_sid, server_ip, 600)
+    end
+  end
+end`
+	return MCPSessionScripts{ReqScript: req, RespScript: resp}
+}
+
 // MCPToolAuthScripts holds the two Lua snippets generated from an
 // AIMCPRoutePolicy's toolAccess: the HTTP_REQ phase that enables request-body
 // buffering and the HTTP_REQ_DATA phase that reads the JSON-RPC body, extracts

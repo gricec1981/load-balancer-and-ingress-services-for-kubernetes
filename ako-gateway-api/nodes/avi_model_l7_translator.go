@@ -179,8 +179,18 @@ func (o *AviObjectGraph) BuildChildVS(key string, routeModel RouteModel, parentN
 		if len(hosts) > 0 {
 			authHost = hosts[0]
 		}
+		// The OAuth callback must land under THIS route's path prefix so the EVH
+		// parent content-switches it to this child VS (e.g. /v1 for the LLM route,
+		// /mcp for the MCP route). Derive it from the rule rather than assuming /v1.
+		routePrefix := "/"
+		for _, m := range rule.Matches {
+			if m.PathMatch != nil && m.PathMatch.Path != "" {
+				routePrefix = m.PathMatch.Path
+				break
+			}
+		}
 		for _, authPolicy := range ps.GetAuthPoliciesForRoute(routeNsName) {
-			aigateway.ApplyAuthPolicy(key, authPolicy, childNode, authHost)
+			aigateway.ApplyAuthPolicy(key, authPolicy, childNode, authHost, routePrefix)
 		}
 		// Model routing must run before token rate limiting: it sets the ai_tier
 		// reqvar (in HTTP_REQ_DATA) that per-tier token budgets read, and lower
@@ -195,7 +205,7 @@ func (o *AviObjectGraph) BuildChildVS(key string, routeModel RouteModel, parentN
 		// DataScript, the shared-IdP OAuth graph (via authRef), and the per-role
 		// tool-authorization DataScript.
 		for _, mcpPolicy := range ps.GetMCPRoutePoliciesForRoute(routeNsName) {
-			ApplyMCPRoutePolicy(key, mcpPolicy, childNode, authHost)
+			ApplyMCPRoutePolicy(key, mcpPolicy, childNode, authHost, routePrefix)
 		}
 		// Guardrails/DLP: author the Avi WafPolicy from the spec and attach it to
 		// the VS (waf_policy_ref). Applies to inference and MCP routes alike.

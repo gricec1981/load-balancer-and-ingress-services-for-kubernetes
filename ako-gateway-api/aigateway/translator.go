@@ -16,6 +16,7 @@ package aigateway
 
 import (
 	"fmt"
+	"strings"
 
 	"google.golang.org/protobuf/proto"
 
@@ -43,7 +44,7 @@ import (
 //   - The VS GeneratedFields get OauthVsConfig (client app_settings +
 //     resource_server access_type JWT) and SsoPolicyRef, attached the same way
 //     the SSORule CRD attaches OAuth to an EVH child.
-func ApplyAuthPolicy(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVsEvhSniModel, host string) {
+func ApplyAuthPolicy(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVsEvhSniModel, host, routePrefix string) {
 	if policy == nil {
 		return
 	}
@@ -98,8 +99,10 @@ func ApplyAuthPolicy(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVs
 		CookieTimeout: proto.Int32(60),
 		// The OAuth callback must land on this EVH child VS, which the parent only
 		// content-switches to for the route's path prefix. Put the callback under
-		// that prefix so it reaches the child's OAuth module instead of 404ing.
-		RedirectURI: proto.String(fmt.Sprintf("https://%s/v1/oauth/callback", host)),
+		// that prefix (derived from the route, not hardcoded) so it reaches the
+		// child's OAuth module instead of 404ing — e.g. /v1/... for the LLM route,
+		// /mcp/... for the MCP route.
+		RedirectURI: proto.String(fmt.Sprintf("https://%s%s/oauth/callback", host, strings.TrimRight(routePrefix, "/"))),
 		OauthSettings: []*akov1alpha2.OAuthSettings{{
 			AuthProfileRef: proto.String(fmt.Sprintf("/api/authprofile?name=%s", authProfileName)),
 			// app_settings are mandatory on oauth_vs_config even in resource-server
