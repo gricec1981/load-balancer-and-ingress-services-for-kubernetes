@@ -1,33 +1,38 @@
 # AKO AI Gateway — Overview
 
 The AKO AI Gateway turns the Avi Load Balancer into the entry point for AI traffic on
-Kubernetes. It authenticates callers, meters and governs usage, routes requests to the
-right model, and inspects content for data loss and abuse — all using the Avi Service
-Engines an organisation already runs, with no extra proxies or sidecars. Every capability is
-expressed as a Kubernetes CRD that attaches to a Gateway API route and is reconciled by AKO
-into native Avi features.
+Kubernetes. It authenticates callers, meters and governs usage, routes requests to the right
+model, and inspects content for data loss and abuse — using the Avi Service Engines an
+organization already runs, **with no new data-plane proxy in the request path**. Every
+capability is expressed as a Kubernetes CRD that attaches to a Gateway API route and is
+reconciled by AKO into native Avi features.
 
-It governs the whole agent loop under **one verified identity**: **inference** calls to LLMs,
-**tool** calls to MCP servers, and **agent↔agent** delegation — with the same authentication,
-the same policies, and the same usage accounting across all three.
+The goal it is built toward is to govern the **whole agent loop under one verified identity** —
+inference calls to LLMs, tool calls to MCP servers, and agent↔agent delegation — all under the
+same authentication, the same policies, and the same usage accounting. Today that model is
+**available** for LLM inference, **implemented** for MCP tool traffic, and **in design** (not yet
+built) for agent↔agent. The capability table below states exactly where each piece stands; the
+sections that follow do not get ahead of it.
+
+**New to Avi?** Two terms run through this doc. The **Avi Controller** is the control plane
+(configuration, API, analytics). The **Service Engine (SE)** is the data plane — the proxy that
+actually carries traffic. **AKO** (Avi Kubernetes Operator) watches Kubernetes CRDs and programs
+the Controller, which in turn drives the SEs. The core idea here is that all of the AI
+governance below runs on SEs you already operate — no new proxy or sidecar enters the request
+path.
+
+![AKO AI Gateway + Avi Architecture](ako-ai-gateway-architecture.png)
 
 ---
 
-## Goals
+## Status ladder
 
-- **Make the Avi data plane the AI Gateway.** Authenticate, govern, meter, route, and inspect
-  AI traffic on the load balancer customers already operate — no new data plane to adopt.
-- **Govern the whole agent loop with one identity.** LLM inference, MCP tool calls, and
-  agent-to-agent traffic share the same authentication, policies, and usage accounting.
-- **Control cost and quality.** Route each request to the appropriate model tier and
-  hardware, and keep expensive resources for the traffic entitled to them.
-- **Protect the data.** Stop secrets, PII, and known attacks from entering prompts, tool
-  arguments, and agent messages — natively, with no model in the hot path.
-- **Give operators visibility and control.** Per-consumer and per-group token budgets, usage
-  counters, group-based entitlements, and a console to see and drive it all.
-- **Stay Kubernetes-native.** Configure everything as CRDs attached to Gateway API routes,
-  reconciled into Avi Service Engine capabilities (OAuth/OIDC, DataScripts, WAF, pools,
-  persistence).
+Every capability is labeled with one of these, and only these:
+
+- **Available** — built and callable in the gateway today.
+- **Verified by spike** — built and confirmed against Avi by a proof-of-concept.
+- **In design** — specified, not yet built. Some carry an open spike that gates feasibility,
+  noted inline as *spike-gated*.
 
 ---
 
@@ -35,256 +40,243 @@ the same policies, and the same usage accounting across all three.
 
 | Capability | What it provides | Status |
 |---|---|---|
-| [Authentication](#authentication) | JWT/OIDC validation for browser **and** machine clients, with verified identity/claims | Available |
-| [Inference](#inference) | Metric-weighted load balancing across model-server pods | Available |
-| [Token Counting](#token-counting) | Per-consumer / per-group token budgets, counters, rate limits | Available |
-| [Model Routing](#model-routing) | Model-aware routing to quality/cost tiers, with entitlements | Available |
-| [MCP](#mcp-agenttool) | The same governance for agent↔tool (Model Context Protocol) traffic | Implemented · design evolving |
-| [A2A](#a2a-agentagent) | Governance for agent↔agent (Agent2Agent) delegation traffic | In design |
-| [Guardrails & DLP](#guardrails--dlp) | WAF-native data-loss prevention and content guardrails | Built · spike-verified |
-| [Semantic Guardrails](#semantic-guardrails) | Model-based prompt-injection detection over ICAP | In design |
-| [Backend mTLS](#backend-mtls-spiffespire) | SE↔backend mutual TLS with SPIFFE/SPIRE short-lived identity | In design |
-| [Multi-Site Delivery](#multi-site-cross-cluster-delivery) | Cross-cluster model routing via AMKO + Avi GSLB | In design |
-| [Console (UI)](#console-the-ai-gateway-ui) | Avi-style web console to view and drive the gateway | Built (companion repo) |
+| [Inference](#inference) | Metric-weighted load balancing across model-server pods | **Available** |
+| [Authentication](#authentication) | JWT/OIDC validation for browser **and** machine clients, with verified identity/claims | **Available** |
+| [Token Counting](#token-counting) | Per-consumer / per-group token budgets, counters, rate limits | **Available** |
+| [Model Routing](#model-routing) | Model-aware routing to quality/cost tiers, with entitlements | **Available** |
+| [Guardrails & DLP](#guardrails--dlp) | WAF-native data-loss prevention and content guardrails | **Available** · request-body DLP verified by spike |
+| [MCP](#mcp-agenttool) | The same governance for agent↔tool (Model Context Protocol) traffic | **Available** |
+| [Console (UI)](#console-the-ai-gateway-ui) | Avi-style web console to view and drive the gateway | **Available** (companion repo) |
+| [Semantic Guardrails](#semantic-guardrails) | Model-based prompt-injection detection over ICAP | **In design** |
+| [A2A](#a2a-agentagent) | Governance for agent↔agent (Agent2Agent) delegation traffic | **In design** |
+| [Backend mTLS](#backend-mtls-spiffespire) | SE↔backend mutual TLS with SPIFFE/SPIRE short-lived identity | **In design** · spike-gated |
+| [Multi-Site Delivery](#multi-site-cross-cluster-delivery) | Cross-cluster model routing via AMKO + Avi GSLB | **In design** · spike-gated |
 
-The three governance surfaces — **inference**, **MCP**, and **A2A** — and their protocols:
+The agent loop has three governance surfaces; the gateway covers all three with the same
+identity:
 
-| Surface | Protocol | Governed by |
-|---|---|---|
-| agent ↔ model | OpenAI-style HTTP | [Authentication](#authentication) + [Model Routing](#model-routing) — available |
-| agent ↔ tool | MCP (JSON-RPC + Streamable HTTP) | [MCP](#mcp-agenttool) — implemented, design evolving |
-| agent ↔ agent | A2A (JSON-RPC over HTTPS) | [A2A](#a2a-agentagent) — design |
+| Surface | Protocol | Governed by | Status |
+|---|---|---|---|
+| agent ↔ model | OpenAI-style HTTP | [Authentication](#authentication) + [Model Routing](#model-routing) | **Available** |
+| agent ↔ tool | MCP (JSON-RPC + Streamable HTTP) | [MCP Gateway](#mcp-agenttool) | **Available** |
+| agent ↔ agent | A2A (JSON-RPC over HTTPS) | [A2A Gateway](#a2a-agentagent) | **In design** |
 
 ---
 
-## Authentication
+## What you actually run
 
-The gateway authenticates API consumers with **JWT / OAuth-OIDC** at the Service Engine,
-against one identity provider that serves the whole gateway. The verified identity and claims —
-the consumer's `sub`, their `group` or `role` — are made available to every downstream policy,
-so token budgets are keyed on it, tier entitlements are decided from it, and MCP/A2A tool
-authorization reads the same claims. This verified identity is the foundation the rest of the
-gateway builds on.
+The "no new data plane" claim is specifically about the **request hot path**: no proxy or
+sidecar is inserted between caller and backend — the SEs you already operate do the work. A few
+roadmap capabilities do add components you operate *outside* that path, and they are called out
+in their sections: the semantic-guardrail classifier (the SE calls it over ICAP, as it already
+calls the OIDC issuer), a SPIRE server plus a small SVID-rotation controller for backend mTLS,
+and AMKO for multi-site delivery. None sit in the request path, but they are real things to run.
 
-It authenticates **both** kinds of caller through one `AIGatewayAuthPolicy`, selected by
-`authMode`:
-
-- **`oauthBrowser`** (default) — interactive/browser clients run the OAuth auth-code flow and
-  carry a session cookie; an unauthenticated request is redirected to the IdP.
-- **`jwtQuery`** — machine clients (SDKs, agents, MCP, `curl`) present a bearer JWT as a
-  `?jwt=` query parameter; an unauthenticated request gets a `401`, not a redirect. This is
-  what lets non-browser **agents** authenticate while their claims stay readable to policy —
-  essential for governing the agent loop.
-
-The two modes exist because of a real Avi constraint: the SE's browser-OAuth path exposes
-claims to policy but ignores a bearer header, while its resource-server JWT path validates a
-bearer but strips the header and hides the claims. `jwtQuery` threads the needle by validating
-the token from the query string, which survives to the policy DataScript. Both modes require
-the listener to terminate TLS.
-
-→ [AI Gateway Authentication — `AIGatewayAuthPolicy`](ai-gateway-auth.md)
+---
 
 ## Inference
 
-The Inference Extension load-balances traffic **within** a model fleet. An `InferencePool`
-groups the pods serving a model, and the gateway distributes requests across them using
-live metrics scraped from each pod — such as KV-cache utilisation and request-queue depth —
-so load follows real serving capacity rather than simple round-robin.
+Inference is the foundation everything else routes *over*, and it is the most mature capability
+in the gateway. The Inference Extension load-balances traffic **within** a model fleet: an
+`InferencePool` groups the pods serving a model, and the gateway distributes requests across
+them using live metrics scraped from each pod — KV-cache utilization, request-queue depth, and
+running-slot occupancy — so load follows real serving capacity rather than simple round-robin.
 
-This is the layer the rest of the gateway routes *over*: each model tier and each route
-ultimately lands on an inference pool whose members are weighted by current load. It keeps
-GPU-bound model servers evenly and efficiently utilised.
+This matters because model servers are GPU-bound and their cost-per-request is dominated by
+tail latency. In internal benchmarking under load, replacing round-robin with the
+metric-weighted algorithm cut **p90 time-to-first-token from roughly 125 s to roughly 10 s** —
+an order-of-magnitude improvement on the metric users feel most. Every model tier and every
+route below ultimately lands on an inference pool whose members are weighted by current load.
 
 → [Native Inference Extension](inference-extension.md) · [Install guide](inference-install.md)
 
+## Authentication
+
+Authentication is the trust anchor the rest of the gateway builds on. The gateway authenticates
+API consumers with **JWT / OAuth-OIDC** at the Service Engine, against one identity provider
+serving the whole gateway. The verified identity and claims — the consumer's `sub` and their
+`group`/`role` — are made available to every downstream policy, so token budgets are keyed on
+them, tier entitlements are decided from them, and MCP/A2A authorization reads the same claims.
+
+One `AIGatewayAuthPolicy` handles **both** kinds of caller, selected by `authMode`:
+
+- **`oauthBrowser`** (default) — interactive/browser clients run the OAuth auth-code flow and
+  carry a session cookie; an unauthenticated request is redirected to the IdP.
+- **`jwtQuery`** — machine clients (SDKs, agents, MCP, `curl`) present a bearer JWT as a `?jwt=`
+  query parameter; an unauthenticated request gets a `401`, not a redirect. This is what lets
+  non-browser **agents** authenticate while their claims stay readable to policy.
+
+The two modes exist because of a real Avi constraint: the SE's browser-OAuth path exposes claims
+to policy but ignores a bearer header, while its resource-server JWT path validates a bearer but
+hides the claims. `jwtQuery` threads the needle by validating the token from the query string,
+which survives to the policy layer. Both modes require the listener to terminate TLS.
+
+→ [AI Gateway Authentication — `AIGatewayAuthPolicy`](ai-gateway-auth.md)
+
 ## Token Counting
 
-The gateway meters **token usage**, not just requests. It reads the token counts from model
+The gateway meters **token usage**, not just request count. It reads token counts from model
 responses and maintains running counters per consumer and per group in Service Engine shared
 state, enforcing **token budgets** over a time window alongside classic request-rate limits.
-Budgets can vary by group, so different tiers of users get different ceilings.
-
-Usage is also exposed through a read-only counters endpoint that the [console](#console-the-ai-gateway-ui)
-polls, giving operators a live view of who is consuming how many tokens. Token counting is
-configured with an `AITokenRateLimitPolicy` and keys its accounting on the identity
-established by authentication.
+Budgets vary by group, so different tiers of users get different ceilings. Usage is also exposed
+through a read-only counters endpoint that the [console](#console-the-ai-gateway-ui) polls.
+Token counting is configured with an `AITokenRateLimitPolicy` and keys its accounting on the
+identity established by authentication.
 
 → [Token Rate Limiting — `AITokenRateLimitPolicy`](ai-gateway.md#token-rate-limiting--aitokenratelimitpolicy)
 
 ## Model Routing
 
-Model routing inspects the incoming request, reads the requested **model**, and steers it to
-a backend organised by **quality/cost tier** — for example a premium tier on high-end GPUs, a
-standard tier on smaller accelerators, and an economy tier on quantised or CPU hardware. This
-turns the model name in each request into a cost-and-quality control: expensive hardware
-serves only the requests that should reach it, and everything else lands on cheaper backends.
-
-Tiers can be gated by the caller's verified group, so entitlement decides which callers may
-reach which tier, and a caller who asks for a tier they aren't entitled to can be downgraded
-to one they are. Model routing is configured with an `AIModelRoutePolicy` and composes with
+Model routing reads the requested **model** from each incoming request and steers it to a
+backend organized by **quality/cost tier** — for example a premium tier on high-end GPUs, a
+standard tier on smaller accelerators, and an economy tier on quantized or CPU hardware. This
+turns the model name into a cost-and-quality control: expensive hardware serves only the
+requests entitled to it, and everything else lands on cheaper backends. Tiers can be gated by
+the caller's verified group, and a caller who asks for a tier they aren't entitled to is
+downgraded to one they are. Configured with an `AIModelRoutePolicy`; composes with
 authentication and token budgets on the same route.
 
 → [Model-Based (Quality/Cost Tier) Routing](model-routing.md)
+
+## Guardrails & DLP
+
+Guardrails add the **content-inspection** layer: stop secrets, PII, and known attacks from
+entering prompts, tool arguments, and agent messages — and, optionally, leaking back out. This
+runs on the data plane already in place: the SE's native **WAF** (ModSecurity-based) does the
+regex matching and request/response-body inspection. No proxy, no sidecar, no model in the path.
+
+An `AIGuardrailPolicy` ships pre-canned **profiles** per surface — `BlockLLM` (DLP +
+prompt-injection signatures), `BlockMCP` (DLP + tool-abuse: command-injection / path-traversal /
+SSRF), and `BlockLLMAndMCP` — so an operator drops one CR per route or gateway, and AKO authors
+the Avi WafPolicy from it and attaches it to the route's virtual service. AKO maintains a
+built-in **signature library** (secret detectors for AWS/GCP/OpenAI/GitHub/Slack keys, private
+keys, JWTs; PII detectors for SSN, credit-card, email; prompt-injection patterns; MCP tool-abuse
+patterns), plus per-policy keyword denylists and custom regex. The prompt-injection detectors
+are evasion-resistant: each runs a normalized pass (lowercase, URL/unicode-decode, whitespace
+removal) and a base64-decode pass, so spaced-out text, zero-width tricks, and `%`-encoding are
+caught. A mode-delegation trick keeps `Block` vs `Log` (shadow) a per-rule flip — which is what
+the console's DLP toggle drives.
+
+The AKO side is built, and request-body DLP blocking is **verified by spike**: an AWS key, SSN,
+or API secret in a prompt returned `403` while a clean prompt passed. Being signature/regex
+based, this layer catches known patterns but cannot do semantic detection — see below.
+
+→ [Guardrails & DLP — `AIGuardrailPolicy`](ai-gateway-guardrails.md)
 
 ## MCP (agent↔tool)
 
 MCP support extends the same governance to **agent↔tool** traffic. Agents call tools over the
 Model Context Protocol, and the gateway fronts those tool servers through a dedicated **MCP
-Gateway**: it keeps stateful agent sessions pinned to the right backend (using Avi 32.1.1's
-native MCP session awareness), authenticates callers against the **same identity provider** as
-the LLM gateway, and authorizes individual tool calls by the caller's role — so different job
-roles get access to different tools.
+Gateway** that keeps stateful agent sessions pinned to the right backend (using Avi 32.1.1's
+native MCP session awareness) and brings tool traffic under the same identity and policy model
+as the LLM gateway.
 
-Tool servers are onboarded from an **approved MCP registry**, a curated catalog of vetted
-servers that the gateway treats as an allow-list. This brings the agent loop's tool half under
-one identity and one governance model. MCP is configured with an `AIMCPRoutePolicy`; the AKO
-controller and translator are wired, with the design continuing to evolve against Avi's native
-MCP features.
+**Tool authentication and authorization.** An agent calling a tool authenticates exactly as it
+calls a model: a bearer JWT (the `jwtQuery` machine-client mode) validated at the Service Engine
+against the **same identity provider** as the LLM gateway — so one agent carries one verified
+identity across both its inference and its tool calls, and the same `sub` / `group` / `role`
+claims are in scope for both. The verified **role** then drives **per-tool authorization**: the
+`AIMCPRoutePolicy` maps roles to the tools they may invoke, so a single MCP server can expose
+different tool subsets to different job roles, and a call to a tool the caller's role isn't
+entitled to is rejected before it reaches the backend. Two gates stack here — the **approved MCP
+registry** is the *server-level* allow-list (which tool servers may be fronted at all), and
+role-based tool auth is the *call-level* gate (which tools a given caller may actually invoke on
+them).
+
+Configured with an `AIMCPRoutePolicy`. The controller and translator are wired and working, and
+the MCP Gateway is callable today.
 
 → [MCP Gateway & MCP-Specific Routes](ai-gateway-mcp.md)
 
-## A2A (agent↔agent)
+---
 
-A2A governs the third surface: agents calling **other agents** — delegation and task hand-off
-between independent agentic systems over the **Agent2Agent** protocol (JSON-RPC over HTTPS). A
-dedicated **A2A Gateway** authenticates callers against the same identity provider, authorizes
-**per-skill** (each Agent Card advertises `skills[]`), keeps long-running stateful **tasks**
-pinned to the right backend via session affinity, and governs **push-notification egress** so
-agents can only call back approved webhooks.
+## On the roadmap
 
-Unlike MCP — which Avi 32.1.1 supports natively — A2A has **no native Avi support** and is
-built from generic Avi primitives plus DataScripts, making it architecturally closer to model
-routing. It is specified by a new `AIA2ARoutePolicy` CRD and completes the
-"govern the whole agent loop under one identity" thesis. It is a design draft, not yet
-implemented.
+The following are specified but not yet built. They are included here so the full
+"govern the whole agent loop" thesis is legible — not as shipping features.
 
-→ [A2A Gateway & Agent-to-Agent Routes](ai-gateway-a2a.md)
+### Semantic Guardrails
 
-## Guardrails & DLP
-
-Guardrails add the **content-inspection** layer: stop secrets, PII, and known attacks from
-entering prompts, tool arguments, and agent messages — and (optionally) leaking back out.
-Crucially, this runs on the data plane already in place: the Avi Service Engine's native
-**WAF** (ModSecurity-based) does the regex matching and request/response-body inspection, so
-there is **no proxy, no sidecar, and no model in the hot path**.
-
-An `AIGuardrailPolicy` ships pre-canned **profiles** per surface — `BlockLLM` (DLP +
-prompt-injection signatures), `BlockMCP` (DLP + tool-abuse: command-injection / path-traversal
-/ SSRF), and `BlockLLMAndMCP` — so an operator drops one CR per route or gateway. AKO **authors**
-the Avi WafPolicy from the spec over REST and attaches it to the route's virtual service.
-
-AKO maintains a **built-in signature library** so the profiles work out of the box: **secret**
-detectors (AWS / GCP / OpenAI / GitHub / Slack keys, private keys, JWTs), **PII** detectors
-(SSN, credit-card, email), **prompt-injection** patterns (ignore-instructions, jailbreak,
-reveal-system-prompt, override-safety, role-injection), and **MCP tool-abuse** patterns —
-plus per-policy keyword denylists and custom regex. The prompt-injection detectors are
-**evasion-resistant ("hardened")**: each emits a normalised pass (lowercase + URL/unicode-decode
-+ whitespace removal, so `i g n o r e`, zero-width tricks, and `%`-encoding are caught) and a
-base64-decode pass. Each detector compiles to request-phase (phase 2, `ARGS|REQUEST_BODY`)
-and/or response-phase (phase 4, `RESPONSE_BODY`) SecRules, and a **mode-delegation** trick keeps
-the policy in detection-only while the AKO rules enforce — so `Block` vs `Log` (shadow) is a
-per-rule flip, which is exactly what the console's DLP toggle drives.
-
-The AKO side is built; request-body DLP blocking is spike-verified (an AWS key / SSN / API
-secret in a prompt returned 403 while a clean prompt passed). The WAF layer is signature/regex
-based — it catches known patterns but cannot do semantic detection (see below).
-
-→ [Guardrails & DLP — `AIGuardrailPolicy`](ai-gateway-guardrails.md)
-
-## Semantic Guardrails
-
-Semantic guardrails are the model-based half of `AIGuardrailPolicy`: a **prompt-injection
-classifier** the Service Engine calls over **ICAP** to catch the **novel / paraphrased**
-injection the signature (WAF) layer provably misses. It preserves the no-proxy thesis — the SE
-buffers the request body and *calls* the classifier as a service (exactly as it already calls
-the OIDC issuer), then **the SE enforces** the block; the model is never a proxy in the request
-path. This is a design draft; nothing is built yet.
+The model-based half of `AIGuardrailPolicy`: a **prompt-injection classifier** the SE calls over
+**ICAP** to catch the novel/paraphrased injection the signature layer provably misses. It
+preserves the no-proxy model — the SE buffers the request body and *calls* the classifier as a
+service (as it already calls the OIDC issuer), then the SE enforces the block; the model is
+never a proxy in the request path. **In design**; nothing built yet.
 
 → [Semantic Guardrails (prompt-injection over ICAP)](ai-gateway-guardrails-semantic.md)
 
-## Backend mTLS (SPIFFE/SPIRE)
+### A2A (agent↔agent)
 
-Authentication secures the **north-bound** hop (caller → gateway); backend mTLS secures the
-**south-bound** hop (gateway → model/tool backend). The Service Engine presents a client
-certificate to local inference pools and MCP servers and validates theirs, with both sides
-using **SPIFFE SVIDs** issued by **SPIRE** — short-lived, automatically rotated workload
-identity rather than long-lived shared certs. So a leaked cert is useless within minutes, and
-backends can refuse anything that isn't the gateway.
+A2A governs the third surface: agents calling **other agents** — delegation and task hand-off
+over the Agent2Agent protocol (JSON-RPC over HTTPS). A dedicated **A2A Gateway** authenticates
+against the same identity provider, authorizes **per-skill** (each Agent Card advertises
+`skills[]`), pins long-running stateful tasks via session affinity, and governs
+push-notification egress so agents can only call approved webhooks. Unlike MCP — which Avi
+32.1.1 supports natively — A2A has no native Avi support and is built from generic primitives
+plus DataScripts, making it architecturally closer to model routing. Specified by a new
+`AIA2ARoutePolicy`. **In design**, not yet implemented.
 
-This extends the already-implemented `RouteBackendExtension.BackendTLS` (which does one-way TLS
-with server validation today) with an `seClientCert` field for the SE's client cert, plus a
-small controller that pulls the SE's SVID from SPIRE and rotates it into Avi at half-life. It is
-a design draft; the make-or-break open question is whether the Avi pool can pin a SPIFFE **URI
-SAN** rather than just a DNS name (spike-gated).
+→ [A2A Gateway & Agent-to-Agent Routes](ai-gateway-a2a.md)
+
+### Backend mTLS (SPIFFE/SPIRE)
+
+Authentication secures the north-bound hop (caller → gateway); backend mTLS secures the
+south-bound hop (gateway → backend). The SE presents a client certificate to inference pools and
+MCP servers and validates theirs, with both sides using **SPIFFE SVIDs** issued by **SPIRE** —
+short-lived, auto-rotated workload identity rather than long-lived shared certs. It extends the
+implemented `RouteBackendExtension.BackendTLS` (one-way TLS today) with an `seClientCert` field,
+plus a small controller that pulls the SE's SVID from SPIRE and rotates it at half-life. **In
+design**; the make-or-break open question — whether the Avi pool can pin a SPIFFE **URI SAN**
+rather than just a DNS name — is *spike-gated*.
 
 → [Backend mTLS with SPIFFE/SPIRE](ai-gateway-backend-mtls.md)
 
-## Multi-Site (cross-cluster) delivery
+### Multi-Site (cross-cluster) delivery
 
 Multi-site delivery routes an inference request to the right **model tier** *and* the right
-**site**, across a fleet of Kubernetes clusters, by composing three existing Broadcom/Avi
-capabilities: the per-cluster AI Gateway, model-based tier routing, and **AMKO + Avi GSLB**
-global server load balancing. GPUs are scarce, expensive, and scattered across clusters and
-regions; this layer lets the gateway understand *which model* a request wants and deliver it to
-the *best site* that can serve it — without introducing a new data plane. It is a design draft;
-cross-site behaviour is spike-gated.
+**site** across a fleet of clusters, by composing three existing capabilities: the per-cluster
+AI Gateway, model-based tier routing, and **AMKO + Avi GSLB** global server load balancing. GPUs
+are scarce and scattered across clusters and regions; this layer delivers a request to the best
+site that can serve the model it wants, without a new data plane. **In design**; cross-site
+behavior is *spike-gated*.
 
 → [Multi-Site (Cross-Cluster) Model Delivery](ai-gateway-multisite.md)
 
+---
+
 ## Console — the AI Gateway UI
 
-The AI Gateway ships with an **Avi-Controller-style web console** that makes the whole gateway
-visible and operable without hand-editing YAML. It is a single static Go binary with an
-embedded Clarity-style SPA, hand-styled to match Avi's dark navy/teal look, and it talks to the
-cluster through its own ServiceAccount + RBAC (real CRD reads and writes) and to the Avi
-controller's read-only REST API for live data-plane state. It lives in a **companion repo**
-(`gricec1981/ai-gateway-ui`), separate from AKO.
+The gateway ships with an **Avi-Controller-style web console** that makes the whole gateway
+visible and operable without hand-editing YAML. It is a single static Go binary with an embedded
+Clarity-style SPA, styled to match Avi's look, talking to the cluster through its own
+ServiceAccount + RBAC and to the Avi Controller's read-only REST API for live data-plane state.
+It lives in a companion repo (`gricec1981/ai-gateway-ui`), separate from AKO. **Available.**
 
-What the console gives operators:
-
-- **Dashboard → Topology.** A live left→right graph of **Avi Service Engine → Gateways
-  (LLM/MCP) → backends**, with healthy/down connector edges, a KPI strip, and auto-refresh —
-  assembled from real SE health, virtual-service oper status, and HTTPRoute backend refs.
-- **Dashboard → Live Counters.** Real-time per-consumer / per-group token usage against
-  budgets, mirroring the same `X-*-Tokens` accounting the Service Engine enforces (alice/carol
-  → 429 at the group budget, dave with no policy → 403).
-- **Auth.** List and edit `AITokenRateLimitPolicy` objects cluster-wide and the
-  `AIModelRoutePolicy` tier/entitlement policies, with a green/red dot reflecting the target
-  route's `Accepted` condition. Identities are pulled live from the OIDC issuer, not a static
-  list.
-- **Models.** List and create `InferencePool`s.
-- **Gateways.** List Gateways (with attached-route counts, Programmed status, and an MCP flag),
-  create LLM or MCP gateways, and flip a **per-gateway DLP toggle** — checked = enforcing
-  (`AIGuardrailPolicy` `action: Block`), unchecked = shadow/detect-only (`Log`), an
-  instantly-reversible patch. Sub-tabs surface **Inference** (live Avi pool-group member ratios
-  per model pod, the weights AKO steers from vLLM metrics) and **MCP**.
-- **MCP Registry & MCP Routes.** Browse the **approved MCP-server allow-list** (with
-  reachability probes), and create/edit/delete the HTTPRoutes that load-balance MCP traffic
-  through an MCP gateway — in-cluster servers point at their Service directly, public servers
-  get an auto-created ExternalName Service, with a listener-hostname guardrail that keeps routes
-  from being rejected.
-
-The console has been deployed in-cluster and verified against real OIDC traffic; it is accessed
-in the demo environment via `kubectl port-forward` (a self-healing port-forward loop).
+It gives operators a live **topology** (SE → gateways → backends with health edges), **live
+token counters** per consumer/group against budgets, editing of the auth/token-rate and model-
+routing policies, `InferencePool` management, gateway creation, an **approved MCP-server
+registry** with reachability probes, and a per-gateway **DLP toggle** (enforce vs shadow) backed
+by the mode-delegation flip described under Guardrails. It is deployed in-cluster and verified
+against real OIDC traffic; in the demo environment it is reached via `kubectl port-forward`.
 
 ---
 
 ## Getting started
 
-- [AI Gateway install guide](ai-gateway-install.md) — enable the feature and apply the auth
-  and token-counting policies.
-- [Inference install guide](inference-install.md) — set up `InferencePool`-based inference
-  load balancing.
+- [AI Gateway install guide](ai-gateway-install.md) — enable the feature and apply the auth and
+  token-counting policies.
+- [Inference install guide](inference-install.md) — set up `InferencePool`-based inference load
+  balancing.
 
 ## Related docs
 
-- [AI Gateway Authentication](ai-gateway-auth.md) — `AIGatewayAuthPolicy`, `oauthBrowser` + `jwtQuery` modes
+- [Native Inference Extension](inference-extension.md) — metric-weighted load balancing
+- [AI Gateway Authentication](ai-gateway-auth.md) — `AIGatewayAuthPolicy`, `oauthBrowser` + `jwtQuery`
 - [AI Gateway](ai-gateway.md) — authentication and token counting reference
 - [Model-Based Routing](model-routing.md) — quality/cost tier routing
-- [Native Inference Extension](inference-extension.md) — metric-weighted load balancing
 - [MCP Gateway](ai-gateway-mcp.md) — agent↔tool traffic governance
-- [A2A Gateway](ai-gateway-a2a.md) — agent↔agent traffic governance
 - [Guardrails & DLP](ai-gateway-guardrails.md) · [Semantic Guardrails](ai-gateway-guardrails-semantic.md) — content inspection
+- [A2A Gateway](ai-gateway-a2a.md) — agent↔agent traffic governance
 - [Backend mTLS](ai-gateway-backend-mtls.md) — SE↔backend mutual TLS with SPIFFE/SPIRE
 - [Multi-Site Delivery](ai-gateway-multisite.md) — cross-cluster model routing
 - [Release Notes](ai-gateway-release-notes.md) — what shipped, by date
