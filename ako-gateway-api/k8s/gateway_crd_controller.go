@@ -77,6 +77,14 @@ func (c *GatewayController) SetupCRDEventHandlers(numWorkers uint32) {
 				numWorkers,
 			)
 		}
+		if c.dynamicInformers.AIGuardrailPolicyInformer != nil {
+			aigateway.SetupGuardrailPolicyEventHandlers(
+				c.dynamicInformers.AIGuardrailPolicyInformer,
+				dynClient,
+				c.workqueue,
+				numWorkers,
+			)
+		}
 	}
 }
 

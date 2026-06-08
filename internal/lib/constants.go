@@ -123,6 +123,7 @@ const (
 	AITokenRateLimitPolicy                     = "AITokenRateLimitPolicy"
 	AIModelRoutePolicy                         = "AIModelRoutePolicy"
 	AIMCPRoutePolicy                           = "AIMCPRoutePolicy"
+	AIGuardrailPolicy                          = "AIGuardrailPolicy"
 	TCPRoute                                   = "TCPRoute"
 	TLSRoute                                   = "TLSRoute"
 	UDPRoute                                   = "UDPRoute"

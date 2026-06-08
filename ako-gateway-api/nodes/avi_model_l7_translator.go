@@ -197,6 +197,11 @@ func (o *AviObjectGraph) BuildChildVS(key string, routeModel RouteModel, parentN
 		for _, mcpPolicy := range ps.GetMCPRoutePoliciesForRoute(routeNsName) {
 			ApplyMCPRoutePolicy(key, mcpPolicy, childNode, authHost)
 		}
+		// Guardrails/DLP: author the Avi WafPolicy from the spec and attach it to
+		// the VS (waf_policy_ref). Applies to inference and MCP routes alike.
+		for _, guardrailPolicy := range ps.GetGuardrailPoliciesForRoute(routeNsName) {
+			aigateway.ApplyGuardrailPolicy(key, guardrailPolicy, childNode)
+		}
 	}
 
 	foundEvhModel := nodes.FindAndReplaceEvhInModel(childNode, parentNode, key)

@@ -133,7 +133,7 @@ func ApplyAuthPolicy(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVs
 //     RateLimiters []*models.RateLimiter and call avi.vs.rate_limiter() for
 //     the native distributed rate limiter.
 //   - token limits:     two AviHTTPDataScriptNode entries (HTTP_REQ enforcement
-//     + HTTP_RESP accounting) are added to the VS's HTTPDSrefs slice.
+//   - HTTP_RESP accounting) are added to the VS's HTTPDSrefs slice.
 //     Names are scoped to the VS to avoid collisions across policies.
 func ApplyTokenRateLimitPolicy(key string, policy *AITokenRateLimitPolicy, vsNode nodes.AviVsEvhSniModel) {
 	if policy == nil {
@@ -179,6 +179,24 @@ func ApplyTokenRateLimitPolicy(key string, policy *AITokenRateLimitPolicy, vsNod
 
 	utils.AviLog.Infof("key: %s, msg: AITokenRateLimitPolicy %s/%s: registered token-accounting DataScripts on VS %s",
 		key, policy.Namespace, policy.Name, vsName)
+}
+
+// ApplyGuardrailPolicy authors the Avi WafPolicy for the guardrail spec (DLP +
+// prompt-injection signatures) and attaches it to the VS via waf_policy_ref. The
+// authoring is what AKO adds — attachment could also be done with the L7Rule CRD,
+// but L7Rule only references a WafPolicy by name; nothing else creates it.
+func ApplyGuardrailPolicy(key string, policy *AIGuardrailPolicy, vsNode nodes.AviVsEvhSniModel) {
+	if policy == nil {
+		return
+	}
+	name, err := EnsureGuardrailWafPolicy(key, policy)
+	if err != nil {
+		utils.AviLog.Warnf("key: %s, msg: AIGuardrailPolicy %s/%s: %v", key, policy.Namespace, policy.Name, err)
+		return
+	}
+	vsNode.SetWafPolicyRef(proto.String("/api/wafpolicy?name=" + name))
+	utils.AviLog.Infof("key: %s, msg: AIGuardrailPolicy %s/%s: attached WAF guardrail %s on VS %s",
+		key, policy.Namespace, policy.Name, name, vsNode.GetName())
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
