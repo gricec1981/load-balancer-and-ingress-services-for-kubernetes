@@ -333,6 +333,8 @@ Where we stay credible and escalate to a model:
   an external **guardrail service** (ICAP content-adaptation, or an ext-authz-style hook),
   keeping the SE as the enforcement point and the model a callable service (same shape as the
   OIDC issuer the SE already calls). Or a future **native SE AI-guardrail** (RFE — check 32.1.1+).
+  **Designed in detail:** [ai-gateway-guardrails-semantic.md](ai-gateway-guardrails-semantic.md)
+  (classifier over ICAP REQMOD; `AIGuardrailPolicy.semantic` knob).
 - **Free-text PII** (names, addresses) — not fixed-format → needs NER, not regex.
 - **Redaction / masking** — the WAF **blocks**; inline body masking is harder (WAF data-masking
   is mostly for logs). Block now; redact later.
@@ -441,7 +443,7 @@ Mirrors how `AIModelRoutePolicy` was wired (`c05fc5bc` → `a2e7b995` → `40477
 | 3 | OWASP CRS with surface-aware auto-exclusions | Design; Spike-3 |
 | 3 | Prompt-injection signature rules | Design; Spike-4 (started) |
 | 3.x | Response-body DLP (non-streaming) | Design; Spike-5 |
-| 4 | Semantic guardrails via callable model service (ICAP / ext-authz) | Idea (§11) |
+| 4 | Semantic guardrails via callable model service (ICAP / ext-authz) | **Designed** — [ai-gateway-guardrails-semantic.md](ai-gateway-guardrails-semantic.md) |
 | 4 | Redaction/masking (vs block) | Idea |
 | 4 | Native SE AI-guardrails (if a future build ships them) | Idea / RFE |
 
@@ -449,6 +451,7 @@ Mirrors how `AIModelRoutePolicy` was wired (`c05fc5bc` → `a2e7b995` → `40477
 
 ## 16. Related docs
 
+- [Semantic Guardrails](ai-gateway-guardrails-semantic.md) — the semantic prompt-injection layer (classifier over ICAP) that escalates from these signatures
 - [AI Gateway](ai-gateway.md) — the policy family this joins; DataScript composition
 - [Model-Based Routing](model-routing.md) — reads the same request body the WAF screens
 - [MCP Gateway](ai-gateway-mcp.md) / [A2A Gateway](ai-gateway-a2a.md) — the other two surfaces the fleet baseline covers

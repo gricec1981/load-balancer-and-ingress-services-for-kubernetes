@@ -8,3 +8,8 @@ cover-*.out
 .vscode
 *.lock
 *.tgz
+# AI Gateway: internal-only memos (competitive/GTM — not for the AKO repo) + Office temp/render artifacts
+docs/gateway-api/ai-gateway-multicluster-strategy.md
+docs/gateway-api/ai-gateway-multisite-opportunity.md
+docs/gateway-api/_brief.html
+~$*.html
