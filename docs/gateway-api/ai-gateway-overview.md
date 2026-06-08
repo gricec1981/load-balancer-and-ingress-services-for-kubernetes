@@ -25,44 +25,6 @@ path.
 
 ---
 
-## Status ladder
-
-Every capability is labeled with one of these, and only these:
-
-- **Available** — built and callable in the gateway today.
-- **Verified by spike** — built and confirmed against Avi by a proof-of-concept.
-- **In design** — specified, not yet built. Some carry an open spike that gates feasibility,
-  noted inline as *spike-gated*.
-
----
-
-## What's supported today
-
-| Capability | What it provides | Status |
-|---|---|---|
-| [Inference](#inference) | Metric-weighted load balancing across model-server pods | **Available** |
-| [Authentication](#authentication) | JWT/OIDC validation for browser **and** machine clients, with verified identity/claims | **Available** |
-| [Token Counting](#token-counting) | Per-consumer / per-group token budgets, counters, rate limits | **Available** |
-| [Model Routing](#model-routing) | Model-aware routing to quality/cost tiers, with entitlements | **Available** |
-| [Guardrails & DLP](#guardrails--dlp) | WAF-native data-loss prevention and content guardrails | **Available** · request-body DLP verified by spike |
-| [MCP](#mcp-agenttool) | The same governance for agent↔tool (Model Context Protocol) traffic | **Available** |
-| [Console (UI)](#console-the-ai-gateway-ui) | Avi-style web console to view and drive the gateway | **Available** (companion repo) |
-| [Semantic Guardrails](#semantic-guardrails) | Model-based prompt-injection detection over ICAP | **In design** |
-| [A2A](#a2a-agentagent) | Governance for agent↔agent (Agent2Agent) delegation traffic | **In design** |
-| [Backend mTLS](#backend-mtls-spiffespire) | SE↔backend mutual TLS with SPIFFE/SPIRE short-lived identity | **In design** · spike-gated |
-| [Multi-Site Delivery](#multi-site-cross-cluster-delivery) | Cross-cluster model routing via AMKO + Avi GSLB | **In design** · spike-gated |
-
-The agent loop has three governance surfaces; the gateway covers all three with the same
-identity:
-
-| Surface | Protocol | Governed by | Status |
-|---|---|---|---|
-| agent ↔ model | OpenAI-style HTTP | [Authentication](#authentication) + [Model Routing](#model-routing) | **Available** |
-| agent ↔ tool | MCP (JSON-RPC + Streamable HTTP) | [MCP Gateway](#mcp-agenttool) | **Available** |
-| agent ↔ agent | A2A (JSON-RPC over HTTPS) | [A2A Gateway](#a2a-agentagent) | **In design** |
-
----
-
 ## What you actually run
 
 The "no new data plane" claim is specifically about the **request hot path**: no proxy or
@@ -73,6 +35,45 @@ calls the OIDC issuer), a SPIRE server plus a small SVID-rotation controller for
 and AMKO for multi-site delivery. None sit in the request path, but they are real things to run.
 
 ---
+
+# Available
+
+The following capabilities are built and callable in the gateway today.
+
+| Capability | What it provides |
+|---|---|
+| [Console (UI)](#console--the-ai-gateway-ui) | Avi-style web console to view and drive the entire gateway |
+| [Inference](#inference) | Metric-weighted load balancing across model-server pods |
+| [Authentication](#authentication) | JWT/OIDC validation for browser **and** machine clients, with verified identity/claims |
+| [Token Counting](#token-counting) | Per-consumer / per-group token budgets, counters, rate limits |
+| [Model Routing](#model-routing) | Model-aware routing to quality/cost tiers, with entitlements |
+| [Guardrails & DLP](#guardrails--dlp) | WAF-native data-loss prevention and content guardrails |
+| [MCP](#mcp-agenttool) | The same governance for agent↔tool (Model Context Protocol) traffic |
+
+The agent loop has three governance surfaces; the gateway covers the first two today:
+
+| Surface | Protocol | Governed by | Status |
+|---|---|---|---|
+| agent ↔ model | OpenAI-style HTTP | [Authentication](#authentication) + [Model Routing](#model-routing) | **Available** |
+| agent ↔ tool | MCP (JSON-RPC + Streamable HTTP) | [MCP Gateway](#mcp-agenttool) | **Available** |
+| agent ↔ agent | A2A (JSON-RPC over HTTPS) | [A2A Gateway](#a2a-agentagent) | **Planned** |
+
+---
+
+## Console — the AI Gateway UI
+
+The gateway ships with an **Avi-Controller-style web console** that makes the whole gateway
+visible and operable without hand-editing YAML. It is a single static Go binary with an embedded
+Clarity-style SPA, styled to match Avi's look, talking to the cluster through its own
+ServiceAccount + RBAC and to the Avi Controller's read-only REST API for live data-plane state.
+It lives in a companion repo (`gricec1981/ai-gateway-ui`), separate from AKO. **Available.**
+
+It gives operators a live **topology** (SE → gateways → backends with health edges), **live
+token counters** per consumer/group against budgets, editing of the auth/token-rate and model-
+routing policies, `InferencePool` management, gateway creation, an **approved MCP-server
+registry** with reachability probes, and a per-gateway **DLP toggle** (enforce vs shadow) backed
+by the mode-delegation flip described under Guardrails. It is deployed in-cluster and verified
+against real OIDC traffic; in the demo environment it is reached via `kubectl port-forward`.
 
 ## Inference
 
@@ -119,7 +120,7 @@ The gateway meters **token usage**, not just request count. It reads token count
 responses and maintains running counters per consumer and per group in Service Engine shared
 state, enforcing **token budgets** over a time window alongside classic request-rate limits.
 Budgets vary by group, so different tiers of users get different ceilings. Usage is also exposed
-through a read-only counters endpoint that the [console](#console-the-ai-gateway-ui) polls.
+through a read-only counters endpoint that the [console](#console--the-ai-gateway-ui) polls.
 Token counting is configured with an `AITokenRateLimitPolicy` and keys its accounting on the
 identity established by authentication.
 
@@ -190,12 +191,21 @@ the MCP Gateway is callable today.
 
 ---
 
-## On the roadmap
+# Planned
 
 The following are specified but not yet built. They are included here so the full
 "govern the whole agent loop" thesis is legible — not as shipping features.
 
-### Semantic Guardrails
+| Capability | What it provides |
+|---|---|
+| [Semantic Guardrails](#semantic-guardrails) | Model-based prompt-injection detection over ICAP |
+| [A2A](#a2a-agentagent) | Governance for agent↔agent (Agent2Agent) delegation traffic |
+| [Backend mTLS](#backend-mtls-spiffespire) | SE↔backend mutual TLS with SPIFFE/SPIRE short-lived identity · *spike-gated* |
+| [Multi-Site Delivery](#multi-site-cross-cluster-delivery) | Cross-cluster model routing via AMKO + Avi GSLB · *spike-gated* |
+
+---
+
+## Semantic Guardrails
 
 The model-based half of `AIGuardrailPolicy`: a **prompt-injection classifier** the SE calls over
 **ICAP** to catch the novel/paraphrased injection the signature layer provably misses. It
@@ -205,7 +215,7 @@ never a proxy in the request path. **In design**; nothing built yet.
 
 → [Semantic Guardrails (prompt-injection over ICAP)](ai-gateway-guardrails-semantic.md)
 
-### A2A (agent↔agent)
+## A2A (agent↔agent)
 
 A2A governs the third surface: agents calling **other agents** — delegation and task hand-off
 over the Agent2Agent protocol (JSON-RPC over HTTPS). A dedicated **A2A Gateway** authenticates
@@ -218,7 +228,7 @@ plus DataScripts, making it architecturally closer to model routing. Specified b
 
 → [A2A Gateway & Agent-to-Agent Routes](ai-gateway-a2a.md)
 
-### Backend mTLS (SPIFFE/SPIRE)
+## Backend mTLS (SPIFFE/SPIRE)
 
 Authentication secures the north-bound hop (caller → gateway); backend mTLS secures the
 south-bound hop (gateway → backend). The SE presents a client certificate to inference pools and
@@ -231,7 +241,7 @@ rather than just a DNS name — is *spike-gated*.
 
 → [Backend mTLS with SPIFFE/SPIRE](ai-gateway-backend-mtls.md)
 
-### Multi-Site (cross-cluster) delivery
+## Multi-Site (cross-cluster) delivery
 
 Multi-site delivery routes an inference request to the right **model tier** *and* the right
 **site** across a fleet of clusters, by composing three existing capabilities: the per-cluster
@@ -241,23 +251,6 @@ site that can serve the model it wants, without a new data plane. **In design**;
 behavior is *spike-gated*.
 
 → [Multi-Site (Cross-Cluster) Model Delivery](ai-gateway-multisite.md)
-
----
-
-## Console — the AI Gateway UI
-
-The gateway ships with an **Avi-Controller-style web console** that makes the whole gateway
-visible and operable without hand-editing YAML. It is a single static Go binary with an embedded
-Clarity-style SPA, styled to match Avi's look, talking to the cluster through its own
-ServiceAccount + RBAC and to the Avi Controller's read-only REST API for live data-plane state.
-It lives in a companion repo (`gricec1981/ai-gateway-ui`), separate from AKO. **Available.**
-
-It gives operators a live **topology** (SE → gateways → backends with health edges), **live
-token counters** per consumer/group against budgets, editing of the auth/token-rate and model-
-routing policies, `InferencePool` management, gateway creation, an **approved MCP-server
-registry** with reachability probes, and a per-gateway **DLP toggle** (enforce vs shadow) backed
-by the mode-delegation flip described under Guardrails. It is deployed in-cluster and verified
-against real OIDC traffic; in the demo environment it is reached via `kubectl port-forward`.
 
 ---
 
