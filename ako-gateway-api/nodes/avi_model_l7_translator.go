@@ -189,23 +189,31 @@ func (o *AviObjectGraph) BuildChildVS(key string, routeModel RouteModel, parentN
 				break
 			}
 		}
+		// The auth mode (OAuth browser vs stateless JWT-in-query) is set by the
+		// route's AIGatewayAuthPolicy and dictates how every claim-reading
+		// DataScript (model entitlements, MCP tool-RBAC, token budgets) decodes
+		// claims, so resolve it before applying the claim-consuming policies.
+		claimMode := aigateway.ClaimModeOAuth
 		for _, authPolicy := range ps.GetAuthPoliciesForRoute(routeNsName) {
 			aigateway.ApplyAuthPolicy(key, authPolicy, childNode, authHost, routePrefix)
+			if authPolicy.Spec.EffectiveAuthMode() == aigateway.ClaimModeJWTQuery {
+				claimMode = aigateway.ClaimModeJWTQuery
+			}
 		}
 		// Model routing must run before token rate limiting: it sets the ai_tier
 		// reqvar (in HTTP_REQ_DATA) that per-tier token budgets read, and lower
 		// DataScript index = runs first.
 		for _, modelPolicy := range ps.GetModelRoutePoliciesForRoute(routeNsName) {
-			o.ApplyModelRoutePolicy(key, modelPolicy, childNode, parentNsName, routeModel, rule)
+			o.ApplyModelRoutePolicy(key, modelPolicy, childNode, parentNsName, routeModel, rule, claimMode)
 		}
 		for _, tokenPolicy := range ps.GetTokenRateLimitPoliciesForRoute(routeNsName) {
-			aigateway.ApplyTokenRateLimitPolicy(key, tokenPolicy, childNode)
+			aigateway.ApplyTokenRateLimitPolicy(key, tokenPolicy, childNode, claimMode)
 		}
 		// MCP routes: attach the native MCP application profile + session
 		// DataScript, the shared-IdP OAuth graph (via authRef), and the per-role
 		// tool-authorization DataScript.
 		for _, mcpPolicy := range ps.GetMCPRoutePoliciesForRoute(routeNsName) {
-			ApplyMCPRoutePolicy(key, mcpPolicy, childNode, authHost, routePrefix)
+			ApplyMCPRoutePolicy(key, mcpPolicy, childNode, authHost, routePrefix, claimMode)
 		}
 		// Guardrails/DLP: author the Avi WafPolicy from the spec and attach it to
 		// the VS (waf_policy_ref). Applies to inference and MCP routes alike.

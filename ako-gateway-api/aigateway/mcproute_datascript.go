@@ -129,7 +129,7 @@ type MCPToolAuthScripts struct {
 // alone. The decision tables (ROLE_STAR / ALLOW / ALLOW_PFX) and ROLE_CLAIM are
 // baked in as Lua constants, exactly as GenerateModelRouteScripts bakes its
 // model→tier tables.
-func GenerateMCPToolAuthScripts(policy *AIMCPRoutePolicy) MCPToolAuthScripts {
+func GenerateMCPToolAuthScripts(policy *AIMCPRoutePolicy, mode AuthClaimMode) MCPToolAuthScripts {
 	spec := policy.Spec
 	if spec.ToolAccess == nil || len(spec.ToolAccess.Rules) == 0 {
 		return MCPToolAuthScripts{}
@@ -153,7 +153,7 @@ func GenerateMCPToolAuthScripts(policy *AIMCPRoutePolicy) MCPToolAuthScripts {
 
 	// ── Helpers (json_str + jwt_claim) ───────────────────────────────────────
 	b.WriteString(jsonStrHelper())
-	b.WriteString(jwtClaimHelper())
+	b.WriteString(jwtClaimHelper(mode))
 	b.WriteString("\n")
 
 	// ── Read body + extract method and tool name ─────────────────────────────

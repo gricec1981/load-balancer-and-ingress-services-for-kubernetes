@@ -42,10 +42,41 @@ type AIGatewayAuthPolicy struct {
 	Status AIGatewayAuthPolicyStatus `json:"status,omitempty"`
 }
 
+// AuthClaimMode selects how the Avi SE validates the caller's JWT and how the
+// AKO DataScripts read its (validated) claims. The two modes are mutually
+// exclusive on the current Avi build — see docs/gateway-api/ai-gateway-auth.md.
+//
+// The zero value is ClaimModeOAuth, so any path that does not explicitly thread a
+// mode falls back to the OAuth flow and never decode-and-trusts a query token.
+type AuthClaimMode int
+
+const (
+	// ClaimModeOAuth is the OAuth/OIDC resource-server flow: the SE runs the
+	// auth-code/session-cookie flow and exposes validated claims to DataScripts
+	// via avi.http.oauth_get_claim(). Browser clients only — a bearer token in
+	// the Authorization header is ignored (302 to /authorize).
+	ClaimModeOAuth AuthClaimMode = iota
+
+	// ClaimModeJWTQuery is the stateless bearer-style flow: the SE validates a
+	// JWT presented as a query parameter (jwt_location=JWT_LOCATION_QUERY_PARAM),
+	// returning 200/401 with no redirect. The query param is NOT stripped before
+	// DataScripts run, so the AKO claim helper base64url-decodes the SE-validated
+	// token to read claims. Works for machine clients (SDKs/agents) that append
+	// the token to the request URL. Cost: token-in-URL (mitigate with TLS,
+	// short-lived tokens, SE query-log redaction, and strip-before-backend).
+	ClaimModeJWTQuery
+)
+
 // AIGatewayAuthPolicySpec is the desired state of an AIGatewayAuthPolicy.
 type AIGatewayAuthPolicySpec struct {
 	// TargetRef identifies the HTTPRoute or Gateway this policy applies to.
 	TargetRef PolicyTargetRef `json:"targetRef"`
+
+	// AuthMode selects the SE validation + claim-access model: "oauthBrowser"
+	// (default — OAuth session, browser clients) or "jwtQuery" (stateless bearer
+	// JWT in a query param, machine clients). See AuthClaimMode.
+	// +optional
+	AuthMode string `json:"authMode,omitempty"`
 
 	// JWT configures JWT validation for the targeted route.
 	JWT JWTConfig `json:"jwt"`
@@ -93,6 +124,18 @@ type AuthFailureAction struct {
 type AIGatewayAuthPolicyStatus struct {
 	// Conditions holds standard condition types.
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// AuthModeJWTQuery is the spec.authMode string that selects ClaimModeJWTQuery.
+const AuthModeJWTQuery = "jwtQuery"
+
+// EffectiveAuthMode maps the spec.authMode string to an AuthClaimMode. Anything
+// other than "jwtQuery" (including empty) is the default OAuth browser flow.
+func (s AIGatewayAuthPolicySpec) EffectiveAuthMode() AuthClaimMode {
+	if s.AuthMode == AuthModeJWTQuery {
+		return ClaimModeJWTQuery
+	}
+	return ClaimModeOAuth
 }
 
 // ─── AITokenRateLimitPolicy ──────────────────────────────────────────────────

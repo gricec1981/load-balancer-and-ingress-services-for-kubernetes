@@ -35,7 +35,7 @@ the same policies, and the same usage accounting across all three.
 
 | Capability | What it provides | Status |
 |---|---|---|
-| [Authentication](#authentication) | OAuth/OIDC validation and verified identity/claims at the gateway | Available |
+| [Authentication](#authentication) | JWT/OIDC validation for browser **and** machine clients, with verified identity/claims | Available |
 | [Inference](#inference) | Metric-weighted load balancing across model-server pods | Available |
 | [Token Counting](#token-counting) | Per-consumer / per-group token budgets, counters, rate limits | Available |
 | [Model Routing](#model-routing) | Model-aware routing to quality/cost tiers, with entitlements | Available |
@@ -59,17 +59,30 @@ The three governance surfaces — **inference**, **MCP**, and **A2A** — and th
 
 ## Authentication
 
-The gateway authenticates API consumers with **OAuth/OIDC** at the Service Engine. A caller's
-bearer token is validated against the configured identity provider, and the verified identity
-and claims — such as the consumer's `sub` and their `group` or `role` — are made available to
-every downstream policy and can be forwarded to backends as request headers. One identity
-provider serves the whole gateway, so a single login governs everything behind it.
+The gateway authenticates API consumers with **JWT / OAuth-OIDC** at the Service Engine,
+against one identity provider that serves the whole gateway. The verified identity and claims —
+the consumer's `sub`, their `group` or `role` — are made available to every downstream policy,
+so token budgets are keyed on it, tier entitlements are decided from it, and MCP/A2A tool
+authorization reads the same claims. This verified identity is the foundation the rest of the
+gateway builds on.
 
-This verified identity is the foundation the rest of the gateway builds on: token budgets are
-keyed on it, tier entitlements are decided from it, and MCP/A2A authorization reads the same
-claims. Authentication is configured with an `AIGatewayAuthPolicy` attached to a route.
+It authenticates **both** kinds of caller through one `AIGatewayAuthPolicy`, selected by
+`authMode`:
 
-→ [OAuth/OIDC Authentication — `AIGatewayAuthPolicy`](ai-gateway.md#oauthoidc-authentication--aigatewayauthpolicy)
+- **`oauthBrowser`** (default) — interactive/browser clients run the OAuth auth-code flow and
+  carry a session cookie; an unauthenticated request is redirected to the IdP.
+- **`jwtQuery`** — machine clients (SDKs, agents, MCP, `curl`) present a bearer JWT as a
+  `?jwt=` query parameter; an unauthenticated request gets a `401`, not a redirect. This is
+  what lets non-browser **agents** authenticate while their claims stay readable to policy —
+  essential for governing the agent loop.
+
+The two modes exist because of a real Avi constraint: the SE's browser-OAuth path exposes
+claims to policy but ignores a bearer header, while its resource-server JWT path validates a
+bearer but strips the header and hides the claims. `jwtQuery` threads the needle by validating
+the token from the query string, which survives to the policy DataScript. Both modes require
+the listener to terminate TLS.
+
+→ [AI Gateway Authentication — `AIGatewayAuthPolicy`](ai-gateway-auth.md)
 
 ## Inference
 
@@ -265,6 +278,7 @@ in the demo environment via `kubectl port-forward` (a self-healing port-forward 
 
 ## Related docs
 
+- [AI Gateway Authentication](ai-gateway-auth.md) — `AIGatewayAuthPolicy`, `oauthBrowser` + `jwtQuery` modes
 - [AI Gateway](ai-gateway.md) — authentication and token counting reference
 - [Model-Based Routing](model-routing.md) — quality/cost tier routing
 - [Native Inference Extension](inference-extension.md) — metric-weighted load balancing

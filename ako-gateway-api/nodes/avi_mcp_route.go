@@ -35,7 +35,7 @@ import (
 //
 // The tool-authz script runs in HTTP_REQ_DATA, a different event from the system
 // session DataScript (HTTP_REQ/HTTP_RESP), so the two coexist on the same VS.
-func ApplyMCPRoutePolicy(key string, policy *akogatewayapiaigateway.AIMCPRoutePolicy, childVsNode *nodes.AviEvhVsNode, authHost, routePrefix string) {
+func ApplyMCPRoutePolicy(key string, policy *akogatewayapiaigateway.AIMCPRoutePolicy, childVsNode *nodes.AviEvhVsNode, authHost, routePrefix string, mode akogatewayapiaigateway.AuthClaimMode) {
 	if policy == nil {
 		return
 	}
@@ -70,7 +70,7 @@ func ApplyMCPRoutePolicy(key string, policy *akogatewayapiaigateway.AIMCPRoutePo
 	}
 
 	// 4. Per-role tool authorization DataScript (only when toolAccess is set).
-	scripts := akogatewayapiaigateway.GenerateMCPToolAuthScripts(policy)
+	scripts := akogatewayapiaigateway.GenerateMCPToolAuthScripts(policy, mode)
 	if scripts.ReqDataScript != "" {
 		vsName := childVsNode.Name
 		attachModelRouteDS(childVsNode, akogatewayapiaigateway.DSMCPReqName(vsName),

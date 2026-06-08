@@ -40,6 +40,25 @@ spec:
             - targetRef
             - jwt
             properties:
+              authMode:
+                description: |-
+                  authMode selects how the Service Engine validates the caller's JWT and
+                  how policy DataScripts read its (validated) claims:
+                    - "oauthBrowser" (default): OAuth/OIDC resource-server flow. The SE
+                      runs the auth-code/session-cookie flow and exposes claims to
+                      DataScripts via oauth_get_claim(). For browser clients — a bearer
+                      token in the Authorization header is ignored (302 to /authorize).
+                    - "jwtQuery": stateless bearer-style flow for machine clients. The SE
+                      validates a JWT presented as the `?jwt=<token>` query parameter
+                      (200/401, no redirect); the param is not stripped, so DataScripts
+                      base64url-decode the SE-validated token to read claims. Cost:
+                      token-in-URL — use only over TLS, with short-lived tokens and SE
+                      query-param log redaction.
+                type: string
+                enum:
+                - oauthBrowser
+                - jwtQuery
+                default: oauthBrowser
               targetRef:
                 description: |-
                   targetRef identifies the HTTPRoute (or Gateway) this policy applies to.

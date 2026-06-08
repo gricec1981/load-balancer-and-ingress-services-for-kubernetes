@@ -20,6 +20,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	avimodels "github.com/vmware/alb-sdk/go/models"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/internal/nodes"
 	akov1alpha2 "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/pkg/apis/ako/v1alpha2"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/pkg/utils"
@@ -49,6 +50,15 @@ func ApplyAuthPolicy(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVs
 		return
 	}
 	spec := policy.Spec
+
+	// jwtQuery mode validates a stateless bearer JWT presented as a query param
+	// (machine clients) instead of running the OAuth browser flow. The claim
+	// helper decodes the SE-validated token from the query string — see
+	// applyJWTQueryAuth / jwtClaimHelper(ClaimModeJWTQuery).
+	if spec.EffectiveAuthMode() == ClaimModeJWTQuery {
+		applyJWTQueryAuth(key, policy, vsNode)
+		return
+	}
 
 	// ── 1. Ensure issuer Pool + OAUTH AuthProfile + OAUTH SSOPolicy in Avi ────
 	// SSO_TYPE_JWT validation strips the Authorization header before any
@@ -126,6 +136,58 @@ func ApplyAuthPolicy(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVs
 		key, policy.Namespace, policy.Name, ssoPolicyName, audience, host)
 }
 
+// applyJWTQueryAuth wires the SSO_TYPE_JWT object graph and the VS jwt_config for
+// stateless bearer auth via a query parameter (ClaimModeJWTQuery). The SE
+// validates the JWT found at ?<jwt>=<token>; the claim helper in the AKO
+// DataScripts base64url-decodes the same (validated) token to read claims —
+// avi.http.oauth_get_claim is not available in this mode.
+//
+// Security note (token-in-URL): unlike the Authorization header, the query param
+// is not stripped, which is what makes the claims readable — but it also means
+// the token can land in access/proxy logs and is forwarded to the backend. Run
+// this only over TLS, with short-lived tokens, SE query-param log redaction, and
+// (where supported) a query-strip before the pool. See docs/gateway-api.
+func applyJWTQueryAuth(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVsEvhSniModel) {
+	spec := policy.Spec
+
+	serverProfileName, err := EnsureJWTServerProfile(key, policy)
+	if err != nil {
+		utils.AviLog.Errorf("key: %s, msg: AIGatewayAuthPolicy %s/%s: JWTServerProfile error: %v",
+			key, policy.Namespace, policy.Name, err)
+		return
+	}
+	authProfileName, err := EnsureJWTAuthProfile(key, policy, serverProfileName)
+	if err != nil {
+		utils.AviLog.Errorf("key: %s, msg: AIGatewayAuthPolicy %s/%s: JWT AuthProfile error: %v",
+			key, policy.Namespace, policy.Name, err)
+		return
+	}
+	ssoPolicyName, err := EnsureJWTSSOPolicy(key, policy, authProfileName)
+	if err != nil {
+		utils.AviLog.Errorf("key: %s, msg: AIGatewayAuthPolicy %s/%s: JWT SSOPolicy error: %v",
+			key, policy.Namespace, policy.Name, err)
+		return
+	}
+
+	audience := "*"
+	if len(spec.JWT.Audiences) > 0 {
+		audience = spec.JWT.Audiences[0]
+	}
+
+	gf := vsNode.GetGeneratedFields()
+	// Mutually exclusive with the OAuth path; clear it so a mode switch on an
+	// existing policy cleanly replaces the config.
+	gf.OauthVsConfig = nil
+	gf.SsoPolicyRef = proto.String(fmt.Sprintf("/api/ssopolicy?name=%s", ssoPolicyName))
+	gf.JwtConfig = &avimodels.JWTValidationVsConfig{
+		Audience:    proto.String(audience),
+		JwtLocation: proto.String("JWT_LOCATION_QUERY_PARAM"),
+		JwtName:     proto.String(JwtQueryParamName),
+	}
+	utils.AviLog.Infof("key: %s, msg: AIGatewayAuthPolicy %s/%s: set JWT-query auth (sso=%s, audience=%s, jwt_name=%s)",
+		key, policy.Namespace, policy.Name, ssoPolicyName, audience, JwtQueryParamName)
+}
+
 // ApplyTokenRateLimitPolicy configures the Avi VS node model to enforce the
 // token-budget and request-rate limits in the AITokenRateLimitPolicy spec.
 //
@@ -138,7 +200,7 @@ func ApplyAuthPolicy(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVs
 //   - token limits:     two AviHTTPDataScriptNode entries (HTTP_REQ enforcement
 //   - HTTP_RESP accounting) are added to the VS's HTTPDSrefs slice.
 //     Names are scoped to the VS to avoid collisions across policies.
-func ApplyTokenRateLimitPolicy(key string, policy *AITokenRateLimitPolicy, vsNode nodes.AviVsEvhSniModel) {
+func ApplyTokenRateLimitPolicy(key string, policy *AITokenRateLimitPolicy, vsNode nodes.AviVsEvhSniModel, mode AuthClaimMode) {
 	if policy == nil {
 		return
 	}
@@ -150,7 +212,7 @@ func ApplyTokenRateLimitPolicy(key string, policy *AITokenRateLimitPolicy, vsNod
 		return
 	}
 
-	scripts := GenerateTokenAccountingScripts(policy)
+	scripts := GenerateTokenAccountingScripts(policy, mode)
 	reqScript := scripts.ReqScript
 
 	// Prepend RPS rate-limit logic to the REQ DataScript when configured.

@@ -135,14 +135,14 @@ func TestMCPValidate(t *testing.T) {
 
 func TestGenerateMCPScriptsReq(t *testing.T) {
 	p := &AIMCPRoutePolicy{Spec: sampleMCPSpec()}
-	if got := GenerateMCPToolAuthScripts(p).ReqScript; !strings.Contains(got, "set_request_body_buffer_size(32768)") {
+	if got := GenerateMCPToolAuthScripts(p, ClaimModeOAuth).ReqScript; !strings.Contains(got, "set_request_body_buffer_size(32768)") {
 		t.Errorf("ReqScript should enable 32KB buffering, got:\n%s", got)
 	}
 }
 
 func TestGenerateMCPScriptsReqData(t *testing.T) {
 	p := &AIMCPRoutePolicy{Spec: sampleMCPSpec()}
-	s := GenerateMCPToolAuthScripts(p).ReqDataScript
+	s := GenerateMCPToolAuthScripts(p, ClaimModeOAuth).ReqDataScript
 
 	mustContain := []string{
 		"avi.http.get_req_body(32768)",      // verified read API
@@ -167,7 +167,7 @@ func TestGenerateMCPScriptsReqData(t *testing.T) {
 func TestGenerateMCPLogMode(t *testing.T) {
 	spec := sampleMCPSpec()
 	spec.OnUnauthorized = &UnauthorizedAction{Type: "Log"}
-	s := GenerateMCPToolAuthScripts(&AIMCPRoutePolicy{Spec: spec}).ReqDataScript
+	s := GenerateMCPToolAuthScripts(&AIMCPRoutePolicy{Spec: spec}, ClaimModeOAuth).ReqDataScript
 
 	if !strings.Contains(s, "X-MCP-Tool-Denied") {
 		t.Errorf("Log mode should tag denials, got:\n%s", s)
@@ -180,7 +180,7 @@ func TestGenerateMCPLogMode(t *testing.T) {
 func TestGenerateMCPNoToolAccess(t *testing.T) {
 	spec := sampleMCPSpec()
 	spec.ToolAccess = nil
-	scripts := GenerateMCPToolAuthScripts(&AIMCPRoutePolicy{Spec: spec})
+	scripts := GenerateMCPToolAuthScripts(&AIMCPRoutePolicy{Spec: spec}, ClaimModeOAuth)
 	if scripts.ReqScript != "" || scripts.ReqDataScript != "" {
 		t.Errorf("no toolAccess should produce no scripts, got req=%q reqdata=%q", scripts.ReqScript, scripts.ReqDataScript)
 	}

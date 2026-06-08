@@ -99,7 +99,7 @@ type TokenAccountingScripts struct {
 //   - Cross-SE consistency: each SE maintains independent per-VS shared state;
 //     the resulting bounded overage is acceptable for quota-style limits.  Use
 //     the native Avi rate limiter (requestRateLimit) for exact enforcement.
-func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy) TokenAccountingScripts {
+func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthClaimMode) TokenAccountingScripts {
 	spec := policy.Spec
 
 	identityHeader := spec.EffectiveIdentityHeader()
@@ -114,7 +114,7 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy) TokenAccount
 	identityBlock := buildIdentityBlock(identityHeader, fallback)
 
 	// jwt_claim helper is shared by both phases (identity + group extraction).
-	helper := jwtClaimHelper()
+	helper := jwtClaimHelper(mode)
 
 	// ── Read-only counters endpoint (dashboard UI) ────────────────────────
 	// Prepended *before* enforcement so it intercepts GET /v1/admin/counters and
@@ -201,12 +201,27 @@ func groupReadExpr(groupHeader string) string {
 }
 
 // jwtClaimHelper returns a Lua function `jwt_claim(claim)` that returns a string
-// claim from the OAuth-validated access token. With the OAuth resource-server flow
-// the Avi SE validates the bearer JWT and exposes its claims to the DataScript via
-// avi.http.oauth_get_claim(). The provider index 0 selects the first (only)
-// oauth_settings entry on the VS. Every call is pcall-guarded so a missing claim or
-// an unauthenticated request yields "" rather than raising in the SE sandbox.
-func jwtClaimHelper() string {
+// claim from the SE-validated JWT. The implementation depends on how the SE was
+// asked to validate the token (see AuthClaimMode):
+//
+//   - ClaimModeOAuth: the SE runs the OAuth resource-server flow and exposes
+//     claims via avi.http.oauth_get_claim(provider_index, claim). Provider index
+//     0 selects the only oauth_settings entry. The value may come back as a Lua
+//     table (multi-valued claim), so the first scalar is unwrapped.
+//
+//   - ClaimModeJWTQuery: the SE validated a bearer JWT presented as the ?<jwt>=
+//     query param (oauth_get_claim is unavailable here). Since the SE does NOT
+//     strip the query param, the helper reads the same (already-validated) token
+//     and base64url-decodes its payload to read the claim. Decode-and-trust is
+//     safe ONLY because the SE already verified the signature/aud/exp — never
+//     emit this variant on a VS that isn't enforcing jwt_config validation.
+//
+// Both variants are sandbox-safe (no string.match, tonumber guarded) and yield ""
+// rather than raising on a missing claim or unauthenticated request.
+func jwtClaimHelper(mode AuthClaimMode) string {
+	if mode == ClaimModeJWTQuery {
+		return jwtQueryClaimHelper()
+	}
 	return `-- AKO AI Gateway: read a claim from the OAuth-validated access token.
 -- avi.http.oauth_get_claim(provider_index, claim) returns the claim value; for
 -- this Avi build it comes back as a Lua table (claims may be multi-valued), so
@@ -221,6 +236,73 @@ local function jwt_claim(claim)
   end
   return tostring(v)
 end`
+}
+
+// jwtQueryClaimHelper returns the ClaimModeJWTQuery variant of jwt_claim: it pulls
+// the SE-validated token from the ?<JwtQueryParamName>= query param and decodes
+// the JWT payload to read a claim. Uniquely-named internal locals (_b64url_decode,
+// _json_scalar) so it composes safely alongside json_str / other helpers already
+// emitted by the model-route and MCP generators.
+func jwtQueryClaimHelper() string {
+	return fmt.Sprintf(`-- AKO AI Gateway: read a claim from the SE-validated query-param JWT.
+-- The SE validated the token at ?%[1]s=<jwt> (jwt_location=QUERY_PARAM); it is not
+-- stripped, so decode its payload here. base64url + minimal JSON scalar read only.
+local function _b64url_decode(data)
+  local map = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+  local rev = {}
+  for i = 1, #map do rev[string.sub(map, i, i)] = i - 1 end
+  local out, buf, bits = {}, 0, 0
+  for i = 1, #data do
+    local v = rev[string.sub(data, i, i)]
+    if v ~= nil then
+      buf = buf * 64 + v
+      bits = bits + 6
+      if bits >= 8 then
+        bits = bits - 8
+        out[#out + 1] = string.char(math.floor(buf / (2 ^ bits)) %% 256)
+        buf = buf %% (2 ^ bits) -- drop the consumed high bits so buf stays bounded
+      end
+    end
+  end
+  return table.concat(out)
+end
+local function _json_scalar(s, k)
+  local p = string.find(s, '"' .. k .. '"', 1, true)
+  if not p then return "" end
+  local c = string.find(s, ":", p, true)
+  if not c then return "" end
+  local i = c + 1
+  while i <= #s and string.sub(s, i, i) == " " do i = i + 1 end
+  local ch = string.sub(s, i, i)
+  if ch == '"' then
+    local e = string.find(s, '"', i + 1, true)
+    if not e then return "" end
+    return string.sub(s, i + 1, e - 1)
+  elseif ch == "[" then
+    local q1 = string.find(s, '"', i, true)
+    if not q1 then return "" end
+    local q2 = string.find(s, '"', q1 + 1, true)
+    if not q2 then return "" end
+    return string.sub(s, q1 + 1, q2 - 1)
+  else
+    local e = string.find(s, ",", i, true) or string.find(s, "}", i, true) or (#s + 1)
+    return string.sub(s, i, e - 1)
+  end
+end
+local function jwt_claim(claim)
+  local q = avi.http.get_query() or ""
+  local s = string.find(q, "%[1]s=", 1, true)
+  if not s then return "" end
+  local rest = string.sub(q, s + %[2]d)
+  local amp = string.find(rest, "&", 1, true)
+  local tok = amp and string.sub(rest, 1, amp - 1) or rest
+  if tok == "" then return "" end
+  local d1 = string.find(tok, ".", 1, true)
+  if not d1 then return "" end
+  local d2 = string.find(tok, ".", d1 + 1, true)
+  local payload = d2 and string.sub(tok, d1 + 1, d2 - 1) or string.sub(tok, d1 + 1)
+  return _json_scalar(_b64url_decode(payload), claim)
+end`, JwtQueryParamName, len(JwtQueryParamName)+1)
 }
 
 // buildIdentityBlock returns the Lua snippet that resolves the consumer identity

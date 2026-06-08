@@ -44,7 +44,7 @@ func tierBudgetPolicy() *AITokenRateLimitPolicy {
 }
 
 func TestTierBudgetEnforcedInReqData(t *testing.T) {
-	s := GenerateTokenAccountingScripts(tierBudgetPolicy())
+	s := GenerateTokenAccountingScripts(tierBudgetPolicy(), ClaimModeOAuth)
 
 	if s.ReqDataEnforceScript == "" {
 		t.Fatal("expected a non-empty ReqDataEnforceScript for a reqvar-keyed limit")
@@ -83,7 +83,7 @@ func TestNonReqvarLimitUnchanged(t *testing.T) {
 			},
 		},
 	}
-	s := GenerateTokenAccountingScripts(p)
+	s := GenerateTokenAccountingScripts(p, ClaimModeOAuth)
 	if s.ReqDataEnforceScript != "" {
 		t.Errorf("non-reqvar policy should not produce a ReqDataEnforceScript:\n%s", s.ReqDataEnforceScript)
 	}
@@ -98,7 +98,7 @@ func TestMixedLimitsSplitAcrossEvents(t *testing.T) {
 	p.Spec.Limits = append(p.Spec.Limits, TokenLimit{
 		Name: "global", Key: "consumer", Tokens: "total", Window: "1h", Budget: 200000,
 	})
-	s := GenerateTokenAccountingScripts(p)
+	s := GenerateTokenAccountingScripts(p, ClaimModeOAuth)
 
 	if !strings.Contains(s.ReqScript, "if cur >= 200000") {
 		t.Errorf("classic limit should enforce in HTTP_REQ:\n%s", s.ReqScript)

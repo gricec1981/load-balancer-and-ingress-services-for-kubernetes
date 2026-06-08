@@ -64,7 +64,7 @@ type ModelRouteScripts struct {
 // Every Pool Group named here must also be listed in the DataScriptSet's
 // pool_group_refs, or Avi rejects the script (HTTP 400) — see the model-routing
 // design doc.
-func GenerateModelRouteScripts(policy *AIModelRoutePolicy, tierPG map[string]string) ModelRouteScripts {
+func GenerateModelRouteScripts(policy *AIModelRoutePolicy, tierPG map[string]string, mode AuthClaimMode) ModelRouteScripts {
 	spec := policy.Spec
 
 	reqScript := fmt.Sprintf(
@@ -91,7 +91,7 @@ func GenerateModelRouteScripts(policy *AIModelRoutePolicy, tierPG map[string]str
 	// ── Helpers ──────────────────────────────────────────────────────────────
 	b.WriteString(jsonStrHelper())
 	if entitled {
-		b.WriteString(jwtClaimHelper())
+		b.WriteString(jwtClaimHelper(mode))
 		b.WriteString("\n")
 	}
 

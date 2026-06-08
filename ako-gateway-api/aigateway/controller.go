@@ -241,8 +241,15 @@ func SetupAuthPolicyEventHandlers(
 			ps.mu.RUnlock()
 			if p != nil {
 				enqueueTargetRoute(ns, p.Spec.TargetRef.Name, lib.AIGatewayAuthPolicy, workqueues, numWorkers)
-				// Clean up AKO-managed Avi objects (OAUTH SSO Policy, AuthProfile, issuer Pool).
-				DeleteOAuthObjects("AIGatewayAuthPolicy/"+ns+"/"+name, p)
+				// Clean up AKO-managed Avi objects for whichever auth mode was used:
+				// OAuth (SSOPolicy, AuthProfile, issuer Pool) or JWT-query
+				// (SSOPolicy, AuthProfile, JWTServerProfile).
+				delKey := "AIGatewayAuthPolicy/" + ns + "/" + name
+				if p.Spec.EffectiveAuthMode() == ClaimModeJWTQuery {
+					DeleteJWTObjects(delKey, p)
+				} else {
+					DeleteOAuthObjects(delKey, p)
+				}
 			}
 			ps.deleteAuthPolicy(ns, name)
 		},
@@ -396,6 +403,11 @@ func unstructuredToAuthPolicy(obj *unstructured.Unstructured) (*AIGatewayAuthPol
 	}
 	if name, _, _ := unstructured.NestedString(spec, "targetRef", "name"); name != "" {
 		p.Spec.TargetRef.Name = name
+	}
+
+	// authMode (oauthBrowser default | jwtQuery)
+	if mode, _, _ := unstructured.NestedString(spec, "authMode"); mode != "" {
+		p.Spec.AuthMode = mode
 	}
 
 	// jwt

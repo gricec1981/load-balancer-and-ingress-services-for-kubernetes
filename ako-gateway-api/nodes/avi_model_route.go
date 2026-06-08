@@ -33,7 +33,7 @@ import (
 // It must be invoked *before* ApplyTokenRateLimitPolicy so the model-route
 // DataScripts get lower DataScript indices and run first — the per-tier token
 // budget enforcement reads the ai_tier reqvar this script sets.
-func (o *AviObjectGraph) ApplyModelRoutePolicy(key string, policy *akogatewayapiaigateway.AIModelRoutePolicy, childVsNode *nodes.AviEvhVsNode, parentNsName string, routeModel RouteModel, rule *Rule) {
+func (o *AviObjectGraph) ApplyModelRoutePolicy(key string, policy *akogatewayapiaigateway.AIModelRoutePolicy, childVsNode *nodes.AviEvhVsNode, parentNsName string, routeModel RouteModel, rule *Rule, mode akogatewayapiaigateway.AuthClaimMode) {
 	if policy == nil {
 		return
 	}
@@ -92,7 +92,7 @@ func (o *AviObjectGraph) ApplyModelRoutePolicy(key string, policy *akogatewayapi
 		return
 	}
 
-	scripts := akogatewayapiaigateway.GenerateModelRouteScripts(policy, tierPG)
+	scripts := akogatewayapiaigateway.GenerateModelRouteScripts(policy, tierPG, mode)
 	vsName := childVsNode.Name
 	// HTTP_REQ: enable request-body buffering (no pool refs needed).
 	attachModelRouteDS(childVsNode, akogatewayapiaigateway.DSModelRouteReqName(vsName),
