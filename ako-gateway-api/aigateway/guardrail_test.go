@@ -107,14 +107,18 @@ func TestGenerateGuardrailRulesRequest(t *testing.T) {
 	}
 	blob := rulesString(rules)
 	for _, sub := range []string{
-		`@rx AKIA[0-9A-Z]{16}`,           // aws secret
-		`@rx [0-9]{3}-[0-9]{2}-[0-9]{4}`, // ssn
-		`(ignore|disregard|forget)`,      // prompt injection
-		`ARGS|REQUEST_BODY`,              // request target
-		`phase:2`,                        // request phase
-		`deny`,                           // block action
-		`WAF_MODE_ENFORCEMENT`,           // per-rule enforce mode
-		`t:lowercase`,                    // PI case-insensitive
+		`@rx AKIA[0-9A-Z]{16}`,               // aws secret
+		`@rx [0-9]{3}-[0-9]{2}-[0-9]{4}`,     // ssn
+		`(ignore|disregard|forget|override)`, // prompt injection
+		`ARGS|REQUEST_BODY`,                  // request target
+		`phase:2`,                            // request phase
+		`deny`,                               // block action
+		`WAF_MODE_ENFORCEMENT`,               // per-rule enforce mode
+		`t:lowercase`,                        // PI case-insensitive
+		`t:removeWhitespace`,                 // hardening: defeats "i g n o r e" spacing
+		`t:base64Decode`,                     // hardening: defeats base64-encoded injection
+		`t:urlDecodeUni`,                     // hardening: defeats %-encoding / unicode
+		`role-injection`,                     // role/delimiter family ([system], <|im_start|>)
 	} {
 		if !strings.Contains(blob, sub) {
 			t.Errorf("request rules missing %q", sub)

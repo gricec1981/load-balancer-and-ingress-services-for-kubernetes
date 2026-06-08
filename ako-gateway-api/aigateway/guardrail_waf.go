@@ -52,14 +52,20 @@ var builtinPIISignatures = map[string]string{
 	"email":       `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`,
 }
 
-// promptInjectionRules is the built-in prompt-injection signature set. Patterns
-// are lowercase and matched with t:lowercase (case-insensitive). They catch
-// *known phrases*; semantic/paraphrased injection needs a model (out of scope).
+// promptInjectionRules is the built-in prompt-injection signature set. These are
+// "hardened" detectors (§GenerateGuardrailRules): they emit two SecRules each — a
+// normalised pass (lowercase + unicode/url-decode + whitespace removal, so
+// "I g n o r e", zero-width tricks and %-encoding are caught) and a base64-decode
+// pass (so base64-encoded injections are caught). Patterns are therefore written
+// WITHOUT spaces (whitespace is stripped before matching) and use bounded `.{0,N}`
+// gaps for filler words. They still catch only *known* phrasings; semantic /
+// paraphrased injection needs a model (an ICAP classifier — out of scope here).
 var promptInjectionRules = []struct{ name, regex string }{
-	{"ignore-instructions", `(ignore|disregard|forget) (all |the |any )?(previous|prior|above|earlier) (instruction|instructions|prompt|prompts)`},
-	{"jailbreak", `(dan mode|developer mode|jailbreak|jailbroken|do anything now)`},
-	{"reveal-system-prompt", `(reveal|show|print|repeat|expose) (your |the |me your )?(system prompt|system message|hidden instruction|instructions above)`},
-	{"override-safety", `(override|bypass|turn off|disable) (your |all |the )?(safety|guardrail|guardrails|content policy|restrictions|filters)`},
+	{"ignore-instructions", `(ignore|disregard|forget|override).{0,12}(previous|prior|above|earlier|preceding|all).{0,12}(instruction|prompt|direction|rule|guideline)`},
+	{"jailbreak", `(doanythingnow|danmode|developermode|jailbreak|jailbroken|unfilteredmode|withoutrestriction|withoutanyfilter)`},
+	{"reveal-system-prompt", `(reveal|show|print|repeat|expose|leak).{0,12}(system.{0,4}prompt|system.{0,4}message|initial.{0,4}prompt|hidden.{0,4}instruction)`},
+	{"override-safety", `(override|bypass|turnoff|disable|switchoff).{0,12}(safety|guardrail|contentpolic|restriction|filter|moderation)`},
+	{"role-injection", `(\[system\]|<\|im_start\|>|<\|im_end\|>|###(system|instruction)|<system>|</system>|beginsystemprompt|endofprompt)`},
 }
 
 // toolAbuseRules is the built-in MCP tool-abuse signature set: command injection,
@@ -86,10 +92,12 @@ func BuiltinSecretNames() []string {
 // ─── SecRule generation ──────────────────────────────────────────────────────
 
 // generatedDetector is one detector reduced to a name + regex + case-sensitivity.
+// hardened detectors (prompt-injection) emit evasion-resistant rule variants.
 type generatedDetector struct {
 	name          string
 	regex         string
 	caseSensitive bool
+	hardened      bool
 }
 
 // flatten turns the resolved detectors into an ordered, deterministic list of
@@ -97,19 +105,20 @@ type generatedDetector struct {
 func (r ResolvedDetectors) flatten() []generatedDetector {
 	var out []generatedDetector
 	for _, n := range r.Secrets {
-		out = append(out, generatedDetector{"secret-" + n, builtinSecretSignatures[n], true})
+		out = append(out, generatedDetector{name: "secret-" + n, regex: builtinSecretSignatures[n], caseSensitive: true})
 	}
 	for _, n := range r.PII {
-		out = append(out, generatedDetector{"pii-" + n, builtinPIISignatures[n], true})
+		out = append(out, generatedDetector{name: "pii-" + n, regex: builtinPIISignatures[n], caseSensitive: true})
 	}
 	if r.PromptInjection {
+		// Prompt-injection patterns are hardened (evasion-resistant variants, §GenerateGuardrailRules).
 		for _, p := range promptInjectionRules {
-			out = append(out, generatedDetector{"pi-" + p.name, p.regex, false})
+			out = append(out, generatedDetector{name: "pi-" + p.name, regex: p.regex, hardened: true})
 		}
 	}
 	if r.ToolAbuse {
 		for _, p := range toolAbuseRules {
-			out = append(out, generatedDetector{"tool-" + p.name, p.regex, false})
+			out = append(out, generatedDetector{name: "tool-" + p.name, regex: p.regex})
 		}
 	}
 	if r.Keywords != nil && len(r.Keywords.Match) > 0 {
@@ -118,12 +127,36 @@ func (r ResolvedDetectors) flatten() []generatedDetector {
 		for _, k := range r.Keywords.Match {
 			escaped = append(escaped, regexEscape(k))
 		}
-		out = append(out, generatedDetector{"keyword-denylist", "(" + strings.Join(escaped, "|") + ")", r.Keywords.CaseSensitive})
+		out = append(out, generatedDetector{name: "keyword-denylist", regex: "(" + strings.Join(escaped, "|") + ")", caseSensitive: r.Keywords.CaseSensitive})
 	}
 	for _, c := range r.Custom {
-		out = append(out, generatedDetector{"custom-" + c.Name, c.Regex, true})
+		out = append(out, generatedDetector{name: "custom-" + c.Name, regex: c.Regex, caseSensitive: true})
 	}
 	return out
+}
+
+// transformChain is one ModSecurity transformation pipeline + a rule-name suffix.
+type transformChain struct {
+	suffix     string
+	transforms string
+}
+
+// transformChains returns the SecRule variants a detector emits. Hardened
+// (prompt-injection) detectors get an evasion-resistant normalised pass
+// (lowercase + url/unicode-decode + whitespace removal, multiMatch so each step is
+// tested) plus a base64-decode pass — defeating casing, spacing ("i g n o r e"),
+// %-encoding and base64-encoded injections. Everything else gets a single pass.
+func transformChains(d generatedDetector) []transformChain {
+	if d.hardened {
+		return []transformChain{
+			{"", "multiMatch,t:none,t:urlDecodeUni,t:lowercase,t:removeWhitespace"},
+			{"-b64", "t:base64Decode,t:lowercase,t:removeWhitespace"},
+		}
+	}
+	if !d.caseSensitive {
+		return []transformChain{{"", "t:none,t:lowercase"}}
+	}
+	return []transformChain{{"", "t:none"}}
 }
 
 // GenerateGuardrailRules builds the WafPolicy rule maps for the resolved
@@ -149,19 +182,19 @@ func GenerateGuardrailRules(r ResolvedDetectors, inspectReq, inspectResp bool, b
 		idx++
 	}
 	for _, d := range r.flatten() {
-		transforms := "t:none"
-		if !d.caseSensitive {
-			transforms = "t:none,t:lowercase"
-		}
-		if inspectReq {
-			id++
-			add(d.name+"-req", "ARGS|REQUEST_BODY",
-				secRule(id, "ARGS|REQUEST_BODY", 2, d.regex, "guardrail "+d.name+" (request)", block, statusCode, transforms))
-		}
-		if inspectResp {
-			id++
-			add(d.name+"-resp", "RESPONSE_BODY",
-				secRule(id, "RESPONSE_BODY", 4, d.regex, "guardrail "+d.name+" (response)", block, statusCode, transforms))
+		// Hardened detectors emit several variants (different transform pipelines)
+		// so casing/spacing/encoding evasions are all caught; others emit one.
+		for _, ch := range transformChains(d) {
+			if inspectReq {
+				id++
+				add(d.name+ch.suffix+"-req", "ARGS|REQUEST_BODY",
+					secRule(id, "ARGS|REQUEST_BODY", 2, d.regex, "guardrail "+d.name+" (request)", block, statusCode, ch.transforms))
+			}
+			if inspectResp {
+				id++
+				add(d.name+ch.suffix+"-resp", "RESPONSE_BODY",
+					secRule(id, "RESPONSE_BODY", 4, d.regex, "guardrail "+d.name+" (response)", block, statusCode, ch.transforms))
+			}
 		}
 	}
 	return rules
