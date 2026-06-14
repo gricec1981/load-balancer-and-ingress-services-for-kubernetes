@@ -111,6 +111,7 @@ func TestGenerateGuardrailRulesRequest(t *testing.T) {
 		`@rx [0-9]{3}-[0-9]{2}-[0-9]{4}`,     // ssn
 		`(ignore|disregard|forget|override)`, // prompt injection
 		`ARGS|REQUEST_BODY`,                  // request target
+		`!ARGS:jwt`,                          // jwtQuery auth token excluded from WAF inspection
 		`phase:2`,                            // request phase
 		`deny`,                               // block action
 		`WAF_MODE_ENFORCEMENT`,               // per-rule enforce mode

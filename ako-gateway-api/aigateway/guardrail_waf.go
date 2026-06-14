@@ -189,14 +189,20 @@ func GenerateGuardrailRules(r ResolvedDetectors, inspectReq, inspectResp bool, b
 		})
 		idx++
 	}
+	// Request-phase rules scan ARGS, which includes query-string args. The jwtQuery
+	// auth mode carries the bearer token in the ?jwt= query param; excluding that arg
+	// (!ARGS:<param>) keeps the WAF from inspecting — and blocking — the opaque token,
+	// so guardrails and jwtQuery auth coexist on the same route. The token is
+	// SE-validated separately; its bytes are never user prompt content.
+	reqTarget := "ARGS|REQUEST_BODY|!ARGS:" + JwtQueryParamName
 	for _, d := range r.flatten() {
 		// Hardened detectors emit several variants (different transform pipelines)
 		// so casing/spacing/encoding evasions are all caught; others emit one.
 		for _, ch := range transformChains(d) {
 			if inspectReq {
 				id++
-				add(d.name+ch.suffix+"-req", "ARGS|REQUEST_BODY",
-					secRule(id, "ARGS|REQUEST_BODY", 2, d.regex, "guardrail "+d.name+" (request)", block, statusCode, ch.transforms))
+				add(d.name+ch.suffix+"-req", reqTarget,
+					secRule(id, reqTarget, 2, d.regex, "guardrail "+d.name+" (request)", block, statusCode, ch.transforms))
 			}
 			if inspectResp {
 				id++
