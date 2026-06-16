@@ -59,6 +59,13 @@ func (rest *RestOperations) AviDSBuild(ds_meta *nodes.AviHTTPDataScriptNode, cac
 		vsdatascriptset.ProtocolParserRefs = ds_meta.ProtocolParsers
 	}
 
+	// Native rate limiters referenced by the script via avi.vs.ratelimit.exceed()
+	// (AI-gateway request-rate limiter). The SE owns the token-bucket; the script
+	// only references the limiter by name.
+	if len(ds_meta.RateLimiters) > 0 {
+		vsdatascriptset.RateLimiters = ds_meta.RateLimiters
+	}
+
 	var path string
 	var rest_op utils.RestOp
 	if cache_obj != nil {

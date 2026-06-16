@@ -996,6 +996,13 @@ func (c *AviObjCache) AviPopulateAllDSs(client *clients.AviClient, cloud string,
 		if len(ds.Datascript) == 1 {
 			checksum += utils.Hash(*ds.Datascript[0].Script)
 		}
+		// Mirror the graph-node checksum (AviHTTPDataScriptNode.CalculateCheckSum):
+		// fold in native rate limiters when present so a changed count/period/burst
+		// is detected on read-back. Guarded so non-rate-limited DataScripts are
+		// unchanged.
+		if len(ds.RateLimiters) > 0 {
+			checksum += utils.Hash(utils.Stringify(ds.RateLimiters))
+		}
 		dsCacheObj.CloudConfigCksum = checksum
 		*DsData = append(*DsData, dsCacheObj)
 	}
@@ -1422,6 +1429,13 @@ func (c *AviObjCache) AviPopulateOneVsDSCache(client *clients.AviClient,
 		checksum := lib.DSChecksum(dsCacheObj.PoolGroups, ds.Markers, true)
 		if len(ds.Datascript) == 1 {
 			checksum += utils.Hash(*ds.Datascript[0].Script)
+		}
+		// Mirror the graph-node checksum (AviHTTPDataScriptNode.CalculateCheckSum):
+		// fold in native rate limiters when present so a changed count/period/burst
+		// is detected on read-back. Guarded so non-rate-limited DataScripts are
+		// unchanged.
+		if len(ds.RateLimiters) > 0 {
+			checksum += utils.Hash(utils.Stringify(ds.RateLimiters))
 		}
 		dsCacheObj.CloudConfigCksum = checksum
 		k := NamespaceName{Namespace: tenant, Name: *ds.Name}

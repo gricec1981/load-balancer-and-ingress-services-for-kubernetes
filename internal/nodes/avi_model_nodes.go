@@ -1501,6 +1501,12 @@ type AviHTTPDataScriptNode struct {
 	PoolGroupRefs    []string
 	ProtocolParsers  []string
 	StringGroups     []string
+	// RateLimiters are native Avi rate limiters published on the VSDataScriptSet
+	// (rate_limiters). The Script references them by name via
+	// avi.vs.ratelimit.exceed() — used by the AI-gateway per-consumer request-rate
+	// limiter. Nil for every other DataScript, so the checksum below (and the cache
+	// read-back checksum) is unchanged for them.
+	RateLimiters []*avimodels.RateLimiter
 	*DataScript
 }
 
@@ -1524,6 +1530,12 @@ func (v *AviHTTPDataScriptNode) CalculateCheckSum() {
 	checksum += utils.Hash(v.Name)
 	if v.DataScript != nil {
 		checksum += utils.Hash(v.DataScript.Evt) + utils.Hash(v.DataScript.Script)
+	}
+	// Fold in native rate limiters so a changed count/period/burst is re-pushed.
+	// Guarded so DataScripts without rate limiters keep their existing checksum
+	// (no spurious re-push of the many non-AI-gateway DataScripts AKO manages).
+	if len(v.RateLimiters) > 0 {
+		checksum += utils.Hash(utils.Stringify(v.RateLimiters))
 	}
 	v.CloudConfigCksum = checksum
 }
