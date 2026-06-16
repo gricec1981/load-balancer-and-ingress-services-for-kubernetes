@@ -58,6 +58,11 @@ const (
 	DSNameSuffixReqDataEnforce = "-ai-tok-reqdata"
 )
 
+// RPSRateLimiterSuffix names the native Avi rate limiter (on the request-phase
+// VSDataScriptSet) that the request-rate DataScript references via
+// avi.vs.ratelimit.exceed(). Scoped to the VS so it never collides across VSes.
+const RPSRateLimiterSuffix = "-ai-rps"
+
 // TokenAccountingScripts holds the Lua snippets generated from an
 // AITokenRateLimitPolicy: request-phase enforcement, a response-header-phase
 // buffer-enable, and response-body-phase accounting.
@@ -642,3 +647,8 @@ func DSReqName(vsName string) string            { return vsName + DSNameSuffixRe
 func DSRespName(vsName string) string           { return vsName + DSNameSuffixResp }
 func DSRespDataName(vsName string) string       { return vsName + DSNameSuffixRespData }
 func DSReqDataEnforceName(vsName string) string { return vsName + DSNameSuffixReqDataEnforce }
+
+// RPSRateLimiterName returns the native rate limiter name for a given VS. The
+// same name is used both in the RateLimiter object on the VSDataScriptSet and in
+// the avi.vs.ratelimit.exceed() call in the script — they must match.
+func RPSRateLimiterName(vsName string) string { return vsName + RPSRateLimiterSuffix }

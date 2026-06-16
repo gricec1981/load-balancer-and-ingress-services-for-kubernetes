@@ -191,15 +191,18 @@ func applyJWTQueryAuth(key string, policy *AIGatewayAuthPolicy, vsNode nodes.Avi
 // ApplyTokenRateLimitPolicy configures the Avi VS node model to enforce the
 // token-budget and request-rate limits in the AITokenRateLimitPolicy spec.
 //
-// Avi object mapping (Phase 1):
-//   - requestRateLimit: soft per-consumer token-bucket rate limiter implemented
-//     in the DataScript REQ phase via avi.vs.table_insert/lookup.
-//     Phase 1.5 upgrade path: extend AviHTTPDataScriptNode with
-//     RateLimiters []*models.RateLimiter and call avi.vs.rate_limiter() for
-//     the native distributed rate limiter.
+// Avi object mapping:
+//   - requestRateLimit: native Avi rate limiter. A models.RateLimiter
+//     (count/period/burst) is published on the request-phase VSDataScriptSet
+//     (rate_limiters) and the REQ DataScript calls avi.vs.ratelimit.exceed()
+//     against it, keyed per-consumer. The SE owns the token bucket and keeps it
+//     consistent across VS scale-out (distributed) — replacing the per-SE,
+//     eventually-consistent table_insert/lookup soft bucket.
 //   - token limits:     two AviHTTPDataScriptNode entries (HTTP_REQ enforcement
-//   - HTTP_RESP accounting) are added to the VS's HTTPDSrefs slice.
-//     Names are scoped to the VS to avoid collisions across policies.
+//   - HTTP_RESP accounting) are added to the VS's HTTPDSrefs slice. Token budgets
+//     stay in DataScript (per-group/tier ceilings, post-response accounting,
+//     fixed-window reset and the counters endpoint don't map onto the native
+//     limiter). Names are scoped to the VS to avoid collisions across policies.
 func ApplyTokenRateLimitPolicy(key string, policy *AITokenRateLimitPolicy, vsNode nodes.AviVsEvhSniModel, mode AuthClaimMode) {
 	if policy == nil {
 		return
@@ -215,31 +218,37 @@ func ApplyTokenRateLimitPolicy(key string, policy *AITokenRateLimitPolicy, vsNod
 	scripts := GenerateTokenAccountingScripts(policy, mode)
 	reqScript := scripts.ReqScript
 
-	// Prepend RPS rate-limit logic to the REQ DataScript when configured.
-	if hasRateLimit {
-		rlScript := buildRequestRateLimitScript(spec)
-		reqScript = rlScript + "\n\n" + reqScript
-	}
-
 	vsName := vsNode.GetName()
 	tenant := vsNode.GetTenant()
 
+	// Prepend RPS rate-limit logic to the REQ DataScript when configured, and
+	// attach the matching native rate limiter to the same VSDataScriptSet. The SE
+	// owns the (distributed, VS-scale-out-aware) token bucket; the script only
+	// calls avi.vs.ratelimit.exceed() against it.
+	var reqRateLimiters []*avimodels.RateLimiter
+	if hasRateLimit {
+		rlName := RPSRateLimiterName(vsName)
+		rlScript := buildRequestRateLimitScript(spec, rlName)
+		reqScript = rlScript + "\n\n" + reqScript
+		reqRateLimiters = []*avimodels.RateLimiter{buildRequestRateLimiter(spec, rlName)}
+	}
+
 	if hasTokenLimits || hasRateLimit {
-		addDataScriptNode(key, vsName, tenant, DSReqName(vsName), DSEvtHTTPReq, reqScript, vsNode)
+		addDataScriptNode(key, vsName, tenant, DSReqName(vsName), DSEvtHTTPReq, reqScript, reqRateLimiters, vsNode)
 	}
 	if hasTokenLimits {
 		// HTTP_RESP enables response-body buffering; HTTP_RESP_DATA reads the
 		// buffered body and does the token accounting (parses usage directly
 		// from the JSON body, no backend token-header dependency).
-		addDataScriptNode(key, vsName, tenant, DSRespName(vsName), DSEvtHTTPResp, scripts.RespScript, vsNode)
-		addDataScriptNode(key, vsName, tenant, DSRespDataName(vsName), DSEvtHTTPRespData, scripts.RespDataScript, vsNode)
+		addDataScriptNode(key, vsName, tenant, DSRespName(vsName), DSEvtHTTPResp, scripts.RespScript, nil, vsNode)
+		addDataScriptNode(key, vsName, tenant, DSRespDataName(vsName), DSEvtHTTPRespData, scripts.RespDataScript, nil, vsNode)
 	}
 	// Tier-dependent budgets enforce in HTTP_REQ_DATA so they can read the ai_tier
 	// reqvar set by the AIModelRoutePolicy script. ApplyModelRoutePolicy is invoked
 	// before this, so its DataScript carries a lower index and runs first (verified:
 	// reqvars cross DataScriptSets and execution follows index order).
 	if scripts.ReqDataEnforceScript != "" {
-		addDataScriptNode(key, vsName, tenant, DSReqDataEnforceName(vsName), DSEvtHTTPReqData, scripts.ReqDataEnforceScript, vsNode)
+		addDataScriptNode(key, vsName, tenant, DSReqDataEnforceName(vsName), DSEvtHTTPReqData, scripts.ReqDataEnforceScript, nil, vsNode)
 	}
 
 	utils.AviLog.Infof("key: %s, msg: AITokenRateLimitPolicy %s/%s: registered token-accounting DataScripts on VS %s",
@@ -266,52 +275,70 @@ func ApplyGuardrailPolicy(key string, policy *AIGuardrailPolicy, vsNode nodes.Av
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
-// buildRequestRateLimitScript returns the Lua snippet for per-consumer RPS rate
-// limiting using a per-SE soft token bucket.
-//
-// Phase 1.5 upgrade path: use avi.vs.rate_limiter() (native distributed limiter)
-// by extending AviHTTPDataScriptNode with RateLimiters []*models.RateLimiter.
-func buildRequestRateLimitScript(spec AITokenRateLimitPolicySpec) string {
-	rl := spec.RequestRateLimit
-	burst := rl.Burst
-	if burst <= 0 {
-		burst = rl.RequestsPerSecond
-	}
-
-	var keyExpr string
-	switch rl.Key {
-	case "consumer":
+// requestRateKeyExpr returns the Lua expression that resolves the rate-limiter
+// request_key (the per-consumer bucket selector). "consumer" prefers the resolved
+// identity header (set by AIGatewayAuthPolicy) and falls back to the client IP;
+// anything else keys on the client IP.
+func requestRateKeyExpr(spec AITokenRateLimitPolicySpec) string {
+	if spec.RequestRateLimit.Key == "consumer" {
 		hdr := spec.EffectiveIdentityHeader()
-		keyExpr = fmt.Sprintf(`(avi.http.get_header(%q, avi.HTTP_REQUEST) or avi.vs.client_ip())`, hdr)
-	default:
-		keyExpr = "avi.vs.client_ip()"
+		return fmt.Sprintf(`(avi.http.get_header(%q, avi.HTTP_REQUEST) or avi.vs.client_ip())`, hdr)
 	}
+	return "avi.vs.client_ip()"
+}
 
-	// avi.vs.table_* take (key[, value[, ttl]]) - no table-name argument - and
-	// table_insert does not overwrite, so remove-then-insert to update the count.
-	return fmt.Sprintf(`-- AKO AI Gateway: per-consumer RPS soft rate limiter
--- Phase 1.5 upgrade: replace with native avi.vs.rate_limiter() for cross-SE consistency.
+// buildRequestRateLimitScript returns the Lua snippet for per-consumer RPS rate
+// limiting using the native Avi rate limiter. The bucket math (count/period/burst)
+// lives in the RateLimiter object on the VSDataScriptSet (see
+// buildRequestRateLimiter); the script just consumes one token per request from
+// the per-consumer bucket via avi.vs.ratelimit.exceed(name, request_key). The SE
+// keeps the bucket consistent across VS scale-out, so this is exact across SEs
+// (unlike the previous per-SE table_insert/lookup soft bucket).
+func buildRequestRateLimitScript(spec AITokenRateLimitPolicySpec, rlName string) string {
+	keyExpr := requestRateKeyExpr(spec)
+	return fmt.Sprintf(`-- AKO AI Gateway: per-consumer RPS rate limiter (native Avi rate limiter)
+-- Buckets per consumer via request_key against the %q rate limiter on this
+-- DataScriptSet. The SE owns the token bucket and keeps it consistent across VS
+-- scale-out, replacing the per-SE soft bucket (remove-then-insert).
 do
-  local rk = "rps:"..%s
-  local win_key = rk..":"..math.floor(os.time())
-  local cur = tonumber(avi.vs.table_lookup(win_key) or 0)
-  if cur >= %d then
+  local rk = %s
+  if avi.vs.ratelimit.exceed(%q, rk) then
     avi.http.response(429,
       {["Content-Type"] = "application/json", ["Retry-After"] = "1"},
       '{"error":"rate_limit_exceeded","limit":"requests_per_second","budget":%d}')
     return
   end
-  avi.vs.table_remove(win_key)
-  avi.vs.table_insert(win_key, tostring(cur + 1), 2)
-end`, keyExpr, burst, rl.RequestsPerSecond)
+end`, rlName, keyExpr, rlName, spec.RequestRateLimit.RequestsPerSecond)
+}
+
+// buildRequestRateLimiter builds the native Avi RateLimiter object for the request
+// rate limit. Count/Period express the sustained rate (requests per second) and
+// BurstSz the allowed instantaneous overshoot (defaults to the sustained count).
+// The Name must match the one used in buildRequestRateLimitScript's
+// avi.vs.ratelimit.exceed() call.
+func buildRequestRateLimiter(spec AITokenRateLimitPolicySpec, name string) *avimodels.RateLimiter {
+	rl := spec.RequestRateLimit
+	burst := rl.Burst
+	if burst <= 0 {
+		burst = rl.RequestsPerSecond
+	}
+	return &avimodels.RateLimiter{
+		Name:    proto.String(name),
+		Count:   proto.Uint32(uint32(rl.RequestsPerSecond)),
+		Period:  proto.Uint32(1),
+		BurstSz: proto.Uint32(uint32(burst)),
+	}
 }
 
 // addDataScriptNode adds or replaces an AviHTTPDataScriptNode in the VS's
-// HTTPDSrefs list (idempotent: replaces by name on reconcile).
-func addDataScriptNode(key, vsName, tenant, dsName, evt, script string, vsNode nodes.AviVsEvhSniModel) {
+// HTTPDSrefs list (idempotent: replaces by name on reconcile). rateLimiters, when
+// non-nil, are the native Avi rate limiters the script references via
+// avi.vs.ratelimit.exceed() — published on the resulting VSDataScriptSet.
+func addDataScriptNode(key, vsName, tenant, dsName, evt, script string, rateLimiters []*avimodels.RateLimiter, vsNode nodes.AviVsEvhSniModel) {
 	ds := &nodes.AviHTTPDataScriptNode{
-		Name:   dsName,
-		Tenant: tenant,
+		Name:         dsName,
+		Tenant:       tenant,
+		RateLimiters: rateLimiters,
 		DataScript: &nodes.DataScript{
 			Evt:    evt,
 			Script: script,
