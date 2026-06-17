@@ -1501,6 +1501,18 @@ type AviHTTPDataScriptNode struct {
 	PoolGroupRefs    []string
 	ProtocolParsers  []string
 	StringGroups     []string
+	// RateLimiters are native Avi rate limiters published on the VSDataScriptSet
+	// (rate_limiters). The Script references them by name via
+	// avi.vs.ratelimit.exceed() — used by the AI-gateway per-consumer request-rate
+	// limiter. Nil for every other DataScript, so the checksum below (and the cache
+	// read-back checksum) is unchanged for them.
+	RateLimiters []*avimodels.RateLimiter
+	// ExtraDataScripts are additional (event, script) entries published in the SAME
+	// VSDataScriptSet as the embedded DataScript. Used when scripts in different
+	// events must share set-scoped state — specifically the AI-gateway native
+	// token-budget gate (HTTP_REQ) and consume (HTTP_RESP_DATA), which must live in
+	// one set to share a rate-limiter bucket. Nil for every other DataScript.
+	ExtraDataScripts []*DataScript
 	*DataScript
 }
 
@@ -1524,6 +1536,19 @@ func (v *AviHTTPDataScriptNode) CalculateCheckSum() {
 	checksum += utils.Hash(v.Name)
 	if v.DataScript != nil {
 		checksum += utils.Hash(v.DataScript.Evt) + utils.Hash(v.DataScript.Script)
+	}
+	// Fold in native rate limiters so a changed count/period/burst is re-pushed.
+	// Guarded so DataScripts without rate limiters keep their existing checksum
+	// (no spurious re-push of the many non-AI-gateway DataScripts AKO manages).
+	if len(v.RateLimiters) > 0 {
+		checksum += utils.Hash(utils.Stringify(v.RateLimiters))
+	}
+	// Fold in additional event-scripts (native token-budget consume entry) so their
+	// content changes are re-pushed. Guarded so normal DataScripts are unchanged.
+	for _, ds := range v.ExtraDataScripts {
+		if ds != nil {
+			checksum += utils.Hash(ds.Evt) + utils.Hash(ds.Script)
+		}
 	}
 	v.CloudConfigCksum = checksum
 }

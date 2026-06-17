@@ -487,6 +487,9 @@ func unstructuredToTokenRateLimitPolicy(obj *unstructured.Unstructured) (*AIToke
 			if v, _, _ := unstructured.NestedString(lm, "name"); v != "" {
 				tl.Name = v
 			}
+			if v, _, _ := unstructured.NestedString(lm, "backend"); v != "" {
+				tl.Backend = v
+			}
 			if v, _, _ := unstructured.NestedString(lm, "key"); v != "" {
 				tl.Key = v
 			}

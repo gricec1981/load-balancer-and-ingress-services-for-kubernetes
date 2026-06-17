@@ -208,6 +208,19 @@ type TokenLimit struct {
 	// Name is a unique identifier for this limit (used as counter-key prefix).
 	Name string `json:"name"`
 
+	// Backend selects how this limit is enforced:
+	//   "datascript" (default) – per-SE shared-state counter (eventually consistent
+	//                            across SEs; fixed calendar window; feeds the admin
+	//                            counters endpoint).
+	//   "native"               – the Avi rate limiter (avi.vs.ratelimit.exceed):
+	//                            exact across SEs / VS scale-out, but a rolling
+	//                            token-bucket window (not a calendar reset). A
+	//                            DataScript display counter is still kept so the
+	//                            admin endpoint keeps working (hybrid). See
+	//                            docs/gateway-api/native-token-budget-design.md.
+	// +optional
+	Backend string `json:"backend,omitempty"`
+
 	// Key is the dimension to key the counter on:
 	//   "consumer"         – resolved consumer identity (from IdentitySource)
 	//   "header:<name>"    – value of a specific request header
@@ -326,4 +339,10 @@ func (s *AITokenRateLimitPolicySpec) EffectiveIdentityHeader() string {
 		return s.IdentitySource.Header
 	}
 	return "x-ai-consumer"
+}
+
+// UsesNativeBackend reports whether this limit is enforced by the native Avi rate
+// limiter (vs the default per-SE DataScript counter). See TokenLimit.Backend.
+func (l *TokenLimit) UsesNativeBackend() bool {
+	return l.Backend == "native"
 }
