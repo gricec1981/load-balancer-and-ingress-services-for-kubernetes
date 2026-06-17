@@ -189,6 +189,27 @@ only proven primitives (the distributed limiter that already powers request-rate
 the per-SE table) — no sideband (`avi.requests()` is request-phase + pool-bound +
 synchronous, so it can't fire from the response), no external store.
 
+## 6c. FINAL verdict from exhaustive live testing (2026-06-17)
+
+All traffic-tested on the 31.2.2 controller:
+- **Native limiter enforces.** A plain 5 req/s RPS limit → clean 5×200 then 429s.
+- **`consume=N` IS honored.** A `consume=9999` probe (> 2347 budget) 429'd the first
+  request. So token-weighting works *at the gate*.
+- **Native token budget does NOT enforce — every variant failed to trip:**
+  direct consume in HTTP_RESP_DATA; gate+consume co-located in one set; and the
+  deferred-carry (charge the carry at the gate). The charge made on the response
+  side never reaches the request-side gate bucket, and the per-SE carry read at the
+  gate comes back empty in this path. We could not bridge "count on response →
+  enforce on request" through the limiter on this build.
+- **DataScript backend enforces under traffic** (per-SE) — it trips. (Observed it
+  trip earlier than the 2347 budget would predict — a separate accuracy item.)
+
+**Conclusion:** the only working token-budget enforcement today is the per-SE
+DataScript counter (actual tokens, eventually-consistent). A correct distributed
+token budget requires the **native distributed counter** primitive — now proven by
+testing, not assumed. The native-backend code on this branch does not enforce and
+should be parked behind the flag (documented dead-end) or reverted.
+
 ## 7. Open decisions for sign-off
 
 1. **Pre-check mechanism — RESOLVED.** Use `consume=1` probe at request time
