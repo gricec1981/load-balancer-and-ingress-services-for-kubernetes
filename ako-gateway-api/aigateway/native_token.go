@@ -166,26 +166,36 @@ func buildNativeGateBlock(limit TokenLimit, vsName string) string {
 		b.WriteString("      '{\"error\":\"unknown_group\",\"group\":\"'..group_hdr..'\"}')\n")
 		b.WriteString("    return\n  end\n")
 	}
-	// Deferred carry: apply the tokens this consumer accrued on previous responses
-	// (staged in a per-SE table by the consume entry) to the DISTRIBUTED limiter
-	// now, at request admission — the only point where the bucket can be charged.
-	// This is what links response-side token counts to request-side enforcement.
-	fmt.Fprintf(&b, "  local _ck = %s\n", nativeCarryKeyExpr(limit, ""))
-	b.WriteString("  local _carry = tonumber(avi.vs.table_lookup(_ck) or 0) or 0\n")
-	b.WriteString("  if _carry > 0 then\n")
-	b.WriteString("    avi.vs.ratelimit.exceed(rlname, rk, _carry)\n")
-	b.WriteString("    avi.vs.table_remove(_ck)\n")
-	b.WriteString("  end\n")
-	// Gate: a consume=1 probe trips when the bucket is empty.
-	b.WriteString("  if avi.vs.ratelimit.exceed(rlname, rk, 1) then\n")
+	// Build the reject snippet once (used by both gate branches).
 	headers := `{["Content-Type"] = "application/json"`
 	if doRetryAfter {
 		headers += `, ["Retry-After"] = "1"`
 	}
 	headers += "}"
-	fmt.Fprintf(&b, "    avi.http.response(%d, %s,\n", statusCode, headers)
-	fmt.Fprintf(&b, "      %s)\n", luaStr(fmt.Sprintf(`{"error":"token_budget_exceeded","limit":"%s"}`, limit.Name)))
-	b.WriteString("    return\n  end\n")
+	reject := fmt.Sprintf("avi.http.response(%d, %s,\n      %s)\n    return",
+		statusCode, headers, luaStr(fmt.Sprintf(`{"error":"token_budget_exceeded","limit":"%s"}`, limit.Name)))
+
+	// Deferred carry: charge the tokens this consumer accrued on previous responses
+	// (staged in a per-SE table by the consume entry) to the DISTRIBUTED limiter
+	// now, at request admission — the only point where the bucket can be charged.
+	// This links response-side token counts to request-side enforcement.
+	//
+	// Gate on the CHARGE itself: ratelimit.exceed consumes all-or-nothing, so when
+	// the bucket can't cover the carry the consumer is over budget — reject (and
+	// leave the carry in place so they stay blocked until the window refills). On a
+	// fresh request (carry 0) a consume=1 probe catches an already-exhausted bucket.
+	fmt.Fprintf(&b, "  local _ck = %s\n", nativeCarryKeyExpr(limit, ""))
+	b.WriteString("  local _carry = tonumber(avi.vs.table_lookup(_ck) or 0) or 0\n")
+	b.WriteString("  if _carry > 0 then\n")
+	b.WriteString("    if avi.vs.ratelimit.exceed(rlname, rk, _carry) then\n")
+	fmt.Fprintf(&b, "      %s\n", reject)
+	b.WriteString("    end\n")
+	b.WriteString("    avi.vs.table_remove(_ck)\n")
+	b.WriteString("  else\n")
+	b.WriteString("    if avi.vs.ratelimit.exceed(rlname, rk, 1) then\n")
+	fmt.Fprintf(&b, "      %s\n", reject)
+	b.WriteString("    end\n")
+	b.WriteString("  end\n")
 	b.WriteString("end\n")
 	return b.String()
 }
