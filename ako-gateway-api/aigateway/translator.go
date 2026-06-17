@@ -215,22 +215,34 @@ func ApplyTokenRateLimitPolicy(key string, policy *AITokenRateLimitPolicy, vsNod
 		return
 	}
 
-	scripts := GenerateTokenAccountingScripts(policy, mode)
-	reqScript := scripts.ReqScript
-
 	vsName := vsNode.GetName()
 	tenant := vsNode.GetTenant()
+
+	scripts := GenerateTokenAccountingScripts(policy, mode, vsName)
+	reqScript := scripts.ReqScript
+
+	// Native-backend token limits enforce via avi.vs.ratelimit.exceed against
+	// RateLimiter objects on the DataScriptSet. The gate (request phase) and the
+	// consume (HTTP_RESP_DATA) reference the same limiter by name, so the limiters
+	// are attached to every DataScriptSet that may reference them (req, reqdata,
+	// respdata). See docs/gateway-api/native-token-budget-design.md.
+	var nativeTokLimiters []*avimodels.RateLimiter
+	for _, limit := range spec.Limits {
+		if limit.UsesNativeBackend() {
+			nativeTokLimiters = append(nativeTokLimiters, buildNativeTokenLimiters(limit, vsName)...)
+		}
+	}
 
 	// Prepend RPS rate-limit logic to the REQ DataScript when configured, and
 	// attach the matching native rate limiter to the same VSDataScriptSet. The SE
 	// owns the (distributed, VS-scale-out-aware) token bucket; the script only
 	// calls avi.vs.ratelimit.exceed() against it.
-	var reqRateLimiters []*avimodels.RateLimiter
+	reqRateLimiters := append([]*avimodels.RateLimiter(nil), nativeTokLimiters...)
 	if hasRateLimit {
 		rlName := RPSRateLimiterName(vsName)
 		rlScript := buildRequestRateLimitScript(spec, rlName)
 		reqScript = rlScript + "\n\n" + reqScript
-		reqRateLimiters = []*avimodels.RateLimiter{buildRequestRateLimiter(spec, rlName)}
+		reqRateLimiters = append(reqRateLimiters, buildRequestRateLimiter(spec, rlName))
 	}
 
 	if hasTokenLimits || hasRateLimit {
@@ -239,16 +251,17 @@ func ApplyTokenRateLimitPolicy(key string, policy *AITokenRateLimitPolicy, vsNod
 	if hasTokenLimits {
 		// HTTP_RESP enables response-body buffering; HTTP_RESP_DATA reads the
 		// buffered body and does the token accounting (parses usage directly
-		// from the JSON body, no backend token-header dependency).
+		// from the JSON body, no backend token-header dependency). Native limits
+		// consume against their limiter here, so they're attached to this set too.
 		addDataScriptNode(key, vsName, tenant, DSRespName(vsName), DSEvtHTTPResp, scripts.RespScript, nil, vsNode)
-		addDataScriptNode(key, vsName, tenant, DSRespDataName(vsName), DSEvtHTTPRespData, scripts.RespDataScript, nil, vsNode)
+		addDataScriptNode(key, vsName, tenant, DSRespDataName(vsName), DSEvtHTTPRespData, scripts.RespDataScript, nativeTokLimiters, vsNode)
 	}
 	// Tier-dependent budgets enforce in HTTP_REQ_DATA so they can read the ai_tier
 	// reqvar set by the AIModelRoutePolicy script. ApplyModelRoutePolicy is invoked
 	// before this, so its DataScript carries a lower index and runs first (verified:
 	// reqvars cross DataScriptSets and execution follows index order).
 	if scripts.ReqDataEnforceScript != "" {
-		addDataScriptNode(key, vsName, tenant, DSReqDataEnforceName(vsName), DSEvtHTTPReqData, scripts.ReqDataEnforceScript, nil, vsNode)
+		addDataScriptNode(key, vsName, tenant, DSReqDataEnforceName(vsName), DSEvtHTTPReqData, scripts.ReqDataEnforceScript, nativeTokLimiters, vsNode)
 	}
 
 	utils.AviLog.Infof("key: %s, msg: AITokenRateLimitPolicy %s/%s: registered token-accounting DataScripts on VS %s",

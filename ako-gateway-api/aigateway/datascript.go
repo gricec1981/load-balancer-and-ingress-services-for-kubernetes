@@ -104,7 +104,7 @@ type TokenAccountingScripts struct {
 //   - Cross-SE consistency: each SE maintains independent per-VS shared state;
 //     the resulting bounded overage is acceptable for quota-style limits.  Use
 //     the native Avi rate limiter (requestRateLimit) for exact enforcement.
-func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthClaimMode) TokenAccountingScripts {
+func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthClaimMode, vsName string) TokenAccountingScripts {
 	spec := policy.Spec
 
 	identityHeader := spec.EffectiveIdentityHeader()
@@ -146,7 +146,7 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 			needReqData = true
 			continue
 		}
-		reqParts = append(reqParts, buildReqLimitBlock(limit, policy.CounterEpoch))
+		reqParts = append(reqParts, reqEnforceBlock(limit, policy.CounterEpoch, vsName))
 	}
 	if needReqData {
 		reqDataEnforceParts = append(reqDataEnforceParts,
@@ -156,7 +156,7 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 		reqDataEnforceParts = append(reqDataEnforceParts, "local now = os.time()")
 		for _, limit := range spec.Limits {
 			if limitUsesReqvar(limit) {
-				reqDataEnforceParts = append(reqDataEnforceParts, buildReqLimitBlock(limit, policy.CounterEpoch))
+				reqDataEnforceParts = append(reqDataEnforceParts, reqEnforceBlock(limit, policy.CounterEpoch, vsName))
 			}
 		}
 	}
@@ -174,7 +174,11 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 	respDataParts = append(respDataParts, buildUsageParseBlock())
 
 	for _, limit := range spec.Limits {
-		respDataParts = append(respDataParts, buildRespLimitBlock(limit, policy.CounterEpoch))
+		if limit.UsesNativeBackend() {
+			respDataParts = append(respDataParts, buildNativeConsumeBlock(limit, policy.CounterEpoch))
+		} else {
+			respDataParts = append(respDataParts, buildRespLimitBlock(limit, policy.CounterEpoch))
+		}
 	}
 
 	return TokenAccountingScripts{
@@ -457,6 +461,20 @@ func tokenDimensionExpr(tokens string) string {
 	default:
 		return "total_tokens"
 	}
+}
+
+// reqEnforceBlock returns the request-phase enforcement Lua for one limit,
+// dispatching on the backend: native limits gate via avi.vs.ratelimit.exceed
+// (a "Log"-action native limit has no gate — consume-only); DataScript limits use
+// the per-SE table counter as before.
+func reqEnforceBlock(limit TokenLimit, epoch, vsName string) string {
+	if limit.UsesNativeBackend() {
+		if !nativeGateUsed(limit) {
+			return fmt.Sprintf("-- limit: %s (native token budget, Log action — consume only, no gate)", limit.Name)
+		}
+		return buildNativeGateBlock(limit, vsName)
+	}
+	return buildReqLimitBlock(limit, epoch)
 }
 
 // buildReqLimitBlock generates the Lua snippet that enforces one token limit in

@@ -83,7 +83,7 @@ func TestGeneratorsThreadJWTQueryMode(t *testing.T) {
 		t.Errorf("MCP tool-authz script did not switch to query-decode helper:\n%s", mcp)
 	}
 
-	tok := GenerateTokenAccountingScripts(tierBudgetPolicy(), ClaimModeJWTQuery).ReqScript
+	tok := GenerateTokenAccountingScripts(tierBudgetPolicy(), ClaimModeJWTQuery, "vs-test").ReqScript
 	if !strings.Contains(tok, "_b64url_decode") || strings.Contains(tok, "oauth_get_claim") {
 		t.Errorf("token-accounting script did not switch to query-decode helper:\n%s", tok)
 	}
