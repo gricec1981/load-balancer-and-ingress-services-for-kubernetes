@@ -97,6 +97,20 @@ spec:
                     name:
                       description: Unique name for this limit (used as the counter key prefix).
                       type: string
+                    backend:
+                      description: |-
+                        backend selects how this limit is enforced.
+                        "datascript" (default) uses a per-SE shared-state counter
+                        (eventually consistent across SEs; fixed calendar window).
+                        "native" uses the Avi rate limiter (avi.vs.ratelimit.exceed)
+                        for cross-SE-consistent enforcement (rolling token-bucket
+                        window), keeping a DataScript display counter for the admin
+                        endpoint (hybrid).
+                      type: string
+                      default: datascript
+                      enum:
+                      - datascript
+                      - native
                     key:
                       description: |-
                         key is the dimension to key the counter on.
