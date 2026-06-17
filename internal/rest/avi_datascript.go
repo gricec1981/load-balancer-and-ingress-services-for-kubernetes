@@ -43,6 +43,15 @@ func (rest *RestOperations) AviDSBuild(ds_meta *nodes.AviHTTPDataScriptNode, cac
 	}
 	datascript := avimodels.VSDataScript{Evt: &ds_meta.Evt, Script: &ds_meta.Script}
 	datascriptlist = append(datascriptlist, &datascript)
+	// Additional event-scripts published in the SAME set (AI-gateway native
+	// token-budget gate + consume must share the set to share a rate-limiter bucket).
+	for _, extra := range ds_meta.ExtraDataScripts {
+		if extra == nil {
+			continue
+		}
+		evt, scr := extra.Evt, extra.Script
+		datascriptlist = append(datascriptlist, &avimodels.VSDataScript{Evt: &evt, Script: &scr})
+	}
 	tenant_ref := "/api/tenant/?name=" + lib.GetEscapedValue(ds_meta.Tenant)
 	cr := lib.AKOUser
 	vsdatascriptset := avimodels.VSDataScriptSet{

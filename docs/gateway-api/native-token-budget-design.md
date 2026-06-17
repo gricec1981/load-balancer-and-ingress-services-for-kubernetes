@@ -134,6 +134,27 @@ cross-SE accuracy, and keep `datascript` where you need the dashboard or `Log`.
   already added for request-rate (nodes/rest/cache).
 - tests + doc.
 
+## 6a. FINDING from live test (2026-06-17): split-set buckets don't share — BLOCKER
+
+End-to-end test on the controller (sub=ratetest1, group1, budget 2347): 55 requests
+× 60 tokens = 3300 consumed, **zero 429s**. Diagnosis:
+- Generated scripts correct; consume phase ran (display counter = 3300 under the
+  same identity → reqvar survived, identity consistent across phases).
+- Root cause: **avi.vs.ratelimit buckets are scoped per-VSDataScriptSet.** The gate
+  lives in the `…-ai-tok-req` set and the consume in `…-ai-tok-respdata` — two
+  different sets — so the same limiter name resolves to **two separate buckets**.
+  The gate's bucket only sees the `+1` probe per request; the consume drains a
+  different bucket that nothing checks. Hence no enforcement.
+
+**Fix:** the gate (HTTP_REQ) and the consume (HTTP_RESP_DATA) must live in **one
+VSDataScriptSet** that defines the rate_limiters once. AKO currently models one
+DataScriptSet per event, so this needs AviHTTPDataScriptNode to carry multiple
+(evt, script) entries (internal/nodes + internal/rest), and the native path to emit
+a single combined set. Then re-test.
+
+Until fixed, `backend: native` does NOT enforce — the default `backend: datascript`
+does (per-SE).
+
 ## 7. Open decisions for sign-off
 
 1. **Pre-check mechanism — RESOLVED.** Use `consume=1` probe at request time

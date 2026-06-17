@@ -90,41 +90,47 @@ func TestNativeTokenLimiterFallback(t *testing.T) {
 	}
 }
 
-// The generated scripts must gate (request) and consume (response) against the
-// native limiter, and keep the DataScript display counter.
+// Native limits must gate (HTTP_REQ) and consume (HTTP_RESP_DATA) in the dedicated
+// NativeReqScript/NativeRespDataScript (one combined set), NOT in the per-event
+// DataScript-backend scripts — so the gate and consume share a bucket.
 func TestNativeBackendScripts(t *testing.T) {
 	s := GenerateTokenAccountingScripts(nativeGroupPolicy(), ClaimModeOAuth, "vs-1")
 
-	// Request phase: native gate, per-group limiter map, reject 429, stash reqvar.
+	// Native gate (HTTP_REQ entry of the combined set).
 	for _, sub := range []string{
 		"avi.vs.ratelimit.exceed(rlname, rk, 1)",
 		nativeTokenLimiterName("vs-1", "hourly", "group1"),
 		nativeTokenLimiterName("vs-1", "hourly", "group2"),
-		`avi.http.set_reqvar("ai_tnk_hourly"`,
 		"token_budget_exceeded",
+		"unknown_group",
 	} {
-		if !strings.Contains(s.ReqScript, sub) {
-			t.Errorf("ReqScript missing %q:\n%s", sub, s.ReqScript)
+		if !strings.Contains(s.NativeReqScript, sub) {
+			t.Errorf("NativeReqScript missing %q:\n%s", sub, s.NativeReqScript)
 		}
-	}
-	// Unknown group with Budget 0 -> reject.
-	if !strings.Contains(s.ReqScript, "unknown_group") {
-		t.Errorf("ReqScript should reject unknown group (Budget 0):\n%s", s.ReqScript)
-	}
-	// Must NOT use the per-SE table counter to *enforce* in the request phase.
-	if strings.Contains(s.ReqScript, "table_lookup") {
-		t.Errorf("native gate must not enforce via table_lookup:\n%s", s.ReqScript)
 	}
 
-	// Response phase: native consume of total_tokens + display table still present.
+	// Native consume re-resolves the limiter (no cross-phase reqvar) + consumes
+	// total_tokens, and keeps the display counter.
 	for _, sub := range []string{
 		"avi.vs.ratelimit.exceed(rlname, rk, total_tokens)",
-		`avi.http.get_reqvar("ai_tnk_hourly")`,
+		nativeTokenLimiterName("vs-1", "hourly", "group1"), // re-resolved name map present
 		"table_insert", // hybrid display counter retained
 	} {
-		if !strings.Contains(s.RespDataScript, sub) {
-			t.Errorf("RespDataScript missing %q:\n%s", sub, s.RespDataScript)
+		if !strings.Contains(s.NativeRespDataScript, sub) {
+			t.Errorf("NativeRespDataScript missing %q:\n%s", sub, s.NativeRespDataScript)
 		}
+	}
+	// Must NOT depend on a reqvar surviving HTTP_REQ -> HTTP_RESP_DATA.
+	if strings.Contains(s.NativeRespDataScript, "get_reqvar(\"ai_tnk") {
+		t.Errorf("native consume must re-resolve, not read a cross-phase reqvar:\n%s", s.NativeRespDataScript)
+	}
+
+	// The native limit must NOT leak into the DataScript-backend scripts.
+	if strings.Contains(s.ReqScript, "ratelimit.exceed") || strings.Contains(s.ReqScript, "table_lookup") {
+		t.Errorf("native limit must not appear in the DataScript ReqScript:\n%s", s.ReqScript)
+	}
+	if strings.Contains(s.RespDataScript, "ratelimit.exceed") {
+		t.Errorf("native consume must not appear in the DataScript RespDataScript:\n%s", s.RespDataScript)
 	}
 }
 
@@ -141,27 +147,39 @@ func TestDataScriptBackendUnchanged(t *testing.T) {
 	}
 }
 
-// Apply attaches the native token limiters to the request AND response-data nodes
-// (so the gate and consume reference the same bucket).
-func TestNativeBackendAttachesLimitersToReqAndRespData(t *testing.T) {
+// Apply puts the native limiters + gate + consume on ONE combined DataScriptSet
+// (so the gate and consume share the bucket), and NOT on the per-event sets.
+func TestNativeBackendAttachesCombinedSet(t *testing.T) {
 	vsNode := &nodes.AviEvhVsNode{Name: "vs-1", Tenant: "admin"}
 	ApplyTokenRateLimitPolicy("key", nativeGroupPolicy(), vsNode, ClaimModeOAuth)
 
-	want := map[string]bool{
-		DSReqName("vs-1"):      false,
-		DSRespDataName("vs-1"): false,
-	}
+	var nativeSet *nodes.AviHTTPDataScriptNode
+	byName := map[string]*nodes.AviHTTPDataScriptNode{}
 	for _, ds := range vsNode.GetHTTPDSrefs() {
-		if _, ok := want[ds.Name]; ok {
-			if len(ds.RateLimiters) != 2 {
-				t.Errorf("node %s: expected 2 native limiters, got %d", ds.Name, len(ds.RateLimiters))
-			}
-			want[ds.Name] = true
+		byName[ds.Name] = ds
+		if ds.Name == DSTokNativeName("vs-1") {
+			nativeSet = ds
 		}
 	}
-	for name, seen := range want {
-		if !seen {
-			t.Errorf("expected DataScript node %s to be created with limiters", name)
+
+	if nativeSet == nil {
+		t.Fatal("expected the combined native DataScript set to be created")
+	}
+	// Both limiters defined once, on this set.
+	if len(nativeSet.RateLimiters) != 2 {
+		t.Errorf("combined set: expected 2 limiters, got %d", len(nativeSet.RateLimiters))
+	}
+	// Primary entry = HTTP_REQ gate; one extra entry = HTTP_RESP_DATA consume.
+	if nativeSet.DataScript == nil || nativeSet.DataScript.Evt != DSEvtHTTPReq {
+		t.Errorf("combined set primary entry should be HTTP_REQ, got %+v", nativeSet.DataScript)
+	}
+	if len(nativeSet.ExtraDataScripts) != 1 || nativeSet.ExtraDataScripts[0].Evt != DSEvtHTTPRespData {
+		t.Errorf("combined set should carry one HTTP_RESP_DATA extra entry, got %+v", nativeSet.ExtraDataScripts)
+	}
+	// The per-event sets must NOT carry the native limiters.
+	for _, n := range []string{DSReqName("vs-1"), DSRespDataName("vs-1")} {
+		if ds := byName[n]; ds != nil && len(ds.RateLimiters) != 0 {
+			t.Errorf("per-event set %s should have no native limiters, got %d", n, len(ds.RateLimiters))
 		}
 	}
 }
