@@ -273,7 +273,7 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 		for _, limit := range spec.Limits {
 			if nativeOK(limit) {
 				nativeReqParts = append(nativeReqParts, buildNativeGateBlock(limit, vsName))
-				nativeRespDataParts = append(nativeRespDataParts, buildNativeConsumeBlock(limit, policy.CounterEpoch, vsName))
+				nativeRespDataParts = append(nativeRespDataParts, buildNativeConsumeBlock(limit, policy.CounterEpoch))
 			}
 		}
 	}
