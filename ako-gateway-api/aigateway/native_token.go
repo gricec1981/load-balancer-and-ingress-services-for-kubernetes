@@ -66,13 +66,6 @@ func nativeTokenLimiterName(vsName, limitName, group string) string {
 	return n
 }
 
-// nativeLimitReqvar is the request-scoped var the gate phase uses to pass the
-// resolved limiter name to the consume phase (so both hit the same bucket without
-// re-resolving the group, which may not be readable in HTTP_RESP_DATA).
-func nativeLimitReqvar(limitName string) string {
-	return "ai_tnk_" + sanitizeLimiterPart(limitName)
-}
-
 // buildNativeTokenLimiters builds the RateLimiter objects for one native-backend
 // limit: one per group budget (+ an unknown-group fallback when Budget > 0), or a
 // single limiter when the limit is not grouped. count/burst = budget, period =
@@ -108,19 +101,47 @@ func buildNativeTokenLimiters(limit TokenLimit, vsName string) []*avimodels.Rate
 	return out
 }
 
-// nativeGateUsed reports whether a native limit produces a request-phase gate.
-// "Log" action limits count-but-allow, so they have no gate (consume only).
-func nativeGateUsed(limit TokenLimit) bool {
-	return limit.Action == nil || limit.Action.Type != "Log"
+// nativeRlnameResolution emits Lua that sets `local rlname` to the rate-limiter
+// name for this request's group (or the single limiter for a non-grouped limit).
+// For grouped limits, an unknown group sets rlname to the fallback name when
+// Budget > 0, else leaves it nil (the gate rejects; the consume skips). Both the
+// gate and the consume call this independently — they must NOT rely on a reqvar
+// surviving across HTTP_REQ → HTTP_RESP_DATA, so each re-resolves from the
+// (response-readable) group claim. Expects jwt_claim/identity already in scope.
+func nativeRlnameResolution(limit TokenLimit, vsName string) string {
+	grouped := limit.GroupHeader != "" && len(limit.GroupBudgets) > 0
+	if !grouped {
+		return fmt.Sprintf("  local rlname = %s\n", luaStr(nativeTokenLimiterName(vsName, limit.Name, "")))
+	}
+	var b strings.Builder
+	b.WriteString(groupReadExpr(limit.GroupHeader)) // -> local group_hdr
+	b.WriteString("  local _lm = {")
+	groups := make([]string, 0, len(limit.GroupBudgets))
+	for g := range limit.GroupBudgets {
+		groups = append(groups, g)
+	}
+	sort.Strings(groups)
+	for i, g := range groups {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "[%s]=%s", luaStr(g), luaStr(nativeTokenLimiterName(vsName, limit.Name, g)))
+	}
+	b.WriteString("}\n")
+	b.WriteString("  local rlname = _lm[group_hdr]\n")
+	if limit.Budget > 0 {
+		fmt.Fprintf(&b, "  if not rlname then rlname = %s end\n",
+			luaStr(nativeTokenLimiterName(vsName, limit.Name, nativeTokFallbackGroup)))
+	}
+	return b.String()
 }
 
-// buildNativeGateBlock emits the request-phase Lua that resolves the limiter name
-// (per group), stashes it in a reqvar, and rejects via a consume=1 probe when the
-// consumer's bucket is empty. `identity` and (for grouped limits) jwt_claim are
-// expected to already be in scope (the caller prepends the shared header).
+// buildNativeGateBlock emits the HTTP_REQ Lua: resolve the limiter name, reject an
+// unknown group (Budget 0), then reject via a consume=1 probe when the consumer's
+// bucket is empty. Lives in the same VSDataScriptSet as the consume so they share
+// the bucket. `identity`/jwt_claim are expected in scope (caller prepends header).
 func buildNativeGateBlock(limit TokenLimit, vsName string) string {
 	keyExpr := counterKeyIdentityExpr(limit.Key) // request_key dimension
-	reqvar := nativeLimitReqvar(limit.Name)
 
 	statusCode := 429
 	doRetryAfter := false
@@ -131,44 +152,20 @@ func buildNativeGateBlock(limit TokenLimit, vsName string) string {
 		doRetryAfter = limit.Action.RetryAfter
 	}
 
+	grouped := limit.GroupHeader != "" && len(limit.GroupBudgets) > 0
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "-- limit: %s (native token budget — gate)\n", limit.Name)
 	b.WriteString("do\n")
 	fmt.Fprintf(&b, "  local rk = %s\n", keyExpr)
-
-	grouped := limit.GroupHeader != "" && len(limit.GroupBudgets) > 0
-	if grouped {
-		b.WriteString(groupReadExpr(limit.GroupHeader)) // -> local group_hdr
-		b.WriteString("  local _lm = {")
-		groups := make([]string, 0, len(limit.GroupBudgets))
-		for g := range limit.GroupBudgets {
-			groups = append(groups, g)
-		}
-		sort.Strings(groups)
-		for i, g := range groups {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			fmt.Fprintf(&b, "[%s]=%s", luaStr(g), luaStr(nativeTokenLimiterName(vsName, limit.Name, g)))
-		}
-		b.WriteString("}\n")
-		b.WriteString("  local rlname = _lm[group_hdr]\n")
-		if limit.Budget > 0 {
-			fmt.Fprintf(&b, "  if not rlname then rlname = %s end\n",
-				luaStr(nativeTokenLimiterName(vsName, limit.Name, nativeTokFallbackGroup)))
-		} else {
-			b.WriteString("  if not rlname then\n")
-			b.WriteString("    avi.http.response(403, {[\"Content-Type\"]=\"application/json\"},\n")
-			b.WriteString("      '{\"error\":\"unknown_group\",\"group\":\"'..group_hdr..'\"}')\n")
-			b.WriteString("    return\n  end\n")
-		}
-	} else {
-		fmt.Fprintf(&b, "  local rlname = %s\n", luaStr(nativeTokenLimiterName(vsName, limit.Name, "")))
+	b.WriteString(nativeRlnameResolution(limit, vsName))
+	// Unknown group with no fallback budget -> reject.
+	if grouped && limit.Budget <= 0 {
+		b.WriteString("  if not rlname then\n")
+		b.WriteString("    avi.http.response(403, {[\"Content-Type\"]=\"application/json\"},\n")
+		b.WriteString("      '{\"error\":\"unknown_group\",\"group\":\"'..group_hdr..'\"}')\n")
+		b.WriteString("    return\n  end\n")
 	}
-
-	// Stash the resolved limiter name for the consume phase (same bucket).
-	fmt.Fprintf(&b, "  avi.http.set_reqvar(%s, rlname)\n", luaStr(reqvar))
-
 	// Gate: a consume=1 probe trips when the bucket is empty.
 	b.WriteString("  if avi.vs.ratelimit.exceed(rlname, rk, 1) then\n")
 	headers := `{["Content-Type"] = "application/json"`
@@ -183,30 +180,23 @@ func buildNativeGateBlock(limit TokenLimit, vsName string) string {
 	return b.String()
 }
 
-// buildNativeConsumeBlock emits the HTTP_RESP_DATA Lua for a native limit: consume
-// the parsed token count from the limiter chosen at gate time (read back from the
-// reqvar), then run the existing DataScript table increment as a display-only
-// counter so the admin/dashboard endpoint keeps working (hybrid).
-func buildNativeConsumeBlock(limit TokenLimit, epoch string) string {
+// buildNativeConsumeBlock emits the HTTP_RESP_DATA Lua for a native limit:
+// re-resolve the limiter name (no cross-phase reqvar dependency) and consume the
+// parsed token count, then run the DataScript table increment as a display-only
+// counter so the admin endpoint keeps working (hybrid).
+func buildNativeConsumeBlock(limit TokenLimit, epoch, vsName string) string {
 	keyExpr := counterKeyIdentityExpr(limit.Key)
 	dimVar := tokenDimensionExpr(limit.Tokens)
-	reqvar := nativeLimitReqvar(limit.Name)
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "-- account: %s (native consume)\n", limit.Name)
 	b.WriteString("do\n")
 	fmt.Fprintf(&b, "  local rk = %s\n", keyExpr)
-	// A non-grouped limit may have no gate phase (Log action) yet still needs a
-	// limiter name; fall back to the single-limiter name when the reqvar is unset.
-	fmt.Fprintf(&b, "  local rlname = avi.http.get_reqvar(%s) or \"\"\n", luaStr(reqvar))
-	if !nativeGateUsed(limit) && !(limit.GroupHeader != "" && len(limit.GroupBudgets) > 0) {
-		fmt.Fprintf(&b, "  if rlname == \"\" then rlname = %s end\n", luaStr(nativeTokenLimiterName("", limit.Name, "")))
-	}
-	fmt.Fprintf(&b, "  if rlname ~= \"\" then avi.vs.ratelimit.exceed(rlname, rk, %s) end\n", dimVar)
+	b.WriteString(nativeRlnameResolution(limit, vsName))
+	fmt.Fprintf(&b, "  if rlname and rlname ~= \"\" then avi.vs.ratelimit.exceed(rlname, rk, %s) end\n", dimVar)
 	b.WriteString("end\n")
 
-	// Hybrid display counter: the existing per-SE table increment still runs so the
-	// admin counters endpoint shows (approximate) usage. Enforcement is the native
-	// limiter above; this table is display-only.
+	// Hybrid display counter (per-SE table) so the admin counters endpoint shows
+	// usage; enforcement is the native limiter above.
 	return b.String() + buildRespLimitBlock(limit, epoch)
 }

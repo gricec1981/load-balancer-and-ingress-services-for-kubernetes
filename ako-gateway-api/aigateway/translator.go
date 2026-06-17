@@ -221,28 +221,28 @@ func ApplyTokenRateLimitPolicy(key string, policy *AITokenRateLimitPolicy, vsNod
 	scripts := GenerateTokenAccountingScripts(policy, mode, vsName)
 	reqScript := scripts.ReqScript
 
-	// Native-backend token limits enforce via avi.vs.ratelimit.exceed against
-	// RateLimiter objects on the DataScriptSet. The gate (request phase) and the
-	// consume (HTTP_RESP_DATA) reference the same limiter by name, so the limiters
-	// are attached to every DataScriptSet that may reference them (req, reqdata,
-	// respdata). See docs/gateway-api/native-token-budget-design.md.
+	// Native-backend (non-reqvar) token limits enforce via avi.vs.ratelimit.exceed.
+	// Their RateLimiter objects are published ONLY on the combined native set below
+	// — the gate (HTTP_REQ) and consume (HTTP_RESP_DATA) live in that one set so
+	// they share the per-set bucket (buckets are scoped per-DataScriptSet — see
+	// docs/gateway-api/native-token-budget-design.md §6a).
 	var nativeTokLimiters []*avimodels.RateLimiter
 	for _, limit := range spec.Limits {
-		if limit.UsesNativeBackend() {
+		if limit.UsesNativeBackend() && !limitUsesReqvar(limit) {
 			nativeTokLimiters = append(nativeTokLimiters, buildNativeTokenLimiters(limit, vsName)...)
 		}
 	}
 
 	// Prepend RPS rate-limit logic to the REQ DataScript when configured, and
-	// attach the matching native rate limiter to the same VSDataScriptSet. The SE
+	// attach the matching native rate limiter to that same VSDataScriptSet. The SE
 	// owns the (distributed, VS-scale-out-aware) token bucket; the script only
 	// calls avi.vs.ratelimit.exceed() against it.
-	reqRateLimiters := append([]*avimodels.RateLimiter(nil), nativeTokLimiters...)
+	var reqRateLimiters []*avimodels.RateLimiter
 	if hasRateLimit {
 		rlName := RPSRateLimiterName(vsName)
 		rlScript := buildRequestRateLimitScript(spec, rlName)
 		reqScript = rlScript + "\n\n" + reqScript
-		reqRateLimiters = append(reqRateLimiters, buildRequestRateLimiter(spec, rlName))
+		reqRateLimiters = []*avimodels.RateLimiter{buildRequestRateLimiter(spec, rlName)}
 	}
 
 	if hasTokenLimits || hasRateLimit {
@@ -250,18 +250,25 @@ func ApplyTokenRateLimitPolicy(key string, policy *AITokenRateLimitPolicy, vsNod
 	}
 	if hasTokenLimits {
 		// HTTP_RESP enables response-body buffering; HTTP_RESP_DATA reads the
-		// buffered body and does the token accounting (parses usage directly
-		// from the JSON body, no backend token-header dependency). Native limits
-		// consume against their limiter here, so they're attached to this set too.
+		// buffered body and does the DataScript-backend token accounting.
 		addDataScriptNode(key, vsName, tenant, DSRespName(vsName), DSEvtHTTPResp, scripts.RespScript, nil, vsNode)
-		addDataScriptNode(key, vsName, tenant, DSRespDataName(vsName), DSEvtHTTPRespData, scripts.RespDataScript, nativeTokLimiters, vsNode)
+		addDataScriptNode(key, vsName, tenant, DSRespDataName(vsName), DSEvtHTTPRespData, scripts.RespDataScript, nil, vsNode)
 	}
 	// Tier-dependent budgets enforce in HTTP_REQ_DATA so they can read the ai_tier
 	// reqvar set by the AIModelRoutePolicy script. ApplyModelRoutePolicy is invoked
 	// before this, so its DataScript carries a lower index and runs first (verified:
 	// reqvars cross DataScriptSets and execution follows index order).
 	if scripts.ReqDataEnforceScript != "" {
-		addDataScriptNode(key, vsName, tenant, DSReqDataEnforceName(vsName), DSEvtHTTPReqData, scripts.ReqDataEnforceScript, nativeTokLimiters, vsNode)
+		addDataScriptNode(key, vsName, tenant, DSReqDataEnforceName(vsName), DSEvtHTTPReqData, scripts.ReqDataEnforceScript, nil, vsNode)
+	}
+	// Native token budgets: gate (HTTP_REQ) + consume (HTTP_RESP_DATA) in ONE
+	// VSDataScriptSet, with the RateLimiter objects defined once on that set, so
+	// the gate and consume share the same bucket.
+	if scripts.NativeReqScript != "" {
+		addCombinedDataScriptNode(key, vsName, tenant, DSTokNativeName(vsName),
+			DSEvtHTTPReq, scripts.NativeReqScript,
+			[]*nodes.DataScript{{Evt: DSEvtHTTPRespData, Script: scripts.NativeRespDataScript}},
+			nativeTokLimiters, vsNode)
 	}
 
 	utils.AviLog.Infof("key: %s, msg: AITokenRateLimitPolicy %s/%s: registered token-accounting DataScripts on VS %s",
@@ -387,30 +394,45 @@ func buildRequestRateLimiter(spec AITokenRateLimitPolicySpec, name string) *avim
 	}
 }
 
-// addDataScriptNode adds or replaces an AviHTTPDataScriptNode in the VS's
-// HTTPDSrefs list (idempotent: replaces by name on reconcile). rateLimiters, when
-// non-nil, are the native Avi rate limiters the script references via
-// avi.vs.ratelimit.exceed() — published on the resulting VSDataScriptSet.
+// addDataScriptNode adds or replaces a single-event AviHTTPDataScriptNode in the
+// VS's HTTPDSrefs list. rateLimiters, when non-nil, are the native Avi rate
+// limiters the script references via avi.vs.ratelimit.exceed().
 func addDataScriptNode(key, vsName, tenant, dsName, evt, script string, rateLimiters []*avimodels.RateLimiter, vsNode nodes.AviVsEvhSniModel) {
-	ds := &nodes.AviHTTPDataScriptNode{
+	upsertDataScriptNode(key, vsName, &nodes.AviHTTPDataScriptNode{
 		Name:         dsName,
 		Tenant:       tenant,
 		RateLimiters: rateLimiters,
-		DataScript: &nodes.DataScript{
-			Evt:    evt,
-			Script: script,
-		},
-	}
+		DataScript:   &nodes.DataScript{Evt: evt, Script: script},
+	}, vsNode)
+}
 
+// addCombinedDataScriptNode adds or replaces an AviHTTPDataScriptNode that carries
+// MULTIPLE event-scripts in one VSDataScriptSet (the primary event + extras), so
+// scripts in different events share set-scoped state — used for the native
+// token-budget gate (HTTP_REQ) + consume (HTTP_RESP_DATA), which must share a
+// rate-limiter bucket.
+func addCombinedDataScriptNode(key, vsName, tenant, dsName, evt, script string, extra []*nodes.DataScript, rateLimiters []*avimodels.RateLimiter, vsNode nodes.AviVsEvhSniModel) {
+	upsertDataScriptNode(key, vsName, &nodes.AviHTTPDataScriptNode{
+		Name:             dsName,
+		Tenant:           tenant,
+		RateLimiters:     rateLimiters,
+		ExtraDataScripts: extra,
+		DataScript:       &nodes.DataScript{Evt: evt, Script: script},
+	}, vsNode)
+}
+
+// upsertDataScriptNode adds the node to the VS's HTTPDSrefs, replacing any
+// existing entry with the same name (idempotent on reconcile).
+func upsertDataScriptNode(key, vsName string, ds *nodes.AviHTTPDataScriptNode, vsNode nodes.AviVsEvhSniModel) {
 	existing := vsNode.GetHTTPDSrefs()
 	for i, e := range existing {
-		if e.Name == dsName {
+		if e.Name == ds.Name {
 			existing[i] = ds
 			vsNode.SetHTTPDSrefs(existing)
-			utils.AviLog.Debugf("key: %s, msg: replaced DataScript %s on VS %s", key, dsName, vsName)
+			utils.AviLog.Debugf("key: %s, msg: replaced DataScript %s on VS %s", key, ds.Name, vsName)
 			return
 		}
 	}
 	vsNode.SetHTTPDSrefs(append(existing, ds))
-	utils.AviLog.Debugf("key: %s, msg: added DataScript %s on VS %s", key, dsName, vsName)
+	utils.AviLog.Debugf("key: %s, msg: added DataScript %s on VS %s", key, ds.Name, vsName)
 }

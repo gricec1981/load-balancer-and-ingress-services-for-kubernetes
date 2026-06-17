@@ -110,6 +110,15 @@ type TokenAccountingScripts struct {
 	// model-route script (lower DataScript index sets ai_tier first — verified that
 	// reqvars cross DataScriptSets and execution follows index order).
 	ReqDataEnforceScript string
+
+	// NativeReqScript / NativeRespDataScript are the HTTP_REQ gate and
+	// HTTP_RESP_DATA consume for native-backend limits. They are published as TWO
+	// event entries in ONE VSDataScriptSet (not the per-event sets above) because
+	// avi.vs.ratelimit buckets are scoped per-DataScriptSet — the gate and consume
+	// must share the set to share the bucket (design doc §6a). Empty when no limit
+	// uses backend: native.
+	NativeReqScript      string
+	NativeRespDataScript string
 }
 
 // GenerateTokenAccountingScripts produces the two Lua DataScript snippets that
@@ -132,6 +141,7 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 	}
 
 	var reqParts, respParts, respDataParts []string
+	var nativeReqParts, nativeRespDataParts []string
 
 	// ── Shared header: resolve identity ────────────────────────────────────
 	identityBlock := buildIdentityBlock(identityHeader, fallback)
@@ -144,6 +154,12 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 	// this point would hit a nil global at request time. The counters endpoint
 	// calls it when claim-gating is configured, hence emitting it first.
 	reqParts = append(reqParts, helper)
+
+	// nativeOK reports a limit enforced by the native limiter in the dedicated
+	// combined set (gate + consume in ONE VSDataScriptSet so they share the bucket).
+	// Native + reqvar (tier) budgets aren't supported yet — the tier is only known
+	// in HTTP_REQ_DATA, so those stay on the DataScript counter.
+	nativeOK := func(l TokenLimit) bool { return l.UsesNativeBackend() && !limitUsesReqvar(l) }
 
 	// ── Read-only counters endpoint (dashboard UI) ────────────────────────
 	// Prepended *before* enforcement so it intercepts GET /v1/admin/counters and
@@ -171,14 +187,14 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 			policy.AdminToken, policy.AdminClaimName, policy.AdminClaimValue))
 	}
 
-	// ── Request-phase: enforce limits ─────────────────────────────────────
+	// ── Request-phase: DataScript-backend enforcement ─────────────────────
 	reqParts = append(reqParts, "-- AKO AI Gateway: token-budget enforcement")
 	reqParts = append(reqParts, identityBlock)
 	reqParts = append(reqParts, "local now = os.time()")
 
 	// Limits whose budget depends on the tier (groupHeader "reqvar:ai_tier") are
 	// enforced in HTTP_REQ_DATA instead, because the tier is only set there (by the
-	// model-route script). All other limits enforce in HTTP_REQ as before.
+	// model-route script). All other DataScript limits enforce in HTTP_REQ as before.
 	var reqDataEnforceParts []string
 	needReqData := false
 	for _, limit := range spec.Limits {
@@ -186,7 +202,10 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 			needReqData = true
 			continue
 		}
-		reqParts = append(reqParts, reqEnforceBlock(limit, policy.CounterEpoch, vsName))
+		if nativeOK(limit) {
+			continue // enforced in the native combined set below
+		}
+		reqParts = append(reqParts, buildReqLimitBlock(limit, policy.CounterEpoch))
 	}
 	if needReqData {
 		reqDataEnforceParts = append(reqDataEnforceParts,
@@ -196,7 +215,7 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 		reqDataEnforceParts = append(reqDataEnforceParts, "local now = os.time()")
 		for _, limit := range spec.Limits {
 			if limitUsesReqvar(limit) {
-				reqDataEnforceParts = append(reqDataEnforceParts, reqEnforceBlock(limit, policy.CounterEpoch, vsName))
+				reqDataEnforceParts = append(reqDataEnforceParts, buildReqLimitBlock(limit, policy.CounterEpoch))
 			}
 		}
 	}
@@ -215,7 +234,7 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 	// POST responses with a JSON content-type) so HTTP_RESP_DATA can read it.
 	respParts = append(respParts, buildBufferEnableBlock())
 
-	// ── Response-body phase: account for tokens ───────────────────────────
+	// ── Response-body phase: DataScript-backend accounting ────────────────
 	respDataParts = append(respDataParts, "-- AKO AI Gateway: token-usage accounting (from response body)")
 	respDataParts = append(respDataParts, helper)
 	respDataParts = append(respDataParts, identityBlock)
@@ -223,10 +242,39 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 	respDataParts = append(respDataParts, buildUsageParseBlock())
 
 	for _, limit := range spec.Limits {
-		if limit.UsesNativeBackend() {
-			respDataParts = append(respDataParts, buildNativeConsumeBlock(limit, policy.CounterEpoch))
-		} else {
-			respDataParts = append(respDataParts, buildRespLimitBlock(limit, policy.CounterEpoch))
+		if nativeOK(limit) {
+			continue // accounted in the native combined set below
+		}
+		respDataParts = append(respDataParts, buildRespLimitBlock(limit, policy.CounterEpoch))
+	}
+
+	// ── Native combined set: gate (HTTP_REQ) + consume (HTTP_RESP_DATA) live in
+	// ONE VSDataScriptSet so both reference the SAME rate-limiter bucket (buckets
+	// are scoped per-DataScriptSet — design doc §6a). Each script is self-contained
+	// (own helper + identity, and the consume re-parses usage). ─────────────────
+	hasNative := false
+	for _, limit := range spec.Limits {
+		if nativeOK(limit) {
+			hasNative = true
+			break
+		}
+	}
+	if hasNative {
+		nativeReqParts = append(nativeReqParts, "-- AKO AI Gateway: native token-budget gate (bucket shared with the consume entry in this set)")
+		nativeReqParts = append(nativeReqParts, helper)
+		nativeReqParts = append(nativeReqParts, identityBlock)
+
+		nativeRespDataParts = append(nativeRespDataParts, "-- AKO AI Gateway: native token-budget consume + display counter")
+		nativeRespDataParts = append(nativeRespDataParts, helper)
+		nativeRespDataParts = append(nativeRespDataParts, identityBlock)
+		nativeRespDataParts = append(nativeRespDataParts, "local now = os.time()")
+		nativeRespDataParts = append(nativeRespDataParts, buildUsageParseBlock())
+
+		for _, limit := range spec.Limits {
+			if nativeOK(limit) {
+				nativeReqParts = append(nativeReqParts, buildNativeGateBlock(limit, vsName))
+				nativeRespDataParts = append(nativeRespDataParts, buildNativeConsumeBlock(limit, policy.CounterEpoch, vsName))
+			}
 		}
 	}
 
@@ -239,6 +287,8 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 		RespScript:           strings.Join(respParts, "\n"),
 		RespDataScript:       strings.Join(respDataParts, "\n"),
 		ReqDataEnforceScript: strings.Join(reqDataEnforceParts, "\n"),
+		NativeReqScript:      strings.Join(nativeReqParts, "\n"),
+		NativeRespDataScript: strings.Join(nativeRespDataParts, "\n"),
 	}
 }
 
@@ -522,20 +572,6 @@ func tokenDimensionExpr(tokens string) string {
 	}
 }
 
-// reqEnforceBlock returns the request-phase enforcement Lua for one limit,
-// dispatching on the backend: native limits gate via avi.vs.ratelimit.exceed
-// (a "Log"-action native limit has no gate — consume-only); DataScript limits use
-// the per-SE table counter as before.
-func reqEnforceBlock(limit TokenLimit, epoch, vsName string) string {
-	if limit.UsesNativeBackend() {
-		if !nativeGateUsed(limit) {
-			return fmt.Sprintf("-- limit: %s (native token budget, Log action — consume only, no gate)", limit.Name)
-		}
-		return buildNativeGateBlock(limit, vsName)
-	}
-	return buildReqLimitBlock(limit, epoch)
-}
-
 // buildReqLimitBlock generates the Lua snippet that enforces one token limit in
 // the HTTP_REQ phase: look up the counter and reject if already at budget.
 // When limit.GroupHeader is set it emits a per-group budget table so each group
@@ -771,3 +807,11 @@ func DSReqDataEnforceName(vsName string) string { return vsName + DSNameSuffixRe
 // same name is used both in the RateLimiter object on the VSDataScriptSet and in
 // the avi.vs.ratelimit.exceed() call in the script — they must match.
 func RPSRateLimiterName(vsName string) string { return vsName + RPSRateLimiterSuffix }
+
+// DSNameSuffixTokNative names the single VSDataScriptSet that holds BOTH the
+// native token-budget gate (HTTP_REQ) and consume (HTTP_RESP_DATA) entries, so
+// they share the per-set rate-limiter bucket.
+const DSNameSuffixTokNative = "-ai-tok-native"
+
+// DSTokNativeName builds the native combined DataScript-set name for a VS.
+func DSTokNativeName(vsName string) string { return vsName + DSNameSuffixTokNative }
