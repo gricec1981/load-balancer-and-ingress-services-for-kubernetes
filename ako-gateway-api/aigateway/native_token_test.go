@@ -96,9 +96,12 @@ func TestNativeTokenLimiterFallback(t *testing.T) {
 func TestNativeBackendScripts(t *testing.T) {
 	s := GenerateTokenAccountingScripts(nativeGroupPolicy(), ClaimModeOAuth, "vs-1")
 
-	// Native gate (HTTP_REQ entry of the combined set).
+	// Native gate (HTTP_REQ): apply the deferred carry to the distributed limiter,
+	// then probe-gate; reject over-budget / unknown group.
 	for _, sub := range []string{
-		"avi.vs.ratelimit.exceed(rlname, rk, 1)",
+		"avi.vs.ratelimit.exceed(rlname, rk, _carry)", // deferred carry charge
+		"avi.vs.ratelimit.exceed(rlname, rk, 1)",      // probe gate
+		"table_lookup(_ck)",                           // read carry
 		nativeTokenLimiterName("vs-1", "hourly", "group1"),
 		nativeTokenLimiterName("vs-1", "hourly", "group2"),
 		"token_budget_exceeded",
@@ -109,20 +112,20 @@ func TestNativeBackendScripts(t *testing.T) {
 		}
 	}
 
-	// Native consume re-resolves the limiter (no cross-phase reqvar) + consumes
-	// total_tokens, and keeps the display counter.
+	// Native consume (HTTP_RESP_DATA): stage actual tokens into the carry table; it
+	// must NOT charge the limiter here (that can't drain the gate's bucket), and
+	// keeps the display counter.
 	for _, sub := range []string{
-		"avi.vs.ratelimit.exceed(rlname, rk, total_tokens)",
-		nativeTokenLimiterName("vs-1", "hourly", "group1"), // re-resolved name map present
-		"table_insert", // hybrid display counter retained
+		"_carry + total_tokens", // stage this response's actual tokens
+		"table_insert(_ck",      // carry write
+		"table_insert",          // display counter retained
 	} {
 		if !strings.Contains(s.NativeRespDataScript, sub) {
 			t.Errorf("NativeRespDataScript missing %q:\n%s", sub, s.NativeRespDataScript)
 		}
 	}
-	// Must NOT depend on a reqvar surviving HTTP_REQ -> HTTP_RESP_DATA.
-	if strings.Contains(s.NativeRespDataScript, "get_reqvar(\"ai_tnk") {
-		t.Errorf("native consume must re-resolve, not read a cross-phase reqvar:\n%s", s.NativeRespDataScript)
+	if strings.Contains(s.NativeRespDataScript, "ratelimit.exceed") {
+		t.Errorf("native consume must NOT charge the limiter (deferred carry):\n%s", s.NativeRespDataScript)
 	}
 
 	// The native limit must NOT leak into the DataScript-backend scripts.

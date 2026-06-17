@@ -166,6 +166,16 @@ func buildNativeGateBlock(limit TokenLimit, vsName string) string {
 		b.WriteString("      '{\"error\":\"unknown_group\",\"group\":\"'..group_hdr..'\"}')\n")
 		b.WriteString("    return\n  end\n")
 	}
+	// Deferred carry: apply the tokens this consumer accrued on previous responses
+	// (staged in a per-SE table by the consume entry) to the DISTRIBUTED limiter
+	// now, at request admission — the only point where the bucket can be charged.
+	// This is what links response-side token counts to request-side enforcement.
+	fmt.Fprintf(&b, "  local _ck = %s\n", nativeCarryKeyExpr(limit, ""))
+	b.WriteString("  local _carry = tonumber(avi.vs.table_lookup(_ck) or 0) or 0\n")
+	b.WriteString("  if _carry > 0 then\n")
+	b.WriteString("    avi.vs.ratelimit.exceed(rlname, rk, _carry)\n")
+	b.WriteString("    avi.vs.table_remove(_ck)\n")
+	b.WriteString("  end\n")
 	// Gate: a consume=1 probe trips when the bucket is empty.
 	b.WriteString("  if avi.vs.ratelimit.exceed(rlname, rk, 1) then\n")
 	headers := `{["Content-Type"] = "application/json"`
@@ -180,23 +190,37 @@ func buildNativeGateBlock(limit TokenLimit, vsName string) string {
 	return b.String()
 }
 
-// buildNativeConsumeBlock emits the HTTP_RESP_DATA Lua for a native limit:
-// re-resolve the limiter name (no cross-phase reqvar dependency) and consume the
-// parsed token count, then run the DataScript table increment as a display-only
-// counter so the admin endpoint keeps working (hybrid).
-func buildNativeConsumeBlock(limit TokenLimit, epoch, vsName string) string {
-	keyExpr := counterKeyIdentityExpr(limit.Key)
+// nativeCarryKeyExpr returns the Lua expression for the per-SE "carry" table key:
+// tokens this consumer has used since their last request, staged here by the
+// consume phase and charged to the distributed limiter at the next request's gate.
+// Keyed by identity (no window) so it survives a window rollover between a response
+// and the consumer's next request; a TTL bounds leakage.
+func nativeCarryKeyExpr(limit TokenLimit, epoch string) string {
+	prefix := "tkcarry:" + limit.Name
+	if epoch != "" {
+		prefix = "tkcarry:" + epoch + ":" + limit.Name
+	}
+	return fmt.Sprintf("%q..\":\"..%s", prefix, counterKeyIdentityExpr(limit.Key))
+}
+
+// buildNativeConsumeBlock emits the HTTP_RESP_DATA Lua for a native limit: stage
+// this response's actual token count into the per-SE carry table (applied to the
+// distributed limiter at the consumer's next request — see buildNativeGateBlock),
+// and keep the DataScript display counter so the admin endpoint shows usage.
+func buildNativeConsumeBlock(limit TokenLimit, epoch string) string {
 	dimVar := tokenDimensionExpr(limit.Tokens)
+	windowSec := windowSeconds(limit.Window)
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "-- account: %s (native consume)\n", limit.Name)
+	fmt.Fprintf(&b, "-- account: %s (native deferred carry — applied at this consumer's next request)\n", limit.Name)
 	b.WriteString("do\n")
-	fmt.Fprintf(&b, "  local rk = %s\n", keyExpr)
-	b.WriteString(nativeRlnameResolution(limit, vsName))
-	fmt.Fprintf(&b, "  if rlname and rlname ~= \"\" then avi.vs.ratelimit.exceed(rlname, rk, %s) end\n", dimVar)
+	fmt.Fprintf(&b, "  local _ck = %s\n", nativeCarryKeyExpr(limit, ""))
+	b.WriteString("  local _carry = tonumber(avi.vs.table_lookup(_ck) or 0) or 0\n")
+	b.WriteString("  avi.vs.table_remove(_ck)\n")
+	fmt.Fprintf(&b, "  avi.vs.table_insert(_ck, tostring(_carry + %s), %d)\n", dimVar, windowSec)
 	b.WriteString("end\n")
 
-	// Hybrid display counter (per-SE table) so the admin counters endpoint shows
-	// usage; enforcement is the native limiter above.
+	// Display counter (per-SE table) so the admin counters endpoint shows usage;
+	// enforcement is the distributed limiter charged at the gate.
 	return b.String() + buildRespLimitBlock(limit, epoch)
 }

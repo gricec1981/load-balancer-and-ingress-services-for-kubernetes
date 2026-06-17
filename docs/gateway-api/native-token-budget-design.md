@@ -146,14 +146,48 @@ End-to-end test on the controller (sub=ratetest1, group1, budget 2347): 55 reque
   The gate's bucket only sees the `+1` probe per request; the consume drains a
   different bucket that nothing checks. Hence no enforcement.
 
-**Fix:** the gate (HTTP_REQ) and the consume (HTTP_RESP_DATA) must live in **one
-VSDataScriptSet** that defines the rate_limiters once. AKO currently models one
-DataScriptSet per event, so this needs AviHTTPDataScriptNode to carry multiple
-(evt, script) entries (internal/nodes + internal/rest), and the native path to emit
-a single combined set. Then re-test.
+**Attempted fix (built + tested):** co-located the gate (HTTP_REQ) and consume
+(HTTP_RESP_DATA) in ONE VSDataScriptSet (`…-ai-tok-native`) defining the
+rate_limiters once (added AviHTTPDataScriptNode.ExtraDataScripts for multi-event
+sets), and made the consume re-resolve the limiter (no cross-phase reqvar).
 
-Until fixed, `backend: native` does NOT enforce — the default `backend: datascript`
-does (per-SE).
+**Result: STILL no enforcement** (55 reqs × 60 tok = 3300 ≫ 2347 budget, zero 429s;
+display counter confirms the consume ran, parsed tokens, and used the same
+identity). Conclusion: **the bucket consumed in HTTP_RESP_DATA does not drain the
+bucket the gate checks in HTTP_REQ — even within one set.** The native limiter is a
+request-phase rate *shaper*; it cannot be drained post-response to gate the *next*
+request.
+
+**Therefore: token budgets cannot be enforced by avi.vs.ratelimit at all** (actual
+usage is only known after the response). This is the concrete, tested justification
+for a **native distributed token counter** (the SE-native brief's separate ask).
+
+Viable paths:
+1. **Estimate-based native gating** — consume an *estimate* (e.g. request
+   `max_tokens` or a fixed per-request cost) at HTTP_REQ time, where the bucket DOES
+   drain. Cross-SE and enforces, but approximate (not actual completion tokens).
+2. **Keep token budgets on `backend: datascript`** (per-SE, actual tokens, works
+   today) and use this finding as the explore-event narrative for the native
+   counter ask. Request-rate stays native (works).
+
+`backend: native` (direct consume) does NOT enforce; default `backend: datascript` does.
+
+## 6b. Working approach: deferred carry (charge at the gate)
+
+Since the limiter can only be charged at admission (HTTP_REQ), charge it there — with
+the tokens the consumer accrued on *previous* responses:
+- **HTTP_RESP_DATA (consume):** add this response's actual tokens to a per-SE carry
+  (`avi.vs.table`, keyed by identity) and to the display counter. No limiter call.
+- **HTTP_REQ (gate):** read the carry, `ratelimit.exceed(name, consumer, carry)` to
+  charge the DISTRIBUTED limiter, clear the carry, then a `consume=1` probe gates.
+
+The distributed limiter is the source of truth (cross-SE exact for everything
+charged); only each consumer's last in-flight request per SE lags (bounded, applied
+when they next hit that SE). Enforcement is one request behind (the request that
+tips over still completes — same bounded overage as the DataScript backend). Uses
+only proven primitives (the distributed limiter that already powers request-rate +
+the per-SE table) — no sideband (`avi.requests()` is request-phase + pool-bound +
+synchronous, so it can't fire from the response), no external store.
 
 ## 7. Open decisions for sign-off
 
