@@ -204,11 +204,33 @@ All traffic-tested on the 31.2.2 controller:
 - **DataScript backend enforces under traffic** (per-SE) — it trips. (Observed it
   trip earlier than the 2347 budget would predict — a separate accuracy item.)
 
-**Conclusion:** the only working token-budget enforcement today is the per-SE
-DataScript counter (actual tokens, eventually-consistent). A correct distributed
-token budget requires the **native distributed counter** primitive — now proven by
-testing, not assumed. The native-backend code on this branch does not enforce and
-should be parked behind the flag (documented dead-end) or reverted.
+## 6d. SOLVED — deferred carry, gated on the charge (2026-06-17)
+
+The bridge works after all. Mechanism:
+- **HTTP_RESP_DATA (consume):** stage this response's actual tokens into a per-SE
+  carry table (`avi.vs.table`).
+- **HTTP_REQ (gate):** read the carry and `ratelimit.exceed(name, consumer, carry)`
+  against the **distributed** limiter — and **gate on that charge's return value**.
+  Because `ratelimit.exceed` consumes all-or-nothing, a `true` means the bucket
+  can't cover the prior request's tokens → over budget → reject (leave the carry so
+  the consumer stays blocked until the window refills). Fresh request (carry 0) uses
+  a `consume=1` probe.
+
+The earlier failures were two separate bugs: (1) charging in the *response* phase —
+the bucket can only be charged at admission; (2) gating on a separate `consume=1`
+probe instead of the carry charge — all-or-nothing consumption let the bucket coast,
+so it tripped at ~1.7× budget. Gating on the charge fixes it.
+
+**Verified on the live 31.2.2 controller:** group1 budget 2347, ~60 tok/response →
+tripped at request 41 (40 OK, ~2400 tokens). Accurate to the budget ± one in-flight
+request.
+
+Properties: **distributed** (the limiter is consistent across VS scale-out),
+**actual tokens** (carry = parsed usage), **accurate** (±~1 request). Caveats:
+enforcement is one request behind (bounded overage of one request, same as the
+DataScript backend); the per-SE carry means a consumer's last in-flight request per
+SE can lag until they return to that SE; and the window is a rolling token-bucket,
+not a calendar reset. This is `backend: native` on AITokenRateLimitPolicy.
 
 ## 7. Open decisions for sign-off
 
