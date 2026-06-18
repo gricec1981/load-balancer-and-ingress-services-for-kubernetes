@@ -1,0 +1,45 @@
+---
+# a2a-gateway.yaml
+#
+# Dedicated Avi Gateway for Agent-to-Agent (A2A) traffic.
+# Kept separate from the LLM gateway (avi-gateway) for blast-radius isolation
+# and independent scaling. AKO creates a distinct Avi VS for this gateway;
+# the LLM VS and its policies are unaffected.
+#
+# Topology:
+#   orchestrator ──HTTPS──▶ a2a-gateway VIP
+#                               ├── Host: ops-agent.demo.local      → ops-agent-svc
+#                               └── Host: security-agent.demo.local → security-agent-svc
+#
+# TLS cert (run before applying):
+#   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+#     -keyout /tmp/a2a-tls.key -out /tmp/a2a-tls.crt \
+#     -subj "/CN=a2a.demo.local" \
+#     -addext "subjectAltName=DNS:ops-agent.demo.local,DNS:security-agent.demo.local"
+#   kubectl create secret tls a2a-tls -n inference \
+#     --cert=/tmp/a2a-tls.crt --key=/tmp/a2a-tls.key
+#
+# Apply order:
+#   kubectl apply -f a2a-gateway.yaml
+#   kubectl apply -f a2a-gateway-policies.yaml
+
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: a2a-gateway
+  namespace: inference
+spec:
+  gatewayClassName: avi-lb
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      allowedRoutes:
+        namespaces:
+          from: Same
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            group: ""
+            name: a2a-tls

@@ -79,13 +79,15 @@ data:
 
     CODES = {}  # auth code -> {sub, group, aud, nonce}
 
-    def mint(sub, group, aud, nonce=None, ttl=3600):
+    def mint(sub, group, aud, nonce=None, ttl=3600, extra=None):
         now = int(time.time())
         claims = {"iss": ISSUER, "sub": sub, "aud": aud, "iat": now, "exp": now + ttl,
                   "tenant": "default", "model": "mock-llm-v1", "group": group,
                   "email": sub + "@demo.local"}
         if nonce:
             claims["nonce"] = nonce
+        if extra:
+            claims.update(extra)
         return pyjwt.encode(claims, private_pem, algorithm="RS256", headers={"kid": KID})
 
     class H(BaseHTTPRequestHandler):
@@ -133,7 +135,10 @@ data:
             elif path == "/token":  # legacy direct mint (claim tests)
                 sub   = qs.get("sub", ["alice"])[0]
                 group = qs.get("group", [USERS.get(sub, "group1")])[0]
-                tok   = mint(sub, group, AUDIENCE)
+                # Any extra query param becomes an extra JWT claim (e.g. agent_id=orchestrator).
+                reserved = {"sub", "group"}
+                extra = {k: v[0] for k, v in qs.items() if k not in reserved}
+                tok   = mint(sub, group, AUDIENCE, extra=extra)
                 self._send(200, json.dumps({"token": tok, "expires_in": 3600,
                                             "sub": sub, "group": group}).encode())
             elif path == "/userinfo":

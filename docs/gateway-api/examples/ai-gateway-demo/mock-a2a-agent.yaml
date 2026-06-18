@@ -1,0 +1,280 @@
+---
+# mock-a2a-agent.yaml
+#
+# Mock A2A agent backends for the AKO AI Gateway A2A demo.
+#
+# Two agents (ops-agent, security-agent), 3 replicas each. Every response
+# includes an X-Handled-By header with the pod name so task affinity is
+# visually obvious in the demo: all follow-up tasks/get calls for a given
+# task ID must show the same pod, proving the gateway's VS-table pinning.
+#
+# A2A endpoints served by each pod:
+#   GET  /.well-known/agent.json  → agent card (name, skills, capabilities)
+#   POST /                        → JSON-RPC dispatch:
+#     tasks/send        create a task in memory, return result.id
+#     tasks/get         return task state + which pod created it
+#     tasks/cancel      mark task canceled
+#     tasks/resubscribe alias for tasks/get (SSE re-attach, simplified)
+#     <other>           JSON-RPC method_not_found error
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mock-a2a-agent-script
+  namespace: inference
+data:
+  server.py: |
+    import os, json, time, uuid
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    AGENT_NAME = os.environ.get("AGENT_NAME", "agent")
+    POD_NAME   = os.environ.get("POD_NAME",   "unknown-pod")
+
+    tasks = {}  # task_id -> {"pod": str, "state": str, "created": int}
+
+    AGENT_CARD = json.dumps({
+        "name": AGENT_NAME,
+        "description": f"Mock {AGENT_NAME} for AKO AI Gateway A2A demo",
+        "url": f"https://{AGENT_NAME}.demo.local",
+        "version": "1.0.0",
+        "capabilities": {"streaming": False, "pushNotifications": False},
+        "skills": [
+            {
+                "id": f"{AGENT_NAME}.run",
+                "name": "Run operation",
+                "description": f"Execute a {AGENT_NAME} operation and return a result",
+                "tags": [AGENT_NAME, "demo"],
+            }
+        ],
+        "securitySchemes": {"oauth2": {"type": "oauth2"}},
+    })
+
+    class H(BaseHTTPRequestHandler):
+        def _json(self, code, body):
+            out = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            # X-Handled-By lets the demo script show which replica answered.
+            self.send_header("X-Handled-By", POD_NAME)
+            self.end_headers()
+            self.wfile.write(out)
+
+        def do_GET(self):
+            if self.path.split("?")[0] == "/.well-known/agent.json":
+                out = AGENT_CARD.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(out)))
+                self.send_header("X-Handled-By", POD_NAME)
+                self.end_headers()
+                self.wfile.write(out)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0))
+            try:
+                req = json.loads(self.rfile.read(n)) if n else {}
+            except json.JSONDecodeError:
+                self._json(400, {"jsonrpc": "2.0", "id": None,
+                                 "error": {"code": -32700, "message": "parse_error"}})
+                return
+
+            rpc_id = req.get("id", 0)
+            method = req.get("method", "")
+            params = req.get("params", {})
+
+            if method == "tasks/send":
+                task_id = "task-" + uuid.uuid4().hex[:8]
+                tasks[task_id] = {
+                    "pod":     POD_NAME,
+                    "state":   "completed",
+                    "created": int(time.time()),
+                }
+                self._json(200, {
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "result": {
+                        "id": task_id,
+                        "status": {
+                            "state": "completed",
+                            "message": {
+                                "role": "agent",
+                                "parts": [{"text": f"[{POD_NAME}] task {task_id} created and completed"}],
+                            },
+                        },
+                    },
+                })
+
+            elif method in ("tasks/get", "tasks/resubscribe"):
+                task_id = params.get("id", "")
+                task    = tasks.get(task_id)
+                if task:
+                    self._json(200, {
+                        "jsonrpc": "2.0",
+                        "id": rpc_id,
+                        "result": {
+                            "id": task_id,
+                            "status": {
+                                "state": task["state"],
+                                "message": {
+                                    "role": "agent",
+                                    "parts": [{"text": (
+                                        f"[{POD_NAME}] task {task_id} — "
+                                        f"created by {task['pod']}"
+                                    )}],
+                                },
+                            },
+                        },
+                    })
+                else:
+                    self._json(200, {
+                        "jsonrpc": "2.0",
+                        "id": rpc_id,
+                        "error": {"code": -32004, "message": "task_not_found",
+                                  "data": {"id": task_id}},
+                    })
+
+            elif method == "tasks/cancel":
+                task_id = params.get("id", "")
+                if task_id in tasks:
+                    tasks[task_id]["state"] = "canceled"
+                self._json(200, {
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "result": {"id": task_id, "status": {"state": "canceled"}},
+                })
+
+            else:
+                self._json(200, {
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "error": {"code": -32601, "message": "method_not_found"},
+                })
+
+        def log_message(self, fmt, *args):
+            print(f"[{POD_NAME}] {fmt % args}", flush=True)
+
+    HTTPServer(("0.0.0.0", 8080), H).serve_forever()
+
+---
+# ─── ops-agent ────────────────────────────────────────────────────────────────
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ops-agent
+  namespace: inference
+  labels:
+    app: ops-agent
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ops-agent
+  template:
+    metadata:
+      labels:
+        app: ops-agent
+    spec:
+      containers:
+      - name: ops-agent
+        image: python:3.11-slim
+        command: ["python3", "/scripts/server.py"]
+        env:
+        - name: AGENT_NAME
+          value: "ops-agent"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /.well-known/agent.json
+            port: 8080
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+      volumes:
+      - name: scripts
+        configMap:
+          name: mock-a2a-agent-script
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ops-agent-svc
+  namespace: inference
+spec:
+  selector:
+    app: ops-agent
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+# ─── security-agent ───────────────────────────────────────────────────────────
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: security-agent
+  namespace: inference
+  labels:
+    app: security-agent
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: security-agent
+  template:
+    metadata:
+      labels:
+        app: security-agent
+    spec:
+      containers:
+      - name: security-agent
+        image: python:3.11-slim
+        command: ["python3", "/scripts/server.py"]
+        env:
+        - name: AGENT_NAME
+          value: "security-agent"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /.well-known/agent.json
+            port: 8080
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+      volumes:
+      - name: scripts
+        configMap:
+          name: mock-a2a-agent-script
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: security-agent-svc
+  namespace: inference
+spec:
+  selector:
+    app: security-agent
+  ports:
+  - port: 8080
+    targetPort: 8080

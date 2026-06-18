@@ -48,11 +48,17 @@ func ApplyA2ARoutePolicy(key string, policy *akogatewayapiaigateway.AIA2ARoutePo
 	}
 
 	// 1. Share the LLM/MCP IdP: resolve authRef and apply its OAuth graph.
+	// Also derive the effective claim mode from the referenced auth policy so the
+	// A2A DataScripts read claims the same way (jwtQuery vs OAuth browser).
+	effectiveMode := mode
 	if policy.Spec.AuthRef != nil && policy.Spec.AuthRef.Name != "" {
 		authPolicy := akogatewayapiaigateway.SharedPolicyStore().GetAuthPolicyByNsName(
 			policy.Namespace, policy.Spec.AuthRef.Name)
 		if authPolicy != nil {
 			akogatewayapiaigateway.ApplyAuthPolicy(key, authPolicy, childVsNode, authHost, routePrefix)
+			if authPolicy.Spec.EffectiveAuthMode() == akogatewayapiaigateway.ClaimModeJWTQuery {
+				effectiveMode = akogatewayapiaigateway.ClaimModeJWTQuery
+			}
 		} else {
 			utils.AviLog.Warnf("key: %s, msg: AIA2ARoutePolicy %s/%s authRef %q not found; A2A route left unauthenticated",
 				key, policy.Namespace, policy.Name, policy.Spec.AuthRef.Name)
@@ -60,7 +66,7 @@ func ApplyA2ARoutePolicy(key string, policy *akogatewayapiaigateway.AIA2ARoutePo
 	}
 
 	// 2. Generate the four A2A DataScripts and attach them to the VS.
-	scripts := akogatewayapiaigateway.GenerateA2AScripts(policy, mode)
+	scripts := akogatewayapiaigateway.GenerateA2AScripts(policy, effectiveMode)
 	vsName := childVsNode.Name
 
 	attachModelRouteDS(childVsNode,

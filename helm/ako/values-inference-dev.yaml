@@ -35,8 +35,11 @@ inferenceExtension:
 # -----------------------------------------------------------------------
 GatewayAPI:
   image:
-    repository: ghcr.io/gricec1981/ako-gateway-api   # <CHANGE ME if different>
-    tag: inference-ext                                  # <CHANGE ME if different>
+    # Gateway-API controller (agc binary). a2a-claimfix carries the A2A claimMode
+    # fix (reqdata datascript decodes the ?jwt= token in jwtQuery mode). Verified
+    # working end-to-end on the demo cluster 2026-06-18.
+    repository: akoinfdemo8161.azurecr.io/ako-gateway-api
+    tag: a2a-claimfix
     pullPolicy: Always
 
 # -----------------------------------------------------------------------
@@ -111,9 +114,13 @@ L7Settings:
 # -----------------------------------------------------------------------
 replicaCount: 1
 
+# Legacy L4/Ingress AKO container (akc binary). MUST be a legacy build, NOT a
+# gateway (agc) build — a gateway image here spawns a duplicate controller whose
+# full-sync cleanup deletes the gateway datascripts. This is the image the live
+# release (helm rev 12) actually used.
 image:
-  repository: projects.registry.vmware.com/ako/ako
-  tag: "2.1.3"
+  repository: akoinfdemo8161.azurecr.io/ako
+  tag: "inference-ext"
   pullPolicy: IfNotPresent
   pullSecrets: []
 

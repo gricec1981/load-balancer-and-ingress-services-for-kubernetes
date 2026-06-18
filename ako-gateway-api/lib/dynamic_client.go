@@ -114,6 +114,14 @@ var (
 		Version:  "v1alpha1",
 		Resource: "aiguardrailpolicies",
 	}
+
+	// AIA2ARoutePolicyGVR is the GroupVersionResource for AIA2ARoutePolicy
+	// (ai.ako.vmware.com/v1alpha1).
+	AIA2ARoutePolicyGVR = schema.GroupVersionResource{
+		Group:    "ai.ako.vmware.com",
+		Version:  "v1alpha1",
+		Resource: "aia2aroutepolicies",
+	}
 )
 
 // NewDynamicClientSet initializes dynamic client set instance
@@ -168,6 +176,9 @@ type DynamicInformers struct {
 	// AIGuardrailPolicyInformer watches AIGuardrailPolicy CRs from ai.ako.vmware.com.
 	// Only initialised when AIGateway is enabled in AKO config.
 	AIGuardrailPolicyInformer informers.GenericInformer
+	// AIA2ARoutePolicyInformer watches AIA2ARoutePolicy CRs from ai.ako.vmware.com.
+	// Only initialised when AIGateway is enabled in AKO config.
+	AIA2ARoutePolicyInformer informers.GenericInformer
 }
 
 // NewDynamicInformers initializes the DynamicInformers struct
@@ -196,6 +207,7 @@ func NewDynamicInformers(client dynamic.Interface, akoInfra bool) *DynamicInform
 		informers.AIModelRoutePolicyInformer = f.ForResource(AIModelRoutePolicyGVR)
 		informers.AIMCPRoutePolicyInformer = f.ForResource(AIMCPRoutePolicyGVR)
 		informers.AIGuardrailPolicyInformer = f.ForResource(AIGuardrailPolicyGVR)
+		informers.AIA2ARoutePolicyInformer = f.ForResource(AIA2ARoutePolicyGVR)
 	}
 	dynamicInformerInstance = informers
 	return dynamicInformerInstance

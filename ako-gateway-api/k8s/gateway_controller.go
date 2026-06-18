@@ -171,6 +171,10 @@ func (c *GatewayController) Start(stopCh <-chan struct{}) {
 			go c.dynamicInformers.AIGuardrailPolicyInformer.Informer().Run(stopCh)
 			informersList = append(informersList, c.dynamicInformers.AIGuardrailPolicyInformer.Informer().HasSynced)
 		}
+		if c.dynamicInformers.AIA2ARoutePolicyInformer != nil {
+			go c.dynamicInformers.AIA2ARoutePolicyInformer.Informer().Run(stopCh)
+			informersList = append(informersList, c.dynamicInformers.AIA2ARoutePolicyInformer.Informer().HasSynced)
+		}
 	}
 
 	if !cache.WaitForCacheSync(stopCh, informersList...) {
