@@ -81,6 +81,12 @@ type PolicyStore struct {
 
 	// routeToGuardrailPolicies: routeNsName → []policyNsName
 	routeToGuardrailPolicies map[string][]string
+
+	// a2aRoutePolicyByNsName: "namespace/name" → *AIA2ARoutePolicy
+	a2aRoutePolicyByNsName map[string]*AIA2ARoutePolicy
+
+	// routeToA2ARoutePolicies: routeNsName → []policyNsName
+	routeToA2ARoutePolicies map[string][]string
 }
 
 var (
@@ -102,6 +108,8 @@ func SharedPolicyStore() *PolicyStore {
 			routeToMCPRoutePolicies:   make(map[string][]string),
 			guardrailPolicyByNsName:   make(map[string]*AIGuardrailPolicy),
 			routeToGuardrailPolicies:  make(map[string][]string),
+			a2aRoutePolicyByNsName:    make(map[string]*AIA2ARoutePolicy),
+			routeToA2ARoutePolicies:   make(map[string][]string),
 		}
 	})
 	return globalPolicyStore

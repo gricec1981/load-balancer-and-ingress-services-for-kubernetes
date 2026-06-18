@@ -56,6 +56,7 @@ func WatchedAIGatewayPolicyGVRs() []schema.GroupVersionResource {
 		AITokenRateLimitPolicyGVR,
 		AIModelRoutePolicyGVR,
 		AIMCPRoutePolicyGVR,
+		AIA2ARoutePolicyGVR,
 	}
 }
 
