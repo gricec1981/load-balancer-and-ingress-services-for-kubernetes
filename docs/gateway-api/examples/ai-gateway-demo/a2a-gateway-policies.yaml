@@ -1,0 +1,152 @@
+---
+# a2a-gateway-policies.yaml
+#
+# AKO AI Gateway demo: Agent-to-Agent (A2A) protocol governance.
+#
+# This example shows an orchestrator agent delegating tasks to two specialist
+# agents (ops-agent, security-agent) through the Avi gateway. The gateway
+# enforces:
+#
+#   - JWT identity for each calling agent (shared IdP with the LLM gateway)
+#   - Task affinity: multi-turn task calls (get/cancel/resubscribe) pin to the
+#     backend that created the task
+#   - Per-agent method RBAC: the orchestrator may submit tasks and stream;
+#     the ops/security agents may only submit tasks (no subscriptions)
+#   - Agent card proxying with URL rewrite so backends expose internal addresses
+#
+# Topology:
+#
+#   orchestrator-agent ──A2A──▶ Avi gateway ──▶ ops-agent-svc     (3 replicas)
+#                                           └──▶ security-agent-svc (3 replicas)
+#
+# Each A2A endpoint is a separate HTTPRoute + AIA2ARoutePolicy.
+# All three share the same AIGatewayAuthPolicy (llm-auth) so agent tokens are
+# validated by the same in-cluster OIDC issuer as LLM and MCP traffic.
+#
+# Apply:
+#   kubectl apply -f jwt-issuer.yaml          # shared OIDC provider
+#   kubectl apply -f gateway.yaml             # shared Avi Gateway
+#   kubectl apply -f a2a-gateway-policies.yaml
+
+# ─── HTTPRoute: ops-agent ─────────────────────────────────────────────────────
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ops-agent-route
+  namespace: inference
+spec:
+  parentRefs:
+  - name: ai-gateway
+    namespace: inference
+  hostnames:
+  - "ops-agent.inference.example.com"
+  rules:
+  - backendRefs:
+    - name: ops-agent-svc
+      port: 8080
+
+---
+# ─── HTTPRoute: security-agent ────────────────────────────────────────────────
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: security-agent-route
+  namespace: inference
+spec:
+  parentRefs:
+  - name: ai-gateway
+    namespace: inference
+  hostnames:
+  - "security-agent.inference.example.com"
+  rules:
+  - backendRefs:
+    - name: security-agent-svc
+      port: 8080
+
+---
+# ─── AIA2ARoutePolicy: ops-agent ─────────────────────────────────────────────
+#
+# The orchestrator agent (identity: "orchestrator") may submit tasks and stream
+# results. The security auditor agent (identity: "security-agent") may only
+# query existing tasks — it cannot submit new ones to ops-agent.
+apiVersion: ai.ako.vmware.com/v1alpha1
+kind: AIA2ARoutePolicy
+metadata:
+  name: ops-agent-a2a
+  namespace: inference
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: ops-agent-route
+
+  # Share the LLM gateway's OIDC provider — agent tokens are issued by the same
+  # in-cluster jwt-issuer, with an "agent_id" claim carrying agent identity.
+  authRef:
+    name: llm-auth
+
+  # Rewrite the agent card URL to the gateway address so callers discover the
+  # gateway endpoint, not the internal pod address.
+  agentCard:
+    rewrite: true
+    url: "https://ops-agent.inference.example.com"
+
+  # Pin multi-turn task calls to the same backend replica.
+  taskAffinity:
+    timeout: 30m
+
+  # Per-agent method RBAC. Agent identity comes from the "agent_id" JWT claim.
+  agentAccess:
+    agentClaim: agent_id
+    rules:
+    - agent: orchestrator
+      allow:
+      - "tasks/send"
+      - "tasks/sendSubscribe"
+      - "tasks/get"
+      - "tasks/cancel"
+      - "tasks/resubscribe"
+    - agent: security-agent
+      allow:
+      - "tasks/get"         # read-only: security-agent may inspect tasks but not create them
+
+  onUnauthorized:
+    type: Reject
+    statusCode: 403
+
+---
+# ─── AIA2ARoutePolicy: security-agent ────────────────────────────────────────
+#
+# Only the orchestrator may submit tasks to the security agent.
+# ops-agent cannot call security-agent (not listed → denied).
+apiVersion: ai.ako.vmware.com/v1alpha1
+kind: AIA2ARoutePolicy
+metadata:
+  name: security-agent-a2a
+  namespace: inference
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: security-agent-route
+
+  authRef:
+    name: llm-auth
+
+  agentCard:
+    rewrite: true
+    url: "https://security-agent.inference.example.com"
+
+  taskAffinity:
+    timeout: 30m
+
+  agentAccess:
+    agentClaim: agent_id
+    rules:
+    - agent: orchestrator
+      allow:
+      - "tasks/*"           # orchestrator may use all task methods on security-agent
+
+  onUnauthorized:
+    type: Reject
+    statusCode: 403
