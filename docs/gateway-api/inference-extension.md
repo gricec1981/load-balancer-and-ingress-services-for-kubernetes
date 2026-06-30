@@ -206,6 +206,21 @@ Other LLM servers (e.g. TGI, Ollama) work if they expose metrics with the same n
 
 ---
 
+## Scraper behaviour
+
+**Weight updates are conditional.** The scraper compares newly computed weights against the
+last emitted set (`lastEmittedWeights`) before calling `onUpdate`. When weights are unchanged
+— steady-state load — `onUpdate` is skipped and no Avi Pool Group REST PUT is issued. This
+prevents a REST write every 15 s under idle or stable conditions. A `Debugf "weights
+unchanged"` log line is emitted on the no-change path.
+
+**Per-pod jitter is stable across scrape cycles.** Each pod is assigned a fixed time offset
+(`podJitter`) once — at `RegisterPool`, `UpdatePods`, or when a new pod appears. The offset
+is looked up from this map on every cycle and does not change. This keeps the `dt` denominator
+in the token-rate formula (`deltaGen / dt`) stable and removes up to ~13% noise that was
+present when jitter was re-rolled each cycle. Pods removed from the pool are pruned from the
+jitter map.
+
 ## Limitations
 
 - **Periodic, not per-request:** Weight adjustment happens on a configurable interval (default 15s), not per-request like the EPP ext-proc approach. Rapid load spikes within a scrape window are not reacted to immediately.
