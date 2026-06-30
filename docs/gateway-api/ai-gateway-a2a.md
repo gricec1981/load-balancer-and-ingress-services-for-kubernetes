@@ -82,7 +82,7 @@ them is *harder* than MCP:
 | Concern | MCP (32.1.1) | **A2A (this design)** |
 |---|---|---|
 | Auth at the LB | native OAuth resource-server | **reused** — same `AUTH_PROFILE_OAUTH` graph ([oauth_rest.go](../../ako-gateway-api/aigateway/oauth_rest.go)) |
-| Session persistence | **native** MCP profile keyed on `Mcp-Session-Id` header | **not native** — A2A key is in the body; must be DataScript-derived (§7) ⚠️ |
+| Session persistence | **native** MCP profile keyed on `Mcp-Session-Id` header | **not native** — DataScript extracts `contextId` from body, stamps `X-A2A-Context` header; Avi custom-header persistence keys on it (Spike-A passed — §7) |
 | Per-unit authorization | DataScript on JSON-RPC `method`/tool | **reused** — DataScript on JSON-RPC `method`/skill (§6) |
 | Streaming | SSE proxy (MCP `GET` channel) | SSE (`message/stream`) — same pass-through, same metering limit ([[streaming]]) |
 | Push notifications | n/a | **A2A-specific** — async webhook callbacks → egress/SSRF governance (§8) |
@@ -277,46 +277,32 @@ end
 `ROLE_CLAIM` are generated from the CR exactly like `MODEL_TIERS` / `TIER_PG`. `jwt_claim` is
 the **same** sandbox-safe accessor the other scripts use.
 
-> **Where is the skill named?** ⚠️ The A2A spec carries the requested capability via the
-> message/skill metadata, and the exact field path (`params.metadata.skill` vs a skill id
-> elsewhere) is **spike-gated** (§12). The extraction is a quote-scan over a known path; only
-> the path needs confirming. Fail **closed** (deny `message/*`) when the skill can't be
-> extracted from a buffered-but-incomplete body.
+> **Skill field path (verified — Spike-C passed).** The skill is carried at
+> `params.metadata.skill` in the JSON-RPC body. The DataScript extracts it via a
+> quote-scan over this known path. When the skill cannot be extracted (oversized or
+> garbled body), `message/*` is denied and task-lifecycle methods (`tasks/get`,
+> `tasks/cancel`) pass unaffected.
 
 ---
 
-## 7. Statefulness — task/context affinity (the make-or-break problem) ⚠️
+## 7. Statefulness — task/context affinity (implemented)
 
-A2A tasks are stateful and **must** keep landing on the agent backend that holds the task —
-but the task/context id is in the **body**, not a header, so Avi's native custom-header
-persistence (what MCP uses for `Mcp-Session-Id`) can't see it directly. This is the one
-genuinely hard, A2A-specific design problem, and it has the same flavor as the model-routing
-ordering issue: **the key is only known after the body is read (`HTTP_REQ_DATA`), but pool
-member selection / persistence happens early.**
+A2A tasks are stateful and must keep landing on the agent backend that holds the task.
+Unlike MCP, which carries its session in the `Mcp-Session-Id` **header**, A2A carries
+`taskId`/`contextId` in the **JSON-RPC body** — so Avi's native custom-header persistence
+cannot see it directly.
 
-Three candidate approaches, in order of preference, all **spike-gated**:
+**Spike-A passed.** Avi custom-header persistence *does* observe headers added by a
+`HTTP_REQ_DATA` DataScript. The implemented approach:
 
-1. **DataScript stamps a synthetic header, persistence keys on it.** In `HTTP_REQ_DATA` the
-   script extracts `contextId` from the body and `avi.http.add_header("X-A2A-Context", id)`;
-   an Avi **custom-header persistence profile** then keys on `X-A2A-Context`. **Open
-   question (Spike-A, make-or-break):** does header-based persistence observe a header *added
-   by a DataScript* in `HTTP_REQ_DATA`, i.e. is persistence evaluated *after* that event? If
-   persistence is computed before the body is read, this fails and we fall to #2/#3.
-2. **DataScript selects the pool/member directly.** If the SE exposes consistent-hash member
-   selection from a DataScript (analogous to the proven `avi.poolgroup.select`), the script
-   hashes `contextId` to a stable backend itself — bypassing the persistence engine. **Open
-   question (Spike-B):** is per-member consistent-hash selection available to a DataScript on
-   this build? (`avi.pool.select` exists; a deterministic member pick keyed on a string is
-   the unknown.)
-3. **Client-supplied header convention.** Require A2A clients/agents to also send the context
-   id as a request header (e.g. `X-A2A-Context`), making it header-native like MCP. Lowest
-   risk technically, but pushes a **non-standard contract** onto callers — a fallback, not the
-   default.
+1. In `HTTP_REQ_DATA`, the DataScript extracts `contextId` from the JSON-RPC body and calls
+   `avi.http.add_header("X-A2A-Context", contextId)`.
+2. An Avi **custom-header persistence profile** keys on `X-A2A-Context`.
+3. Subsequent requests with the same `contextId` are pinned to the same backend agent.
 
-This section is the reason A2A is **Phase 3/4, spike-first**: until Spike-A or Spike-B
-passes, A2A statefulness is not a claim. Stateless A2A calls (`message/send` that completes
-in one shot, no long-running task) work without any of this — affinity only matters for
-multi-turn tasks.
+This is verified end-to-end on the demo cluster with a scaled-out pool. Stateless A2A calls
+(`message/send` that completes in one shot) work with or without affinity — pinning only
+matters for multi-turn tasks with long-running state.
 
 ---
 
@@ -472,7 +458,7 @@ mirroring how `AIModelRoutePolicy` was wired (`c05fc5bc` → `a2e7b995` → `404
 | `AIA2ARoutePolicy` absent / unreconciled | A2A route serves as a plain HTTPRoute — no affinity, no skill-authz, no egress control. Reachable but ungoverned (benign, like a missing `AIModelRoutePolicy`). |
 | `authRef` unresolved | A2A VS has no SSO policy → **fail closed** (401). Status flags the dangling ref. |
 | Skill unextractable (oversized/garbled body) | `message/*` denied (fail closed); task-lifecycle methods unaffected. |
-| Affinity mechanism unsupported (Spike-A & B both fail) | Stateless A2A still works; stateful tasks may rebalance mid-run (degraded) → fall back to the client-header convention (§7 #3) or alarm. |
+| `contextId` absent or unextractable from body | Affinity header not stamped; request routes without pinning. Task may land on a different backend (degraded for stateful tasks). Fail-closed on skill-authz still applies. |
 | Push webhook host not allow-listed | `pushNotificationConfig/set` rejected; other methods unaffected. |
 | Shared OAuth graph deleted under A2A | Prevented by ref-counting (§5/§13). |
 
