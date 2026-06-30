@@ -1,29 +1,30 @@
 <!--
-  DESIGN DRAFT. Mirrors the structure/conventions of ai-gateway-mcp.md and model-routing.md.
   A2A (Agent2Agent) is the third governance surface after inference and MCP.
-  Capability claims are SPIKE-GATED against the demo Avi build — sections marked ⚠️ are
-  hypotheses to validate before they are claimed as shipping capabilities. Drafted 2026-06-07.
+  CRD, controller, translator, and demo manifests implemented on feature/ai-a2a-gateway.
+  Drafted 2026-06-07. Updated 2026-06-18 to reflect implemented state.
   NOTE: unlike MCP (native in Avi 32.1.1), A2A has NO native Avi support — it is built from
   generic Avi primitives + DataScripts, closer to model-routing than to the MCP design.
 -->
 
 # AKO AI Gateway — A2A Gateway & Agent-to-Agent Routes
 
-> **Status: Design draft (Phase 3/4).** This document specifies an **A2A Gateway** — a
-> dedicated Gateway API entry point for **Agent2Agent** (agent↔agent) traffic — and a new
-> `AIA2ARoutePolicy` CRD that governs it: shared-IdP authentication, **per-skill**
-> authorization, task/context **session affinity**, and **push-notification egress
-> control**. It completes the "govern the whole agent loop under one identity" thesis
-> (inference → tools → agents) alongside [ai-gateway.md](ai-gateway.md),
+> **Status: Implemented (feature/ai-a2a-gateway).** The `AIA2ARoutePolicy` CRD, controller,
+> DataScript generator, and translator are implemented and end-to-end verified on the demo
+> cluster (orchestrator→200, security-agent send→403/get→200, rogue→403). This document
+> covers the **A2A Gateway** — a dedicated Gateway API entry point for **Agent2Agent**
+> (agent↔agent) traffic — and the `AIA2ARoutePolicy` CRD that governs it: shared-IdP
+> authentication, **per-skill** authorization, task/context **session affinity**, and
+> **push-notification egress control**. It completes the "govern the whole agent loop under
+> one identity" thesis (inference → tools → agents) alongside [ai-gateway.md](ai-gateway.md),
 > [model-routing.md](model-routing.md), and [ai-gateway-mcp.md](ai-gateway-mcp.md), and reuses
 > their machinery (OAuth/OIDC object graph, request-body DataScript parsing, per-rule Pool
-> Groups). **It has not been implemented yet.** Sections marked ⚠️ are spike-gated.
+> Groups).
 >
 > **Key difference from MCP:** Avi 32.1.1 added *native* MCP features (session profile,
 > MCP-aware persistence). **A2A has no native Avi support.** Everything here is built from
 > generic Avi primitives + DataScripts — so A2A is architecturally closer to model routing
-> than to the MCP design, and a couple of its requirements (notably body-derived session
-> affinity) are genuine open questions, not reuse.
+> than to the MCP design. Body-derived session affinity (Spike-A) is resolved: the DataScript
+> stamps `X-A2A-Context` and Avi custom-header persistence keys on it (verified end-to-end).
 
 ---
 
@@ -213,6 +214,13 @@ valid at the LLM, MCP, and A2A gateways; enforcement is per-VS so A2A's skill-au
 rules never perturb the others. The same **reference-counting** lifecycle applies — the
 shared OAuth graph is not torn down while any LLM/MCP/A2A policy still references it (§13).
 
+> **jwtQuery mode (implemented).** When the route's `authRef` policy is configured with
+> `jwtQuery` mode (JWT delivered in `?jwt=` query param rather than `Authorization:` header),
+> `ApplyA2ARoutePolicy` detects this from the policy spec and switches the DataScript claim
+> accessor from `avi.http.oauth_get_claim` (which returns nil under jwtQuery and denied every
+> agent with 403) to `jwtQueryClaimHelper`, which decodes the query-param JWT directly. The
+> mode is derived automatically — no extra field in `AIA2ARoutePolicy` is required.
+
 > **Identity propagation across agent hops (deferred).** When orchestrator agent **A** calls
 > worker agent **B** through the gateway, the gateway validates A's token and authorizes A's
 > role. Multi-hop chains (A→B→C) where B should act **on behalf of** A raise delegation
@@ -399,45 +407,58 @@ north-star governance object, now spanning tools *and* agents.
 
 ---
 
-## 12. Feasibility — spikes to run ⚠️
+## 12. Feasibility — spike results
 
-Same method as the model-routing/MCP spikes (throwaway VS + profiles/DataScriptSet via Avi
-REST from an in-cluster pod, torn down after). **Spike-A is make-or-break for stateful A2A.**
+All make-or-break spikes passed. The implementation is verified end-to-end on the demo
+cluster (orchestrator→200, security-agent send→403/get→200, rogue→403).
 
-| # | Question | Pass criterion |
+| # | Question | Result |
 |---|---|---|
-| **A (make-or-break)** | Does Avi **custom-header persistence** observe a header **added by a `HTTP_REQ_DATA` DataScript**, so affinity can key on a body-derived `contextId` (§7 #1)? | A multi-turn task with the same `contextId` lands on the same backend agent across requests in a scaled-out pool. |
-| **B (fallback for A)** | Can a DataScript pick a **pool member by consistent hash of a string** (`contextId`) directly (§7 #2)? | Deterministic same-member selection for a given `contextId`; different ids spread. |
-| **C** | Is the A2A JSON-RPC body readable in `HTTP_REQ_DATA`, and does `method` + the **skill path** (`params.metadata.skill` per the spec — confirm) extract via the sandbox-safe scan (§6)? | `message/send` for `report.generate` denied for `guest`, allowed for `analyst`; `tasks/get` passes for both; body > 32 KB still extracts from the head (else fails closed). |
-| **D** | Push-notification egress check (§8): extract the webhook URL from `tasks/pushNotificationConfig/set` and reject a non-allowlisted host. | Registering a webhook on an unlisted host is rejected; a listed host passes. |
-| **E** | Shared-IdP / reference-counted lifecycle (§5), same as MCP Spike-5. | A token works at LLM+MCP+A2A VSes; deleting the A2A policy leaves the others intact. |
-| **F** | SSE `message/stream` proxies through the VS without full buffering, alongside affinity. | A long-lived A2A stream stays open and sticky for the session timeout. |
+| **A ✅** | Does Avi **custom-header persistence** observe a header added by a `HTTP_REQ_DATA` DataScript? | **Passed.** DataScript stamps `X-A2A-Context` in `HTTP_REQ_DATA`; Avi custom-header persistence keys on it. Multi-turn tasks with the same `contextId` land on the same backend. |
+| **B (not needed)** | DataScript-driven consistent-hash member selection as fallback for A. | Spike-A passed; Spike-B not required. |
+| **C ✅** | A2A body readable in `HTTP_REQ_DATA`; `method` + skill path extract via sandbox-safe scan. | **Passed.** `message/send` denied for unauthorized roles; `tasks/get` passes for all authenticated callers; body > 32 KB fails closed on `message/*`. |
+| **D ✅** | Push-notification egress check rejects unlisted webhook hosts. | **Passed.** `tasks/pushNotificationConfig/set` to an unlisted host returns the JSON-RPC error; listed hosts pass. |
+| **E ✅** | Shared-IdP reference-counted lifecycle (§5). | **Passed.** Token accepted at LLM+MCP+A2A VSes; deleting A2A policy leaves others intact. |
+| **F** | SSE `message/stream` proxies through the VS alongside affinity. | Not yet validated in demo — open for follow-up. |
 
-> **Residual from model-routing:** the 32 KB request-body buffer cap and `get_req_body`
-> head-buffering behaviour — unchanged here; `method`/`skill`/`contextId` sit at the JSON head.
+> **Note on jwtQuery mode:** when the `authRef` policy uses `jwtQuery` (JWT in `?jwt=`),
+> `avi.http.oauth_get_claim` returns nil and denied every agent (403). The translator now
+> detects this mode from the policy spec and switches to `jwtQueryClaimHelper` automatically.
+> See §5 for details.
 
 ---
 
-## 13. Implementation outline
+## 13. Implementation
 
-Mirrors how `AIModelRoutePolicy` was wired (`c05fc5bc` → `a2e7b995` → `404775d4`) and the MCP
-plan (§11 there):
+Implemented across three commits on `feature/ai-a2a-gateway` (`72f6fd2a` → `80d36e07` → `5fbb575e`),
+mirroring how `AIModelRoutePolicy` was wired (`c05fc5bc` → `a2e7b995` → `404775d4`).
 
-1. **CRD + Go types** — `helm/ako/crds/ai.ako.vmware.com_aia2aroutepolicies.yaml` and
-   `AIA2ARoutePolicy` types/deepcopy/validation in `ako-gateway-api/aigateway/`, mirroring
-   [`modelroute_types.go`](../../ako-gateway-api/aigateway/modelroute_types.go).
-2. **RBAC** — add `aia2aroutepolicies` (+ `/status`) to
-   [`helm/ako/templates/clusterrole.yaml`](../../helm/ako/templates/clusterrole.yaml) (the
-   step missed for model routing — `404775d4`; don't repeat it).
-3. **Informer + handlers** — dynamic informer + `SetupA2ARoutePolicyEventHandlers` in
+1. **CRD + Go types** ✅ — `helm/ako/crds/ai.ako.vmware.com_aia2aroutepolicies.yaml` and
+   `AIA2ARoutePolicy` types/deepcopy/validation in
+   [`ako-gateway-api/aigateway/a2aroute_types.go`](../../ako-gateway-api/aigateway/a2aroute_types.go).
+2. **RBAC** ✅ — `aia2aroutepolicies` (+ `/status`) added to
+   [`helm/ako/templates/clusterrole.yaml`](../../helm/ako/templates/clusterrole.yaml) in the
+   same commit (lesson from the model-routing miss at `404775d4`).
+3. **Informer + handlers** ✅ — dynamic informer + `SetupA2ARoutePolicyEventHandlers` in
    [`gateway_crd_controller.go`](../../ako-gateway-api/k8s/gateway_crd_controller.go), started
    in [`gateway_controller.go`](../../ako-gateway-api/k8s/gateway_controller.go), plus a
-   `PolicyStore` entry (`GetA2ARoutePoliciesForRoute`).
-4. **Translator** — `ApplyA2ARoutePolicy(...)` from the same per-child-VS hook: resolve+
-   ref-count the OAuth graph (reuse the MCP code path), emit the A2A SSO policy, attach the
-   session-affinity mechanism that Spike-A/B selects, and generate the skill-authz + push-
-   egress DataScript set (`GenerateA2AScripts`, mirroring `GenerateModelRouteScripts`).
-5. **Gateway annotation** — honor `ai.ako.vmware.com/a2a: "true"`.
+   `PolicyStore` entry (`GetA2ARoutePoliciesForRoute`) in
+   [`ako-gateway-api/aigateway/a2aroute_controller.go`](../../ako-gateway-api/aigateway/a2aroute_controller.go).
+4. **Translator** ✅ — `ApplyA2ARoutePolicy(...)` in
+   [`ako-gateway-api/nodes/avi_a2a_route.go`](../../ako-gateway-api/nodes/avi_a2a_route.go),
+   wired into the per-child-VS loop in
+   [`avi_model_l7_translator.go`](../../ako-gateway-api/nodes/avi_model_l7_translator.go)
+   immediately after the MCP block. Resolves + ref-counts the OAuth graph, emits the A2A SSO
+   policy, stamps `X-A2A-Context` for session affinity, and generates the skill-authz +
+   push-egress DataScript set. jwtQuery mode is detected from the `authRef` policy spec and
+   switches the claim accessor to `jwtQueryClaimHelper` (see §5).
+5. **DataScript generator** ✅ — `GenerateA2AScripts` in
+   [`ako-gateway-api/aigateway/a2aroute_datascript.go`](../../ako-gateway-api/aigateway/a2aroute_datascript.go),
+   mirroring `GenerateModelRouteScripts`.
+6. **Demo manifests** ✅ — complete A2A demo in
+   [`docs/gateway-api/examples/ai-gateway-demo/`](../examples/ai-gateway-demo/) including
+   `a2a-gateway.yaml`, `a2a-gateway-policies.yaml`, `mock-a2a-agent.yaml`, `setup-a2a.sh`,
+   and extended `demo.sh`.
 
 > **Status semantics.** `AIA2ARoutePolicy.status.conditions` reports an unresolved `authRef`
 > and unknown skills/roles in `skillAccess`, the same validation shape as `AIModelRoutePolicy`.
@@ -461,15 +482,18 @@ plan (§11 there):
 
 | Phase | Feature | Status |
 |---|---|---|
-| 3/4 | `AIA2ARoutePolicy` + A2A Gateway annotation; shared-IdP/separate-SSO auth | Design (this doc); **spike-gated** |
-| 3/4 | Per-skill authorization DataScript | Design; reuses model-route/MCP mechanism |
-| 3/4 | **Task/context session affinity** (body-derived) | Design; **Spike-A/B make-or-break** |
-| 3/4 | Push-notification egress allow-list | Design; Spike-D |
-| 3/4 | Per-skill call budgets via `AITokenRateLimitPolicy` | Design (reuse) |
+| 3/4 | `AIA2ARoutePolicy` CRD + A2A Gateway annotation; shared-IdP/separate-SSO auth | ✅ Implemented (`72f6fd2a`) |
+| 3/4 | Per-skill authorization DataScript | ✅ Implemented (`72f6fd2a`) |
+| 3/4 | Task/context session affinity via `X-A2A-Context` synthetic header | ✅ Implemented + verified (`80d36e07`) |
+| 3/4 | Push-notification egress allow-list | ✅ Implemented (`72f6fd2a`) |
+| 3/4 | jwtQuery mode claim accessor fix | ✅ Implemented (`5fbb575e`) |
+| 3/4 | Demo manifests + `setup-a2a.sh` | ✅ Implemented (`5fbb575e`) |
+| 3/4 | Per-skill call budgets via `AITokenRateLimitPolicy` | Planned (reuse — no new work) |
+| 3/4 | SSE `message/stream` end-to-end affinity validation | Open (Spike-F, see §12) |
 | 3.x | UI "A2A Gateways" section (external repo) | Spec (§10) |
 | 3.x | Agent Card registry onboarding + approved allow-list (default-deny) | Spec (§11) |
-| 4 | **On-behalf-of delegation** across agent hops (OAuth token exchange, RFC 8693) | Idea (§5) |
-| 4 | `AgentServer`/registry CRD — reconciled catalog (adopt onboarded routes), version/withdrawal tracking | Idea |
+| 4 | On-behalf-of delegation across agent hops (OAuth token exchange, RFC 8693) | Idea (§5) |
+| 4 | `AgentServer`/registry CRD — reconciled catalog; version/withdrawal tracking | Idea |
 | 4 | Egress lockdown via NetworkPolicy / NSX-vDefend DFW; cross-site A2A via GSLB | Idea |
 
 ---
