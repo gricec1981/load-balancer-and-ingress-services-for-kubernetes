@@ -111,12 +111,13 @@ spec:
   detectors:
     secrets:                # AKO ships & maintains the regex for these
       - aws-access-key      #   AKIA[0-9A-Z]{16}
-      - openai-api-key      #   sk-[A-Za-z0-9]{20,}
+      - openai-api-key      #   sk-[A-Za-z0-9]{20,} | sk-proj-* | sk-svcacct-*
+      - github-token        #   gh[pousr]_* (classic) + github_pat_* (fine-grained)
       - private-key         #   -----BEGIN ... PRIVATE KEY-----
       - jwt
     pii:
       - ssn                 #   \d{3}-\d{2}-\d{4}
-      - credit-card         #   13–16 digits (+ optional Luhn)
+      - credit-card         #   IIN-prefix anchored (Visa/MC/Amex/Discover/Diners); no Luhn
       - email
     promptInjection: true   # LLM: "ignore previous instructions", jailbreak, reveal-system-prompt
     toolAbuse: true         # MCP: command injection / path traversal / SSRF in tool arguments
@@ -234,11 +235,12 @@ The built-in **signature library** (AKO-maintained, the value-add — operators 
 | Detector | Regex (illustrative) |
 |---|---|
 | `aws-access-key` | `AKIA[0-9A-Z]{16}` |
-| `openai-api-key` | `sk-[A-Za-z0-9]{20,}` |
+| `openai-api-key` | `sk-[A-Za-z0-9]{48}` (legacy) \| `sk-proj-[A-Za-z0-9_-]{20,}` \| `sk-svcacct-[A-Za-z0-9_-]{20,}` |
+| `github-token` | `gh[pousr]_[A-Za-z0-9]{36,}` (classic) \| `github_pat_[A-Za-z0-9_]{82,}` (fine-grained) |
 | `private-key` | `-----BEGIN [A-Z ]+PRIVATE KEY-----` |
 | `jwt` | `eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.` |
 | `ssn` | `[0-9]{3}-[0-9]{2}-[0-9]{4}` |
-| `credit-card` | `[0-9]{13,16}` (Luhn refinement optional) |
+| `credit-card` | IIN-anchored: `4[0-9]{12,15}` (Visa) \| `5[1-5][0-9]{14}` (MC) \| `3[47][0-9]{13}` (Amex) \| `6(?:011\|5[0-9]{2})[0-9]{12}` (Discover) \| `3(?:0[0-5]\|[68][0-9])[0-9]{11}` (Diners). Luhn check not expressible in WAF regex. |
 | `email` | `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}` |
 
 ---
