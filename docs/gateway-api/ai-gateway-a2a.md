@@ -49,8 +49,9 @@ verified identity**:
 A2A is, like MCP, **JSON-RPC 2.0 over HTTPS** — which is exactly why our SE-native model
 fits it. The shape (per the A2A spec, which is still evolving):
 
-- **Discovery via an Agent Card.** Each agent publishes a JSON **Agent Card** (conventionally
-  at `/.well-known/agent-card.json`) describing its `name`, `version`, `url`, `capabilities`
+- **Discovery via an Agent Card.** Each agent publishes a JSON **Agent Card** (served today at
+  `/.well-known/agent.json`; the A2A spec is migrating the convention to `/.well-known/agent-card.json`)
+  describing its `name`, `version`, `url`, `capabilities`
   (`streaming`, `pushNotifications`), **`skills[]`** (`id`, `name`, `description`, `tags`),
   input/output modes, and **`securitySchemes`** (OAuth2/OIDC, API key, …). The Agent Card is
   the A2A analog of MCP's `server.json` — the discovery + registry primitive (§11).
@@ -369,7 +370,9 @@ A new **"A2A Gateways"** section beside the LLM/MCP views, sharing the same OIDC
 
 Operators browse a **catalog of approved agents** and onboard with a click — the direct A2A
 analog of the MCP registry ([ai-gateway-mcp.md §9](ai-gateway-mcp.md)). The catalog entry is
-the agent's **Agent Card** (`/.well-known/agent-card.json`).
+the agent's **Agent Card** (served at `/.well-known/agent.json`). This catalog is implemented
+today as the `agent-registry` ConfigMap + console view + `/.well-known/agents` federation —
+see [ai-gateway-agent-registry.md](ai-gateway-agent-registry.md).
 
 | Agent Card field | Gateway relevance |
 |---|---|

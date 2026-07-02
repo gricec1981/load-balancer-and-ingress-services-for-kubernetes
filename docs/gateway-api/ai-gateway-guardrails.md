@@ -115,7 +115,7 @@ spec:
       - private-key         #   -----BEGIN ... PRIVATE KEY-----
       - jwt
     pii:
-      - ssn                 #   \d{3}-\d{2}-\d{4}
+      - ssn                 #   validity-anchored \d{3}-\d{2}-\d{4} (excludes 000/666/900-999 area, 00 group, 0000 serial)
       - credit-card         #   13–16 digits (+ optional Luhn)
       - email
     promptInjection: true   # LLM: "ignore previous instructions", jailbreak, reveal-system-prompt
@@ -234,11 +234,15 @@ The built-in **signature library** (AKO-maintained, the value-add — operators 
 | Detector | Regex (illustrative) |
 |---|---|
 | `aws-access-key` | `AKIA[0-9A-Z]{16}` |
-| `openai-api-key` | `sk-[A-Za-z0-9]{20,}` |
+| `gcp-api-key` | `AIza[0-9A-Za-z_-]{35}` |
+| `openai-api-key` | `sk-(?:proj-\|svcacct-)?[A-Za-z0-9]{20,}` |
+| `github-token` | `gh[pousr]_[A-Za-z0-9]{36}` |
+| `github-fine-grained-pat` | `github_pat_[A-Za-z0-9_]{82,}` |
+| `slack-token` | `xox[baprs]-[0-9A-Za-z-]{10,}` |
 | `private-key` | `-----BEGIN [A-Z ]+PRIVATE KEY-----` |
-| `jwt` | `eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.` |
-| `ssn` | `[0-9]{3}-[0-9]{2}-[0-9]{4}` |
-| `credit-card` | `[0-9]{13,16}` (Luhn refinement optional) |
+| `jwt` | `eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+` |
+| `ssn` | `\b(?!000\|666\|9[0-9]{2})[0-9]{3}-(?!00)[0-9]{2}-(?!0000)[0-9]{4}\b` (boundary + validity ranges) |
+| `credit-card` | `\b(?:4[0-9]{12}(?:[0-9]{3})?\|5[1-5][0-9]{14}\|3[47][0-9]{13}\|3(?:0[0-5]\|[68][0-9])[0-9]{11}\|6(?:011\|5[0-9]{2})[0-9]{12})\b` (IIN-anchored) |
 | `email` | `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}` |
 
 ---
@@ -321,6 +325,16 @@ another policy rejects first.
 Once confirmed, the picture is: **one identity (auth) → guardrails screen the body → routing
 selects the backend → budgets meter** — the same body that model routing reads for `model`
 (and MCP/A2A read for tool/skill) is the body the WAF screens for secrets/PII.
+
+> **jwtQuery auth coexistence (implemented).** Request-phase guardrail rules target
+> `ARGS|REQUEST_BODY|!ARGS:jwt`, so the `?jwt=` query parameter used by jwtQuery auth
+> mode is **excluded from WAF scanning**. Without this exclusion the WAF would inspect
+> the opaque bearer token string, match the built-in `jwt` detector regex, and block
+> every authenticated request with a 403. The exclusion (`!ARGS:jwt`) is present in
+> `guardrail_waf.go` (commit `591de2438`, branches `feature/ai-mcp-gateway` and
+> `feature/ai-a2a-gateway`). Building an image from a branch without this fix causes
+> guardrails to 403 the auth token — if you observe unexplained 403s on a guardrailed
+> route using jwtQuery mode, verify the image includes this commit.
 
 ---
 

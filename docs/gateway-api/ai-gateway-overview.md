@@ -270,6 +270,8 @@ behavior is *spike-gated*.
 - [MCP Gateway](ai-gateway-mcp.md) — agent↔tool traffic governance
 - [Guardrails & DLP](ai-gateway-guardrails.md) · [Semantic Guardrails](ai-gateway-guardrails-semantic.md) — content inspection
 - [A2A Gateway](ai-gateway-a2a.md) — agent↔agent traffic governance
+- [A2A Agent Registry](ai-gateway-agent-registry.md) — ConfigMap catalog, console registry view, `/.well-known/agents` federation
 - [Backend mTLS](ai-gateway-backend-mtls.md) — SE↔backend mutual TLS with SPIFFE/SPIRE
 - [Multi-Site Delivery](ai-gateway-multisite.md) — cross-cluster model routing
+- [Provider Failover Design](ai-provider-failover-design.md) — cross-provider failover strategies (design only, not yet implemented)
 - [Release Notes](ai-gateway-release-notes.md) — what shipped, by date

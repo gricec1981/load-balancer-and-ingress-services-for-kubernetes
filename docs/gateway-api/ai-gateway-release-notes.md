@@ -138,3 +138,132 @@ which users to query without hardcoding them.
   you add the `admin-token-secret` annotation and its Secret.
 - No CRD schema changes; both new controls are annotations on the existing
   `AITokenRateLimitPolicy`.
+
+---
+
+## Guardrails — SSN detector hardened + full built-in secret library documented — 2026-07-02
+
+### Changes
+
+**SSN regex tightened to boundary + validity ranges**
+The `ssn` detector regex now uses word-boundary anchors (`\b`) and excludes invalid
+Social Security Number ranges (area `000`, `666`, `900-999`; group `00`; serial `0000`):
+
+```
+\b(?!000|666|9[0-9]{2})[0-9]{3}-(?!00)[0-9]{2}-(?!0000)[0-9]{4}\b
+```
+
+This reduces false positives from arbitrary nine-digit strings while catching all
+structurally valid SSNs. Previously the detector matched any `\d{3}-\d{2}-\d{4}` pattern
+without validity constraints.
+
+**Built-in secret signature set documented**
+The full set of built-in secret detectors shipped in the signature library
+(`guardrail_waf.go`) is now documented in `docs/gateway-api/ai-gateway-guardrails.md`
+§6. Detectors added since initial documentation:
+
+| Detector | Regex (illustrative) |
+|---|---|
+| `gcp-api-key` | `AIza[0-9A-Za-z_-]{35}` |
+| `github-token` | `gh[pousr]_[A-Za-z0-9]{36}` |
+| `github-fine-grained-pat` | `github_pat_[A-Za-z0-9_]{82,}` |
+| `slack-token` | `xox[baprs]-[0-9A-Za-z-]{10,}` |
+
+Specify these in `AIGuardrailPolicy.spec.detectors.secrets[]` by the names above.
+
+---
+
+## Guardrails — WAF jwtQuery exclusion (`!ARGS:jwt`) — 2026-07-02
+
+Resolves a conflict between the `AIGuardrailPolicy` WAF and jwtQuery authentication mode.
+
+### Problem
+
+Request-phase guardrail rules targeted `ARGS|REQUEST_BODY`, which includes query-string
+parameters. The `jwtQuery` auth mode carries the bearer JWT in `?jwt=`. When both a
+guardrail and jwtQuery auth were active on the same route, the WAF matched the built-in
+`jwt` detector pattern (`eyJ…`) against the query-param value and blocked every
+authenticated request (403).
+
+### Fix
+
+The request-phase rule target is now `ARGS|REQUEST_BODY|!ARGS:jwt`, excluding the `jwt`
+query parameter from WAF inspection. The SE validates the `jwt` param via its own OAuth
+resource-server path; its raw bytes are not user prompt content and should not be DLP-
+scanned. This fix is in `ako-gateway-api/aigateway/guardrail_waf.go`, commit `591de2438`,
+present on `feature/ai-mcp-gateway` and `feature/ai-a2a-gateway`.
+
+### Impact
+
+Guardrails and jwtQuery auth now coexist on the same route with no configuration change
+needed. The Stage 5 guardrails demo (see `RUNBOOK.md`) runs correctly with the guardrail
+attached and jwtQuery mode active.
+
+### Upgrade notes
+
+- Images built from a branch **without** commit `591de2438` will 403 every jwtQuery-
+  authenticated request on a guardrailed route. Verify your image includes this commit.
+- No CRD or manifest changes required.
+
+---
+
+## A2A Agent Registry — ConfigMap catalog + console view + federation endpoint — 2026-07-02
+
+Implements the **Agent Registry**: a ConfigMap-backed catalog of approved A2A agents,
+a console Agent Registry page, and a `/.well-known/agents` federation endpoint. This is
+the direct A2A counterpart to the MCP server registry. Full doc:
+`docs/gateway-api/ai-gateway-agent-registry.md`.
+
+### New features
+
+**`agent-registry` ConfigMap catalog**
+The registry lives in the `agent-registry` ConfigMap (namespace `inference`, key
+`agents.json`). Each entry (`AgentInfo`) carries: `name`, `cardURL`, `skills[]`, optional
+`health` URL (probed at read time for reachability), `scope`, `auth`, `approved`, and
+`description`. The `reachable` field is computed at read time and never persisted.
+Deliberately a ConfigMap rather than a CRD — no controller reconciliation, auditable by
+standard ConfigMap tooling.
+
+**Console Agent Registry page**
+A new **"Agent Registry"** left-nav item in the AI Gateway console shows a table (Agent /
+AgentCard / Skills / Scope / Auth / Status) with a live reachability dot per entry. A
+**"+ Add Agent"** form posts to `POST /api/agentregistry` and upserts by name.
+
+**`/.well-known/agents` federation endpoint**
+`GET /.well-known/agents` returns only entries where `approved: true` as
+`{name, card_url, skills, description}`. Served via an `HTTPRoute` (`agent-registry-route`,
+hostname `a2a.demo.local`, path prefix `/.well-known/agents`, backend `ai-gateway-ui:80`)
+on the A2A Gateway. No `AIA2ARoutePolicy` attached — public discovery, no auth required.
+
+**Demo manifest**
+`avi-mcp-gateway-demo/k8s/07-agent-registry.yaml` ships the ConfigMap pre-populated with
+`ops-agent` and `security-agent`, plus the federation HTTPRoute.
+
+### Behaviour notes
+
+- `approved: false` — agent appears in the console but is excluded from
+  `/.well-known/agents` and has no gateway route.
+- `approved: true` — agent is published at `/.well-known/agents`; a separate
+  `AIA2ARoutePolicy` is still needed to create an enforced gateway route.
+- The registry is catalog/discovery; per-agent enforcement stays in `AIA2ARoutePolicy`.
+
+### Upgrade notes
+
+- The `ai-gateway-ui` ClusterRole (`k8s/01-rbac.yaml`) must grant `configmaps` verbs
+  `create,update,patch` (previously `get,list` only) for the upsert write path.
+- Apply the demo manifest: `kubectl apply -f avi-mcp-gateway-demo/k8s/07-agent-registry.yaml`.
+- Access via `kubectl port-forward -n inference svc/ai-gateway-ui 8080:80` →
+  `http://localhost:8080` → "Agent Registry".
+
+---
+
+## Provider Failover — design doc added — 2026-07-02
+
+A design document for **AI provider failover** has been added at
+`docs/gateway-api/ai-provider-failover-design.md`. This is a **design-only** entry — no
+code is implemented. The doc covers cross-provider failover strategies (active/passive,
+active/active cost-weighted, latency-based), the Avi mechanisms that would underpin them
+(Pool Groups, health monitors, DataScript-based routing), and open design questions.
+
+This entry is included in the release notes for traceability; the feature is not available
+in any current build.
