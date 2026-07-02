@@ -51,7 +51,10 @@ var builtinSecretSignatures = map[string]string{
 
 // builtinPIISignatures maps a PII-detector name to its @rx regex.
 var builtinPIISignatures = map[string]string{
-	"ssn": `[0-9]{3}-[0-9]{2}-[0-9]{4}`,
+	// Boundary-anchored + SSN validity ranges (exclude area 000/666/900-999, group 00,
+	// serial 0000). A bare 3-2-4 digit pattern matches phone/order/ID numbers and any
+	// digit run; anchoring + range exclusions cut most of those false positives.
+	"ssn": `\b(?!000|666|9[0-9]{2})[0-9]{3}-(?!00)[0-9]{2}-(?!0000)[0-9]{4}\b`,
 	// IIN-prefix anchored pattern covering Visa, Mastercard, Amex, Diners, Discover.
 	// A bare \d{13,16} produces excessive false positives on any numeric sequence;
 	// encoding the known IIN prefixes eliminates most noise without a Luhn check

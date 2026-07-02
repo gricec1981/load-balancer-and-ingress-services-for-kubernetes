@@ -108,7 +108,7 @@ func TestGenerateGuardrailRulesRequest(t *testing.T) {
 	blob := rulesString(rules)
 	for _, sub := range []string{
 		`@rx AKIA[0-9A-Z]{16}`,               // aws secret
-		`@rx [0-9]{3}-[0-9]{2}-[0-9]{4}`,     // ssn
+		`@rx \b(?!000|666|9[0-9]{2})[0-9]{3}-(?!00)[0-9]{2}-(?!0000)[0-9]{4}\b`, // ssn (boundaries + validity ranges)
 		`(ignore|disregard|forget|override)`, // prompt injection
 		`ARGS|REQUEST_BODY`,                  // request target
 		`!ARGS:jwt`,                          // jwtQuery auth token excluded from WAF inspection
