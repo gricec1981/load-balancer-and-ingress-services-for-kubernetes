@@ -2,11 +2,7 @@
 
 An OpenResty shim that sits **behind the Avi SE as a pool member** and provides
 the one primitive the SE data path lacks today: per-chunk inspection /
-transformation of streamed LLM (SSE) traffic. It is the working reference
-implementation of the **AI Inspection Callout RFE**
-([`rfe-se-ai-native-callout.md`](../../rfe-se-ai-native-callout.md)) —
-scaffolding that proves the primitive and self-destructs the day the SE ships
-it natively.
+transformation of streamed LLM (SSE) traffic without buffering it.
 
 **Architecture rule (load-bearing):** the SE stays the *only* policy point. The
 shim executes policy passed to it as request headers (`X-DLP-Mode`,
@@ -180,17 +176,7 @@ GW=http://localhost:8080 ./test.sh      # headless asserts, exit 0 = green
 - **Tech-preview:** semantic **cache** — threshold tuning required,
   `temperature>0` caveat, DLP-before-cache invariant, ephemeral state.
 - **One-chunk-lag by construction:** async semantic guardrails (body_filter
-  forbids cosockets → verdict lands on the next chunk). A native SE callout
-  holds the chunk until the verdict — that's the RFE argument, not a bug.
+  forbids cosockets → verdict lands on the next chunk).
 - **Not production:** delta≈token heuristic, regex delta extraction, no mTLS
   shim↔sidecars, no HA/shared state (single replica keeps metering coherent).
 
-## The RFE tie-in
-
-Every one of these — streaming metering, budget kill, DLP kill **and
-redaction**, and now **semantic cache serve+capture** — is response-side,
-per-chunk work the SE data path cannot do today without buffering (= destroying)
-the stream. A single SE-native per-chunk callout (ext_proc-style,
-**RFE-4761 / the AI Inspection Callout RFE**) subsumes *all* of this: the shim
-is the proof, and it self-destructs the day the SE ships the callout.
-```

@@ -94,5 +94,5 @@ echo "# ai_shim_redactions_total, cache hits/misses, and GPU-seconds saved"
 echo "# (cache hits x running-avg generation time per model)."
 metrics
 echo
-echo "Done. Every capability shown is 'not possible' on the SE data path"
-echo "today — and all of it is one ext_proc-style callout away from native."
+echo "Done. Every capability shown is response-side, per-chunk work the SE"
+echo "data path cannot do today without buffering (= destroying) the stream."
