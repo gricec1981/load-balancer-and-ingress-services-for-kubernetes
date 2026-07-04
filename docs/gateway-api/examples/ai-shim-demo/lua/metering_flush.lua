@@ -3,7 +3,10 @@
 local ctx = ngx.ctx
 if not ctx.tokens or ctx.tokens == 0 then return end
 
-local consumer = ngx.var.http_x_auth_sub    or "anonymous"
+-- Identity: prefer x-ai-consumer (set by the SE AIGatewayAuthPolicy), then the
+-- direct X-Auth-Sub (shim-direct/demo), then anonymous. Keying on the SE's
+-- identity is what lets the dashboard's per-user counters line up.
+local consumer = ngx.var.http_x_ai_consumer or ngx.var.http_x_auth_sub or "anonymous"
 local model    = ngx.var.http_x_target_model or "unknown"
 local key      = consumer .. ":" .. model
 

@@ -129,6 +129,9 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 	reqParts = append(reqParts, "-- AKO AI Gateway: token-budget enforcement")
 	reqParts = append(reqParts, helper)
 	reqParts = append(reqParts, identityBlock)
+	// Forward the SE-resolved identity to the backend so a downstream meter
+	// (e.g. the streaming shim) can key usage by the same consumer the SE sees.
+	reqParts = append(reqParts, `if identity ~= nil and identity ~= "" then avi.http.add_header("x-ai-consumer", identity) end`)
 	reqParts = append(reqParts, "local now = os.time()")
 
 	// Limits whose budget depends on the tier (groupHeader "reqvar:ai_tier") are

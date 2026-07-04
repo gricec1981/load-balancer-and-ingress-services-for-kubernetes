@@ -46,7 +46,7 @@ end
 if prompt == "" then return end      -- nothing to key on; skip cache
 
 local model  = ngx.var.http_x_target_model or req.model or "unknown"
-local tenant = ngx.var.http_x_auth_sub or "anonymous"
+local tenant = ngx.var.http_x_ai_consumer or ngx.var.http_x_auth_sub or "anonymous"
 -- Cache namespace = model + tenant + system_hash. NEVER cross tenants.
 ctx.cache_key = { model = model, tenant = tenant,
                   system_hash = hash(system), prompt = prompt }

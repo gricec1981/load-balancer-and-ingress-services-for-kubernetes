@@ -1,8 +1,21 @@
 # Streaming token-budget enforcement + dashboard integration — design
 
 **Status:** CRD + AKO wiring **implemented and verified end-to-end through the
-Avi SE** (`perRequest` mode). Dashboard integration remains a proposal. Does
-**not** modify the auth path.
+Avi SE** (`perRequest` mode), and **dashboard integration implemented** (option
+B — the shim serves `/v1/admin/counters`, the console reads it). Does **not**
+modify the auth path.
+
+**Dashboard (B) — implemented + verified 2026-07-04:** the SE can't meter a
+streamed response, so the shim is the source of truth. It serves
+`/v1/admin/counters` (same JSON contract, gated by `X-Admin-Token`) with REAL
+per-consumer streamed tokens, keyed by the identity the SE now forwards
+(`add_header x-ai-consumer`, from the token DataScript's resolved identity). The
+`ai-gateway-ui` backend reads it (`SHIM_COUNTERS_URL` + `SHIM_ADMIN_TOKEN`) and a
+"Streaming (Shim)" console tab renders per-user streamed tokens + tiles
+(redactions, cache hit-rate, GPU-seconds saved). Verified: alice's real streamed
+tokens + non-zero redaction/cache/GPU tiles surface in the console. No Redis
+counter needed — the shim's metering dict is the store (single-replica keeps it
+coherent; multi-replica would need the shared-store variant below).
 
 **Verified 2026-07-04** on AKS `aks-inference-demo`: an `AITokenRateLimitPolicy`
 with `streaming: {enforce, mode: perRequest, perRequestCap: 15}` on the

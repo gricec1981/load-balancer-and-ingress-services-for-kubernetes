@@ -37,6 +37,13 @@ spec:
         # (the lookup side uses the rendered proxy_pass in nginx.conf).
         - name: CACHE_BACKEND
           value: "cache-service.ai-shim.svc.cluster.local:9200"
+        # gates the shim-served /v1/admin/counters (dashboard read); same token
+        # value as inference/ai-admin-token so the console's ADMIN_TOKEN works.
+        - name: ADMIN_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: ai-admin-token
+              key: token
         # - name: CLASSIFIER_HOST        # uncomment to enable the async
         #   value: "classifier.ai-shim.svc.cluster.local"   # semantic scanner
         ports: [{ containerPort: 8080 }]
