@@ -142,6 +142,11 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 			continue
 		}
 		reqParts = append(reqParts, buildReqLimitBlock(limit, policy.CounterEpoch))
+		if limit.Streaming != nil && limit.Streaming.Enforce {
+			if blk := buildStreamingHeaderBlock(limit, policy.CounterEpoch); blk != "" {
+				reqParts = append(reqParts, blk)
+			}
+		}
 	}
 	if needReqData {
 		reqDataEnforceParts = append(reqDataEnforceParts,
@@ -541,6 +546,60 @@ func buildReqLimitBlock(limit TokenLimit, epoch string) string {
 
 	fmt.Fprintf(&b, "  end\n")
 	fmt.Fprintf(&b, "end\n")
+	return b.String()
+}
+
+// buildStreamingHeaderBlock generates the HTTP_REQ Lua that hands this limit's
+// per-request token ceiling to the streaming shim via a request header (default
+// X-Token-Budget). The shim truncates the response mid-stream at that ceiling —
+// real-time enforcement the reactive, post-response counter cannot do. The
+// policy value overrides any client-supplied header (remove-then-add), so the
+// ceiling is SE-controlled, not client-controlled.
+func buildStreamingHeaderBlock(limit TokenLimit, epoch string) string {
+	sc := limit.Streaming
+	header := "X-Token-Budget"
+	if sc.Header != "" {
+		header = sc.Header
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "-- AKO AI Gateway: streaming budget for limit %s -> %s (shim truncates mid-stream)\ndo\n",
+		limit.Name, header)
+
+	if sc.Mode == "remaining" {
+		// remaining = resolved budget − running counter. Accurate only once the
+		// shim feeds real streamed counts back into the counter (design §3);
+		// until then the streaming counter stays 0 and this reads the full budget.
+		fmt.Fprintf(&b, "  local k = %s\n", counterKeyExpr(limit, epoch))
+		b.WriteString("  local cur = tonumber(avi.vs.table_lookup(k) or 0) or 0\n")
+		if limit.GroupHeader != "" && len(limit.GroupBudgets) > 0 {
+			b.WriteString(groupReadExpr(limit.GroupHeader))
+			b.WriteString("  local group_budgets = {")
+			first := true
+			for g, budget := range limit.GroupBudgets {
+				if !first {
+					b.WriteString(", ")
+				}
+				fmt.Fprintf(&b, "[%q]=%d", g, budget)
+				first = false
+			}
+			b.WriteString("}\n")
+			b.WriteString("  local budget = group_budgets[group_hdr]\n")
+			fmt.Fprintf(&b, "  if not budget then budget = %d end\n", limit.Budget)
+		} else {
+			fmt.Fprintf(&b, "  local budget = %d\n", limit.Budget)
+		}
+		b.WriteString("  local v = budget - cur\n  if v < 0 then v = 0 end\n")
+	} else {
+		// perRequest: a flat ceiling.
+		if sc.PerRequestCap <= 0 {
+			return ""
+		}
+		fmt.Fprintf(&b, "  local v = %d\n", sc.PerRequestCap)
+	}
+
+	fmt.Fprintf(&b, "  pcall(avi.http.remove_header, %q)\n", header)
+	fmt.Fprintf(&b, "  avi.http.add_header(%q, tostring(math.floor(v)))\n", header)
+	b.WriteString("end\n")
 	return b.String()
 }
 

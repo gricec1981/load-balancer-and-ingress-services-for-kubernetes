@@ -1,0 +1,31 @@
+# SE-side auth for the shim's gateway. Mirrors the live llm-auth: jwtQuery mode
+# (token in ?jwt=), validated by the Avi SE against the in-cluster jwt-issuer.
+# The SE authenticates and forwards identity as the x-ai-consumer header — the
+# shim never re-authenticates. jwtQuery is stateless bearer, so HTTP/80 is fine
+# (no TLS/redirect flow needed).
+#
+# This also makes token policies work on this route: with an auth policy present,
+# AKO emits jwtQuery claim resolution (not oauth_get_claim), so the token
+# DataScript resolves identity correctly instead of failing on a non-OAuth VS.
+apiVersion: ai.ako.vmware.com/v1alpha1
+kind: AIGatewayAuthPolicy
+metadata:
+  name: stream-llm-auth
+  namespace: ai-shim
+spec:
+  authMode: jwtQuery
+  identityHeader: x-ai-consumer
+  jwt:
+    audiences:
+    - llm-api
+    forwardClaims:
+    - group
+    identityClaim: sub
+    issuer: http://jwt-issuer.inference.svc.cluster.local:8080
+    jwksUri: http://jwt-issuer.inference.svc.cluster.local:8080/jwks
+  onFailure:
+    statusCode: 401
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: stream-llm

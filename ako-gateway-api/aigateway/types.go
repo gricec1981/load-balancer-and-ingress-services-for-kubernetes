@@ -246,6 +246,36 @@ type TokenLimit struct {
 
 	// Action controls what happens when the budget is exceeded.
 	Action *LimitAction `json:"action,omitempty"`
+
+	// Streaming, when set, hands this limit's per-request ceiling to the
+	// streaming shim (via the X-Token-Budget request header) so it can truncate
+	// a response MID-STREAM — real-time enforcement the reactive counter cannot
+	// do (it is post-response and one request behind). See
+	// docs/gateway-api/ai-streaming-token-budget-design.md.
+	Streaming *StreamingConfig `json:"streaming,omitempty"`
+}
+
+// StreamingConfig configures real-time, mid-stream budget enforcement performed
+// by the streaming shim (an SE pool member). AKO emits the resulting per-request
+// ceiling as a request header the shim reads.
+type StreamingConfig struct {
+	// Enforce, when true, emits the X-Token-Budget header for this limit.
+	Enforce bool `json:"enforce,omitempty"`
+
+	// Mode selects how the per-request ceiling is computed:
+	//   "perRequest" – a flat cap (PerRequestCap) on any single response.
+	//   "remaining"  – the consumer's remaining window budget (budget − used).
+	//                  Accurate only once the shim feeds real streamed counts back
+	//                  into the counter; otherwise it reads the full budget.
+	// Defaults to "perRequest".
+	Mode string `json:"mode,omitempty"`
+
+	// PerRequestCap is the flat token ceiling used when Mode is "perRequest".
+	PerRequestCap int64 `json:"perRequestCap,omitempty"`
+
+	// Header is the request header carrying the ceiling to the shim.
+	// Defaults to "X-Token-Budget".
+	Header string `json:"header,omitempty"`
 }
 
 // LimitAction controls the response when a token limit is exceeded.

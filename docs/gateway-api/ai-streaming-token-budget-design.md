@@ -1,7 +1,27 @@
 # Streaming token-budget enforcement + dashboard integration — design
 
-**Status:** proposal / sketch. Not implemented. Net-new work across the
-token-limit CRD, AKO, and the console. Does **not** touch the auth path.
+**Status:** CRD + AKO wiring **implemented and verified end-to-end through the
+Avi SE** (`perRequest` mode). Dashboard integration remains a proposal. Does
+**not** modify the auth path.
+
+**Verified 2026-07-04** on AKS `aks-inference-demo`: an `AITokenRateLimitPolicy`
+with `streaming: {enforce, mode: perRequest, perRequestCap: 15}` on the
+`stream-llm` route drives the SE HTTP_REQ DataScript to inject `X-Token-Budget:
+15`; the shim truncates the stream at exactly 15 tokens with **no client-set
+header** (`token_budget_exceeded`, `tokens_delivered:15`), while an
+unauthenticated request is rejected 401 by the SE. Implemented in
+`ako-gateway-api/aigateway/{types,controller,datascript}.go` + the CRD schema;
+`buildStreamingHeaderBlock` emits the header (remove-then-add so policy overrides
+any client value). `remaining` mode is implemented but reads the full budget
+until the shim feeds streamed counts back into the counter (§3) — streaming
+responses aren't buffered/metered by the SE, so that counter stays 0.
+
+**Gotcha (found + worked around):** a token policy requires the route to have an
+`AIGatewayAuthPolicy`. Without one, AKO defaults `claimMode` to OAuth and the
+token DataScript calls `avi.http.oauth_get_claim`, which wedges a non-OAuth VS
+(empty replies on every request). Attaching a jwtQuery `AIGatewayAuthPolicy` to
+`stream-llm` (auth on the SE, never on the shim) flips `claimMode` to JWTQuery
+and resolves identity correctly. See `k8s/stream-llm-auth.yaml`.
 
 Companion to the per-chunk streaming shim
 ([`examples/ai-shim-demo/`](examples/ai-shim-demo/)). Where that kit proves the

@@ -166,6 +166,36 @@ spec:
                             the window boundary.
                           type: boolean
                           default: false
+                    streaming:
+                      description: |-
+                        streaming, when set, hands this limit's per-request token
+                        ceiling to the streaming shim (via the X-Token-Budget request
+                        header) so it truncates the response MID-STREAM — real-time
+                        enforcement the reactive, post-response counter cannot do.
+                      type: object
+                      properties:
+                        enforce:
+                          description: enforce emits the X-Token-Budget header for this limit.
+                          type: boolean
+                          default: false
+                        mode:
+                          description: |-
+                            mode selects how the per-request ceiling is computed.
+                            "perRequest" is a flat cap (perRequestCap); "remaining" is
+                            the consumer's remaining window budget (budget - used).
+                          type: string
+                          default: perRequest
+                          enum:
+                          - perRequest
+                          - remaining
+                        perRequestCap:
+                          description: perRequestCap is the flat token ceiling when mode is perRequest.
+                          type: integer
+                          format: int64
+                          minimum: 0
+                        header:
+                          description: header carrying the ceiling to the shim (default X-Token-Budget).
+                          type: string
               requestRateLimit:
                 description: |-
                   requestRateLimit applies a classic requests-per-second rate limiter on

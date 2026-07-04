@@ -531,6 +531,23 @@ func unstructuredToTokenRateLimitPolicy(obj *unstructured.Unstructured) (*AIToke
 					RetryAfter: ra,
 				}
 			}
+			// streaming (real-time enforcement handed to the shim)
+			if st, found, _ := unstructured.NestedMap(lm, "streaming"); found {
+				scfg := &StreamingConfig{}
+				if v, _, _ := unstructured.NestedBool(st, "enforce"); v {
+					scfg.Enforce = v
+				}
+				if v, _, _ := unstructured.NestedString(st, "mode"); v != "" {
+					scfg.Mode = v
+				}
+				if v, _, _ := unstructured.NestedInt64(st, "perRequestCap"); v > 0 {
+					scfg.PerRequestCap = v
+				}
+				if v, _, _ := unstructured.NestedString(st, "header"); v != "" {
+					scfg.Header = v
+				}
+				tl.Streaming = scfg
+			}
 			p.Spec.Limits = append(p.Spec.Limits, tl)
 		}
 	}

@@ -1,0 +1,30 @@
+# Policy-driven streaming token budget for the shim.
+#
+# Attaches to the stream-llm HTTPRoute. The `streaming` block makes AKO emit an
+# X-Token-Budget request header (perRequest cap = 15) in the SE HTTP_REQ
+# DataScript, which the shim reads and uses to truncate the response MID-STREAM.
+# The client sends NO X-Token-Budget — the ceiling comes from this policy.
+#
+# (The cumulative `budget`/`window` are required fields; they gate at admission
+# via the reactive counter. It's set high here because streaming responses are
+# not buffered/metered by the SE, so that counter stays 0 — the real-time
+# enforcement is the shim's job, driven by the streaming block.)
+apiVersion: ai.ako.vmware.com/v1alpha1
+kind: AITokenRateLimitPolicy
+metadata:
+  name: stream-llm-budget
+  namespace: ai-shim
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: stream-llm
+  limits:
+  - name: per-request-cap
+    key: consumer
+    budget: 100000
+    window: 1h
+    streaming:
+      enforce: true
+      mode: perRequest
+      perRequestCap: 15
