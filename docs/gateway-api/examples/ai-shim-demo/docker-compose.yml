@@ -1,0 +1,44 @@
+# Laptop run of the full shim stack (no GPUs, no k8s):
+#   docker compose up --build
+#   GW=http://localhost:8080 ./demo.sh      # shim-direct (no SE in this path)
+#   GW=http://localhost:8080 ./test.sh
+#
+# This is the "for others / offline" path; the AKS + Avi-gateway topology is in
+# k8s/shim.yaml + deploy.sh. cache-service builds torch + MiniLM -> first build
+# is a few minutes and ~1GB.
+services:
+  mock:
+    image: python:3.12-alpine
+    command: ["python", "/app/mock_vllm.py"]
+    volumes:
+      - ./mock/mock_vllm.py:/app/mock_vllm.py:ro
+
+  redis:
+    image: redis/redis-stack-server:latest
+    # RediSearch + HNSW ship in this image; no config needed.
+
+  cache-service:
+    build: ./cache
+    environment:
+      REDIS_URL: "redis://redis:6379"
+      CACHE_THRESHOLD: "0.95"
+    depends_on:
+      - redis
+
+  shim:
+    image: openresty/openresty:1.25.3.1-alpine
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    environment:
+      RESOLVER: "127.0.0.11"                 # docker embedded DNS
+      MODEL_BACKEND: "mock:8000"
+      CACHE_BACKEND: "cache-service:9200"
+      CLASSIFIER_BACKEND: "127.0.0.1:9999"
+    volumes:
+      - ./nginx.conf:/conf/nginx.conf:ro
+      - ./lua:/etc/nginx/lua:ro
+      - ./docker-entrypoint.sh:/entrypoint.sh:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      - mock
+      - cache-service

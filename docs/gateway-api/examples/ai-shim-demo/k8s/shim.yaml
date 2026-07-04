@@ -1,0 +1,203 @@
+# AI per-chunk shim + semantic-cache stack, fronted by a dedicated Avi LLM
+# gateway (stream-llm.demo.local). All in an isolated `ai-shim` namespace so it
+# never disturbs the live 8-test demo in `inference`.
+#
+# nginx.conf is rendered (RESOLVER / MODEL_BACKEND / CACHE_BACKEND /
+# CLASSIFIER_BACKEND) by deploy.sh at ConfigMap-creation time, so the container
+# just execs openresty -- no in-container envsubst dependency.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ai-shim
+---
+# ConfigMaps ai-shim-conf (rendered nginx.conf + lua/*) and mock-vllm-app
+# (mock_vllm.py) are created by deploy.sh BEFORE this manifest is applied --
+# kept out of here so re-applying can't wipe their data.
+# ── the shim ──────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-shim
+  namespace: ai-shim
+  labels: { app: ai-shim }
+spec:
+  replicas: 1            # single replica keeps the shared-dict metering coherent
+  selector: { matchLabels: { app: ai-shim } }
+  template:
+    metadata:
+      labels: { app: ai-shim }
+    spec:
+      containers:
+      - name: openresty
+        image: openresty/openresty:1.25.3.1-alpine
+        command: ["/usr/local/openresty/bin/openresty"]
+        args: ["-c", "/conf/nginx.conf", "-p", "/usr/local/openresty/nginx", "-g", "daemon off;"]
+        env:
+        # cache_client.lua reads CACHE_BACKEND for the store-side cosocket
+        # (the lookup side uses the rendered proxy_pass in nginx.conf).
+        - name: CACHE_BACKEND
+          value: "cache-service.ai-shim.svc.cluster.local:9200"
+        # - name: CLASSIFIER_HOST        # uncomment to enable the async
+        #   value: "classifier.ai-shim.svc.cluster.local"   # semantic scanner
+        ports: [{ containerPort: 8080 }]
+        volumeMounts:
+        - { name: conf, mountPath: /conf }
+        - { name: conf, mountPath: /etc/nginx/lua }
+        readinessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+      volumes:
+      - name: conf
+        configMap: { name: ai-shim-conf }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-shim
+  namespace: ai-shim
+spec:
+  selector: { app: ai-shim }
+  ports: [{ port: 8080, targetPort: 8080 }]
+---
+# ── streaming mock model server ─────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-vllm
+  namespace: ai-shim
+  labels: { app: mock-vllm }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: mock-vllm } }
+  template:
+    metadata:
+      labels: { app: mock-vllm }
+    spec:
+      containers:
+      - name: mock
+        image: python:3.12-alpine
+        command: ["python", "/app/mock_vllm.py"]
+        ports: [{ containerPort: 8000 }]
+        volumeMounts: [{ name: app, mountPath: /app }]
+      volumes:
+      - name: app
+        configMap: { name: mock-vllm-app }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-vllm
+  namespace: ai-shim
+spec:
+  selector: { app: mock-vllm }
+  ports: [{ port: 8000, targetPort: 8000 }]
+---
+# ── redis-stack (RediSearch HNSW vector index) ──────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-stack
+  namespace: ai-shim
+  labels: { app: redis-stack }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: redis-stack } }
+  template:
+    metadata:
+      labels: { app: redis-stack }
+    spec:
+      containers:
+      - name: redis
+        image: redis/redis-stack-server:latest   # az acr import if DockerHub egress is blocked
+        ports: [{ containerPort: 6379 }]
+        readinessProbe:
+          tcpSocket: { port: 6379 }
+      # NOTE: ephemeral (no PVC) -- cache is warm-state only, fine for the demo.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-stack
+  namespace: ai-shim
+spec:
+  selector: { app: redis-stack }
+  ports: [{ port: 6379, targetPort: 6379 }]
+---
+# ── semantic cache service (FastAPI + MiniLM) ───────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cache-service
+  namespace: ai-shim
+  labels: { app: cache-service }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: cache-service } }
+  template:
+    metadata:
+      labels: { app: cache-service }
+    spec:
+      containers:
+      - name: cache
+        image: akoinfdemo8161.azurecr.io/cache-service:latest
+        imagePullPolicy: Always
+        env:
+        - name: REDIS_URL
+          value: "redis://redis-stack.ai-shim.svc.cluster.local:6379"
+        - name: CACHE_THRESHOLD
+          value: "0.95"
+        ports: [{ containerPort: 9200 }]
+        readinessProbe:
+          httpGet: { path: /healthz, port: 9200 }
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        resources:
+          requests: { cpu: "250m", memory: "512Mi" }
+          limits:   { memory: "1500Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cache-service
+  namespace: ai-shim
+spec:
+  selector: { app: cache-service }
+  ports: [{ port: 9200, targetPort: 9200 }]
+---
+# ── dedicated Avi LLM gateway for the shim (own VIP, own subdomain) ─────────
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: stream-llm-gateway
+  namespace: ai-shim
+spec:
+  gatewayClassName: avi-lb
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      hostname: "stream-llm.demo.local"
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: stream-llm
+  namespace: ai-shim
+spec:
+  parentRefs:
+    - name: stream-llm-gateway
+  hostnames:
+    - "stream-llm.demo.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1
+        - path:              # scoreboard reachable through the SE too
+            type: PathPrefix
+            value: /metrics
+      backendRefs:
+        - name: ai-shim
+          port: 8080
