@@ -29,6 +29,22 @@ any client value). `remaining` mode is implemented but reads the full budget
 until the shim feeds streamed counts back into the counter (§3) — streaming
 responses aren't buffered/metered by the SE, so that counter stays 0.
 
+**Cumulative budget for streaming (option 1) — shim-side, verified shim-direct
+2026-07-04:** the SE's native cumulative gate is inert on a streaming route (it
+never meters the stream). So `buildStreamingHeaderBlock` also forwards the
+resolved cumulative budget + window (`X-Budget-Total` / `X-Budget-Window`) to the
+shim; the shim (`request_guard.lua`) keeps a windowed per-consumer counter
+(`budget:<consumer>:<window>`, incremented in `metering_flush.lua`, TTL'd) and
+rejects **429** at admission once at/over budget — all-or-nothing, like the SE
+native limiter. Verified shim-direct: budget 30, 40-token responses → req1 200,
+req2/3 429 (`{"used":40,"budget":30,...,"enforced_by":"ako-ai-shim"}`). This keeps
+counters at the shim (no SE→store call, no Redis on the data path); the SE stays
+the policy source (it forwards the budget), the shim is the meter+enforcer for
+streaming. The AKO `add_header` forwarding is built + `go build`-clean but its
+through-SE path is **pending next Avi VM-up** (not deployed to avoid an
+unverified DataScript re-wedging the VS). Chosen over the Redis shared-store
+variant (which would put Redis in the SE request-admission path).
+
 **Gotcha (found + worked around):** a token policy requires the route to have an
 `AIGatewayAuthPolicy`. Without one, AKO defaults `claimMode` to OAuth and the
 token DataScript calls `avi.http.oauth_get_claim`, which wedges a non-OAuth VS

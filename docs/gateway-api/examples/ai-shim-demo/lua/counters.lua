@@ -19,8 +19,8 @@ local m = ngx.shared.metering
 -- meta keys in the dict that are NOT "<consumer>:<model>" token counters
 local function is_meta(k)
     return k:find("^requests:") or k:find("^killed:") or k:find("^avgtot:")
-        or k:find("^avgn:") or k == "redactions" or k == "cache_hits"
-        or k == "cache_misses" or k == "gpu_ms_saved"
+        or k:find("^avgn:") or k:find("^budget:") or k == "redactions"
+        or k == "cache_hits" or k == "cache_misses" or k == "gpu_ms_saved"
 end
 
 -- sum streamed tokens for a consumer across all its models

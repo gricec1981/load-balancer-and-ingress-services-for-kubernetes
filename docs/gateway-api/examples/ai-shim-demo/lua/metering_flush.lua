@@ -15,5 +15,14 @@ m:incr(key, ctx.tokens, 0)
 m:incr("requests:" .. key, 1, 0)
 if ctx.killed then m:incr("killed:" .. key, 1, 0) end
 
+-- Windowed per-consumer counter for shim-side cumulative budget enforcement
+-- (request_guard reads it). Only maintained when the SE forwards the window
+-- (X-Budget-Window). Keyed by window boundary; TTL expires old windows.
+local wsec = tonumber(ngx.var.http_x_budget_window)
+if wsec and wsec > 0 then
+    local wb = math.floor(ngx.now() / wsec) * wsec
+    m:incr("budget:" .. consumer .. ":" .. wb, ctx.tokens, 0, wsec)
+end
+
 ngx.log(ngx.INFO, "AI-SHIM metered ", key, " +", ctx.tokens,
         " tokens killed=", tostring(ctx.killed or false))

@@ -564,44 +564,51 @@ func buildStreamingHeaderBlock(limit TokenLimit, epoch string) string {
 	if sc.Header != "" {
 		header = sc.Header
 	}
+	windowSec := windowSeconds(limit.Window)
 	var b strings.Builder
-	fmt.Fprintf(&b, "-- AKO AI Gateway: streaming budget for limit %s -> %s (shim truncates mid-stream)\ndo\n",
-		limit.Name, header)
+	fmt.Fprintf(&b, "-- AKO AI Gateway: streaming budget for limit %s -> shim (per-request cap + cumulative)\ndo\n",
+		limit.Name)
 
-	if sc.Mode == "remaining" {
-		// remaining = resolved budget − running counter. Accurate only once the
-		// shim feeds real streamed counts back into the counter (design §3);
-		// until then the streaming counter stays 0 and this reads the full budget.
-		fmt.Fprintf(&b, "  local k = %s\n", counterKeyExpr(limit, epoch))
-		b.WriteString("  local cur = tonumber(avi.vs.table_lookup(k) or 0) or 0\n")
-		if limit.GroupHeader != "" && len(limit.GroupBudgets) > 0 {
-			b.WriteString(groupReadExpr(limit.GroupHeader))
-			b.WriteString("  local group_budgets = {")
-			first := true
-			for g, budget := range limit.GroupBudgets {
-				if !first {
-					b.WriteString(", ")
-				}
-				fmt.Fprintf(&b, "[%q]=%d", g, budget)
-				first = false
+	// Resolve the cumulative budget for this consumer into `budget` (group ceiling
+	// or flat). Used both for a remaining-mode per-request cap and to hand the
+	// shim the cumulative budget it enforces windowed — real-time cumulative
+	// enforcement for streaming traffic the SE counter never sees.
+	if limit.GroupHeader != "" && len(limit.GroupBudgets) > 0 {
+		b.WriteString(groupReadExpr(limit.GroupHeader))
+		b.WriteString("  local group_budgets = {")
+		first := true
+		for g, budget := range limit.GroupBudgets {
+			if !first {
+				b.WriteString(", ")
 			}
-			b.WriteString("}\n")
-			b.WriteString("  local budget = group_budgets[group_hdr]\n")
-			fmt.Fprintf(&b, "  if not budget then budget = %d end\n", limit.Budget)
-		} else {
-			fmt.Fprintf(&b, "  local budget = %d\n", limit.Budget)
+			fmt.Fprintf(&b, "[%q]=%d", g, budget)
+			first = false
 		}
-		b.WriteString("  local v = budget - cur\n  if v < 0 then v = 0 end\n")
+		b.WriteString("}\n")
+		b.WriteString("  local budget = group_budgets[group_hdr]\n")
+		fmt.Fprintf(&b, "  if not budget then budget = %d end\n", limit.Budget)
 	} else {
-		// perRequest: a flat ceiling.
-		if sc.PerRequestCap <= 0 {
-			return ""
-		}
-		fmt.Fprintf(&b, "  local v = %d\n", sc.PerRequestCap)
+		fmt.Fprintf(&b, "  local budget = %d\n", limit.Budget)
 	}
 
-	fmt.Fprintf(&b, "  pcall(avi.http.remove_header, %q)\n", header)
-	fmt.Fprintf(&b, "  avi.http.add_header(%q, tostring(math.floor(v)))\n", header)
+	// Per-request ceiling (truncate a single response mid-stream).
+	if sc.Mode == "remaining" {
+		fmt.Fprintf(&b, "  local k = %s\n", counterKeyExpr(limit, epoch))
+		b.WriteString("  local cur = tonumber(avi.vs.table_lookup(k) or 0) or 0\n")
+		b.WriteString("  local v = budget - cur\n  if v < 0 then v = 0 end\n")
+		fmt.Fprintf(&b, "  pcall(avi.http.remove_header, %q)\n", header)
+		fmt.Fprintf(&b, "  avi.http.add_header(%q, tostring(math.floor(v)))\n", header)
+	} else if sc.PerRequestCap > 0 {
+		fmt.Fprintf(&b, "  pcall(avi.http.remove_header, %q)\n", header)
+		fmt.Fprintf(&b, "  avi.http.add_header(%q, %q)\n", header, fmt.Sprintf("%d", sc.PerRequestCap))
+	}
+
+	// Cumulative budget + window handed to the shim (option 1). The shim windows
+	// a per-consumer counter and rejects (429) when over.
+	b.WriteString("  pcall(avi.http.remove_header, \"X-Budget-Total\")\n")
+	b.WriteString("  pcall(avi.http.remove_header, \"X-Budget-Window\")\n")
+	b.WriteString("  avi.http.add_header(\"X-Budget-Total\", tostring(math.floor(budget)))\n")
+	fmt.Fprintf(&b, "  avi.http.add_header(\"X-Budget-Window\", \"%d\")\n", windowSec)
 	b.WriteString("end\n")
 	return b.String()
 }
