@@ -6,6 +6,7 @@ without GPUs. Behavior hooks driven by the prompt text:
   contains "card"    -> emits a valid-Luhn PAN SPLIT across two SSE frames
                         (DLP redaction / cross-boundary catch demo)
   contains "long"    -> 200 tokens (pair with X-Token-Budget for budget kill)
+  contains "burn"    -> 500 tokens at a fast cadence (cumulative-budget burn demos)
   otherwise          -> ~40 token pleasant answer
 """
 import json, time
@@ -16,7 +17,7 @@ WORDS = ("Kubernetes native AI traffic governance runs on the service engine "
 
 def tokens_for(prompt):
     p = prompt.lower()
-    n = 200 if "long" in p else 40
+    n = 500 if "burn" in p else (200 if "long" in p else 40)
     toks = [WORDS[i % len(WORDS)] + " " for i in range(n)]
     if "leak" in p:
         toks[12] = "SECRET-API-KEY-123 "
@@ -43,10 +44,11 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
         toks = tokens_for(prompt)
+        cadence = 0.002 if "burn" in prompt.lower() else 0.08  # burn = fast, for budget demos
         for i, t in enumerate(toks):
             frame = {"choices": [{"delta": {"content": t}, "index": 0}]}
             self._sse(json.dumps(frame))
-            time.sleep(0.08)                       # visible streaming cadence
+            time.sleep(cadence)                    # streaming cadence (fast for burn)
         self._sse(json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}],
                               "usage": {"completion_tokens": len(toks)}}))
         self._sse("[DONE]")

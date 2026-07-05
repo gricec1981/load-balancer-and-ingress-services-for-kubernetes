@@ -19,8 +19,9 @@ local m = ngx.shared.metering
 -- meta keys in the dict that are NOT "<consumer>:<model>" token counters
 local function is_meta(k)
     return k:find("^requests:") or k:find("^killed:") or k:find("^avgtot:")
-        or k:find("^avgn:") or k:find("^budget:") or k == "redactions"
-        or k == "cache_hits" or k == "cache_misses" or k == "gpu_ms_saved"
+        or k:find("^avgn:") or k:find("^budget:") or k:find("^cfg_")
+        or k == "redactions" or k == "cache_hits" or k == "cache_misses"
+        or k == "gpu_ms_saved"
 end
 
 -- sum streamed tokens for a consumer across all its models
@@ -52,8 +53,9 @@ end
 
 local parts = {}
 for _, u in ipairs(users) do
-    parts[#parts + 1] = string.format('{"user":"%s","used":%d,"window_used":%d}',
-        u, used_for(u), window_used_for(u))
+    local ubudget = m:get("cfg_budget:" .. u) or budget_total
+    parts[#parts + 1] = string.format('{"user":"%s","used":%d,"window_used":%d,"budget":%d}',
+        u, used_for(u), window_used_for(u), ubudget)
 end
 
 -- shim-unique aggregate signals for the dashboard tiles

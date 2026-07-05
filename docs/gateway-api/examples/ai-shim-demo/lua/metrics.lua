@@ -25,6 +25,8 @@ for _, key in ipairs(m:get_keys(0)) do
         avgn[key:sub(6)] = v
     elseif key:find("^budget:") then
         lines[#lines + 1] = 'ai_shim_budget_window_used{key="' .. key:sub(8) .. '"} ' .. v
+    elseif key:find("^cfg_") then
+        -- forwarded budget config (not a metric) -- skip
     else
         lines[#lines + 1] = 'ai_shim_tokens_total{key="' .. key .. '"} ' .. v
     end

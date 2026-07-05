@@ -1,0 +1,33 @@
+# Burn demo: per-user streaming budgets — alice = 5000, carol = 4000.
+#
+# The CRD keys budgets by GROUP, so per-user budgets are expressed as per-group
+# budgets and each user is minted a distinct group claim:
+#   alice -> group "gold"   (?sub=alice&group=gold)   -> 5000
+#   carol -> group "silver" (?sub=carol&group=silver) -> 4000
+# streaming.enforce with NO perRequestCap => cumulative-only: the SE forwards
+# each request's resolved budget (X-Budget-Total) and the shim windows a
+# per-consumer counter, returning 429 once that consumer is at/over budget.
+# Burn it with burn.sh (fast "burn" mock trigger = 500 tokens/request).
+#
+# Replaces stream-llm-budget (one AITokenRateLimitPolicy per route).
+apiVersion: ai.ako.vmware.com/v1alpha1
+kind: AITokenRateLimitPolicy
+metadata:
+  name: stream-llm-budget
+  namespace: ai-shim
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: stream-llm
+  limits:
+  - name: per-group-budget
+    key: consumer            # counter per consumer identity
+    groupHeader: group       # budget ceiling chosen by the JWT group claim
+    groupBudgets:
+      gold: 5000
+      silver: 4000
+    budget: 0                # unknown group -> 403
+    window: 1h
+    streaming:
+      enforce: true          # cumulative-only (no perRequestCap) -> shim windows + 429s
