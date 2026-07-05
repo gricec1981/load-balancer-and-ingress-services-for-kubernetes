@@ -32,6 +32,10 @@ end
 local btotal = tonumber(ngx.var.http_x_budget_total)
 if btotal and btotal > 0 then
     local wsec = tonumber(ngx.var.http_x_budget_window) or 3600
+    -- stash the SE-forwarded budget config so /v1/admin/counters can report
+    -- usage-vs-budget to the dashboard (last-seen wins; single-budget demo).
+    ngx.shared.metering:set("cfg_budget_total", btotal)
+    ngx.shared.metering:set("cfg_budget_window", wsec)
     local consumer = ngx.var.http_x_ai_consumer or ngx.var.http_x_auth_sub or "anonymous"
     local wb = math.floor(ngx.now() / wsec) * wsec
     local used = ngx.shared.metering:get("budget:" .. consumer .. ":" .. wb) or 0

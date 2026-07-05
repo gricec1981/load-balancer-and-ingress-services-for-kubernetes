@@ -34,6 +34,17 @@ local function used_for(user)
     return total
 end
 
+-- windowed cumulative budget (option 1): the last budget/window the SE
+-- forwarded (stashed by request_guard). window_used is this consumer's usage in
+-- the current window -- what the shim enforces the cumulative 429 against.
+local budget_total  = m:get("cfg_budget_total") or 0
+local budget_window = m:get("cfg_budget_window") or 0
+local wb = (budget_window > 0) and (math.floor(ngx.now() / budget_window) * budget_window) or 0
+local function window_used_for(user)
+    if budget_window <= 0 then return 0 end
+    return m:get("budget:" .. user .. ":" .. wb) or 0
+end
+
 local users = {}
 for u in (ngx.var.arg_users or ""):gmatch("[^,]+") do
     users[#users + 1] = u
@@ -41,14 +52,15 @@ end
 
 local parts = {}
 for _, u in ipairs(users) do
-    parts[#parts + 1] = string.format('{"user":"%s","used":%d}', u, used_for(u))
+    parts[#parts + 1] = string.format('{"user":"%s","used":%d,"window_used":%d}',
+        u, used_for(u), window_used_for(u))
 end
 
 -- shim-unique aggregate signals for the dashboard tiles
 local function g(k) return m:get(k) or 0 end
 ngx.say(string.format(
-    '{"source":"ai-shim","counters":[%s],'
+    '{"source":"ai-shim","budget_total":%d,"budget_window_s":%d,"counters":[%s],'
     .. '"redactions":%d,"cache_hits":%d,"cache_misses":%d,'
     .. '"gpu_seconds_saved":%.3f}',
-    table.concat(parts, ","),
+    budget_total, budget_window, table.concat(parts, ","),
     g("redactions"), g("cache_hits"), g("cache_misses"), g("gpu_ms_saved") / 1000))
