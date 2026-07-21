@@ -33,7 +33,6 @@ OpenAI-compatible JSON and — importantly — the token-usage `usage` block in 
 | Requirement | Notes |
 |---|---|
 | Working inference-extension demo | Gateway, InferencePool, HTTPRoute already set up |
-| AKO image with AI Gateway code | This branch; toggled by `aiGateway.enabled` (no rebuild to toggle) |
 | Avi Controller reachable from AKO | AKO builds every AI Gateway object (JWT/WAF/Pool Group/DataScript) over the Avi REST API |
 | HTTPS Gateway listener + TLS cert | **Both** `AIGatewayAuthPolicy` modes — `oauthBrowser` and `jwtQuery` — require the Gateway listener to terminate TLS. `jwtQuery` removes the OAuth callback/session/cookie-jar machinery, **not** the TLS requirement itself. |
 | Issuer reachable **from AKO**, not from the SE | Under `jwtQuery`, AKO fetches the JWKS itself and embeds it in a `JWTServerProfile` — no issuer Pool, no SE-side reachability needed. (Contrast with `oauthBrowser`, where the SE reaches the issuer at runtime through an AKO-built Pool.) |
@@ -43,12 +42,45 @@ OpenAI-compatible JSON and — importantly — the token-usage `usage` block in 
 
 ---
 
-## Step 1 — Enable the AI Gateway feature
+## Step 1 — Get the code
+
+```bash
+git clone git@github-vcf.devops.broadcom.net:ANS/AI-Gateway-chris.git
+cd AI-Gateway-chris
+git checkout feature/ai-a2a-gateway
+```
+
+## Step 2 — Build and push the `ako-gateway-api` image
+
+`Dockerfile.ako-gateway-api-dev` is self-contained (compiles the Go binary, then distroless).
+Pick whichever build path matches your setup:
+
+**A — No local Docker (build remotely, lands directly in your registry):**
+
+```bash
+az acr build -r <your-acr-name> -t ako-gateway-api:<tag> -f Dockerfile.ako-gateway-api-dev .
+```
+
+**B — Local Docker:**
+
+```bash
+make dev-build-and-push-gateway-api REGISTRY=<your-registry> TAG=<tag>
+# builds `dev-docker-gateway-api` then pushes with `dev-push-gateway-api`;
+# both default to REGISTRY=ghcr.io/gricec1981 TAG=inference-ext if you omit them.
+```
+
+Either way, note the `<registry>/ako-gateway-api:<tag>` you end up with — you need it in the next step.
+
+## Step 3 — Point the chart at your image and enable the feature
 
 ```yaml
 # values.yaml
 featureGates:
   GatewayAPI: true
+GatewayAPI:
+  image:
+    repository: <registry>/ako-gateway-api   # from Step 2
+    tag: <tag>                               # from Step 2
 aiGateway:
   enabled: true
 ```
@@ -58,14 +90,10 @@ helm upgrade ako ./helm/ako -n avi-system -f values.yaml
 kubectl rollout status statefulset/ako -n avi-system
 ```
 
-> **No local Docker to build the image?** `Dockerfile.ako-gateway-api-dev` is self-contained
-> (compiles the Go binary, then distroless), so build it remotely with no Docker daemon:
-> ```bash
-> az acr build -r <your-acr> -t ako-gateway-api:<tag> -f Dockerfile.ako-gateway-api-dev .
-> ```
+## Step 4 — Confirm the flag
 
-Confirm the flag (the container is **distroless** — no `env` binary — and the flag isn't logged,
-so read the pod spec):
+The container is **distroless** — no `env` binary — and the flag isn't logged, so read the pod
+spec directly:
 
 ```bash
 kubectl get pod ako-0 -n avi-system \
@@ -76,7 +104,7 @@ kubectl get pod ako-0 -n avi-system \
 
 ---
 
-## Step 2 — Install the AI Gateway CRDs
+## Step 5 — Install the AI Gateway CRDs
 
 All six AI Gateway policy CRDs live under `helm/ako/crds/`:
 
@@ -102,7 +130,7 @@ guide walks through each in turn, so install all six now.
 
 ---
 
-## Step 3 — Deploy the mock LLM pods (emit token headers)
+## Step 6 — Deploy the mock LLM pods (emit token headers)
 
 ```bash
 kubectl apply -f docs/gateway-api/examples/ai-gateway-demo/mock-llm.yaml
@@ -397,7 +425,7 @@ Expected: `alice: 200 200 200 200 200 429`, `bob: 200×10 429`, `dave: 403` with
 Routes each request to a quality/cost tier by the requested `model` field, optionally gated by
 the caller's verified group. Full design + Avi object mapping: [model-routing.md](model-routing.md).
 
-Reuse the two mock-llm pods from Step 3 as two tiers, each with its own `InferencePool`:
+Reuse the two mock-llm pods from Step 6 as two tiers, each with its own `InferencePool`:
 
 ```yaml
 apiVersion: gateway.inference.x-k8s.io/v1
@@ -807,7 +835,7 @@ kubectl delete -f docs/gateway-api/examples/ai-gateway-demo/mock-llm.yaml
 
 ## Troubleshooting
 
-**DataScripts don't appear on the VS** — confirm `AI_GATEWAY_ENABLED=true` (Step 1; the
+**DataScripts don't appear on the VS** — confirm `AI_GATEWAY_ENABLED=true` (Step 4; the
 container is distroless so read the pod spec, not `kubectl exec -- env`).
 
 **5xx / "no available servers"** — the backend pods are down or not selected by the
