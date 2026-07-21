@@ -1,9 +1,11 @@
 # AKO AI Gateway — Install Guide
 
-Step-by-step guide to install and verify the **full AI Gateway feature set** on AKO —
-authentication, token-budget rate limiting, model-tier routing, MCP tool governance, A2A
-agent-to-agent governance, and WAF-based guardrails — on a cluster already running the
-[Inference Extension](inference-install.md).
+Step-by-step guide to install AKO with Gateway API and AI Gateway enabled, and verify the
+**full AI Gateway feature set** — authentication, token-budget rate limiting, model-tier
+routing, MCP tool governance, A2A agent-to-agent governance, and WAF-based guardrails —
+starting from a **fresh Kubernetes cluster with nothing pre-installed**: no Gateway API CRDs,
+no AKO, no Gateway/InferencePool/HTTPRoute. This one file is everything you need, start to
+finish.
 
 The guide needs **no real LLMs or GPUs**. It reuses the `mock-llm` pod pattern, which returns
 OpenAI-compatible JSON and — importantly — the token-usage `usage` block in the response
@@ -32,13 +34,20 @@ OpenAI-compatible JSON and — importantly — the token-usage `usage` block in 
 
 | Requirement | Notes |
 |---|---|
-| Working inference-extension demo | Gateway, InferencePool, HTTPRoute already set up |
+| Kubernetes cluster | 1.28+ recommended |
+| Helm 3 | `brew install helm` |
+| kubectl | configured and pointing at your cluster |
+| Docker, or `az acr build` | Needed to build the `ako-gateway-api` image in Step 2 — locally via Docker, or remotely via ACR (no local Docker needed on that path) |
+| Avi Controller, Cloud, and Service Engine Group already exist in Avi | This is a **hard prerequisite nothing in this guide can script around** — create them in the Avi Controller itself before starting |
 | Avi Controller reachable from AKO | AKO builds every AI Gateway object (JWT/WAF/Pool Group/DataScript) over the Avi REST API |
 | HTTPS Gateway listener + TLS cert | **Both** `AIGatewayAuthPolicy` modes — `oauthBrowser` and `jwtQuery` — require the Gateway listener to terminate TLS. `jwtQuery` removes the OAuth callback/session/cookie-jar machinery, **not** the TLS requirement itself. |
 | Issuer reachable **from AKO**, not from the SE | Under `jwtQuery`, AKO fetches the JWKS itself and embeds it in a `JWTServerProfile` — no issuer Pool, no SE-side reachability needed. (Contrast with `oauthBrowser`, where the SE reaches the issuer at runtime through an AKO-built Pool.) |
 | Avi Controller ≥ 32.1.1 | Only needed for the [MCP](#mcp--aimcproutepolicy) section — the native MCP application profile and session DataScript are 32.1.1+ objects. |
 
-> Starting fresh? Complete [inference-install.md](inference-install.md) first, then return here.
+> **Want automatic, Prometheus-driven weight adjustment across pods on top of this?** That's a
+> separate, deeper feature — the `inferenceExtension` scraping controller covered in
+> [inference-install.md](inference-install.md). It's not required for anything in this guide;
+> see that doc if you want it layered on afterward.
 
 ---
 
@@ -71,40 +80,46 @@ make dev-build-and-push-gateway-api REGISTRY=<your-registry> TAG=<tag>
 
 Either way, note the `<registry>/ako-gateway-api:<tag>` you end up with — you need it in the next step.
 
-## Step 3 — Point the chart at your image and enable the feature
+## Step 3 — Install the CRDs
 
-```yaml
-# values.yaml
-featureGates:
-  GatewayAPI: true
-GatewayAPI:
-  image:
-    repository: <registry>/ako-gateway-api   # from Step 2
-    tag: <tag>                               # from Step 2
-aiGateway:
-  enabled: true
-```
+Three sets of CRDs need to exist before anything else works: the base Gateway API CRDs, the
+InferencePool CRD, and the six AI Gateway policy CRDs. None of them depend on AKO being
+installed, so apply all of them now.
+
+### Gateway API CRDs
 
 ```bash
-helm upgrade ako ./helm/ako -n avi-system -f values.yaml
-kubectl rollout status statefulset/ako -n avi-system
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
 ```
 
-## Step 4 — Confirm the flag
+Verify:
+```bash
+kubectl get crd gateways.gateway.networking.k8s.io
+```
 
-The container is **distroless** — no `env` binary — and the flag isn't logged, so read the pod
-spec directly:
+### InferencePool CRD
 
 ```bash
-kubectl get pod ako-0 -n avi-system \
-  -o jsonpath='{range .spec.containers[?(@.name=="ako-gateway-api")].env[*]}{.name}={.value}{"\n"}{end}' \
-  | grep AI_GATEWAY
-# Expected: AI_GATEWAY_ENABLED=true
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/download/v1.1.0/manifests.yaml
 ```
 
----
+Verify:
+```bash
+kubectl get crd | grep inference
+```
 
-## Step 5 — Install the AI Gateway CRDs
+You should see:
+```
+inferencepools.gateway.inference.x-k8s.io
+inferenceobjectives.gateway.inference.x-k8s.io
+```
+
+If the CRD is still not found, try the kustomize path instead:
+```bash
+kubectl kustomize "github.com/kubernetes-sigs/gateway-api-inference-extension/config/crd?ref=v1.1.0" | kubectl apply -f -
+```
+
+### AI Gateway policy CRDs
 
 All six AI Gateway policy CRDs live under `helm/ako/crds/`:
 
@@ -130,7 +145,166 @@ guide walks through each in turn, so install all six now.
 
 ---
 
-## Step 6 — Deploy the mock LLM pods (emit token headers)
+## Step 4 — Avi credentials secret and a fresh AKO install
+
+AKO reads the Avi Controller credentials from a Kubernetes Secret:
+
+```bash
+kubectl create namespace avi-system
+
+kubectl create secret generic avi-secret \
+  -n avi-system \
+  --from-literal=username=admin \
+  --from-literal=password=<your-avi-password>
+```
+
+Now build one `values.yaml` that both points AKO at your Avi environment **and** turns on
+Gateway API + AI Gateway with the image from Step 2:
+
+```yaml
+# values.yaml
+ControllerSettings:
+  controllerHost: "10.x.x.x"            # your Avi Controller IP
+  cloudName: "Default-Cloud"            # your Avi Cloud name
+  serviceEngineGroupName: "Default-Group"
+
+AKOSettings:
+  clusterName: "ai-gateway-demo"        # unique name for this cluster in Avi
+
+NetworkSettings:
+  vipNetworkList:
+    - networkName: "vip-network"        # your Avi VIP network
+
+featureGates:
+  GatewayAPI: true
+GatewayAPI:
+  image:
+    repository: <registry>/ako-gateway-api   # from Step 2
+    tag: <tag>                               # from Step 2
+aiGateway:
+  enabled: true
+```
+
+> **`inferenceExtension.enabled` is intentionally left out.** InferencePool→Avi-PoolGroup
+> backendRef resolution for HTTPRoutes is unconditional core Gateway API route processing
+> (`ako-gateway-api/nodes/avi_model_route.go`) — it is **not** gated by the `inferenceExtension`
+> flag. That flag only controls the separate Prometheus-scraping auto-weight-adjustment
+> controller (`ako-gateway-api/inference/`), which nothing in this guide uses. Setting it would
+> be harmless, but it's an extra moving part this guide doesn't need — see
+> [inference-install.md](inference-install.md) if you want that feature on top.
+
+Nothing exists yet, so this is a fresh install, not an upgrade:
+
+```bash
+helm install ako ./helm/ako \
+  -n avi-system --create-namespace \
+  -f values.yaml
+kubectl rollout status statefulset/ako -n avi-system
+```
+
+Watch the pod come up — you should see two containers, `ako` (the main AKO controller) and
+`ako-gateway-api` (your Gateway API build from Step 2):
+
+```bash
+kubectl get pods -n avi-system -w
+```
+
+---
+
+## Step 5 — Confirm the flag
+
+The container is **distroless** — no `env` binary — and the flag isn't logged, so read the pod
+spec directly:
+
+```bash
+kubectl get pod ako-0 -n avi-system \
+  -o jsonpath='{range .spec.containers[?(@.name=="ako-gateway-api")].env[*]}{.name}={.value}{"\n"}{end}' \
+  | grep AI_GATEWAY
+# Expected: AI_GATEWAY_ENABLED=true
+```
+
+---
+
+## Step 6 — Create the Gateway, InferencePool, and HTTPRoute
+
+AKO installs a `GatewayClass` automatically. Verify:
+
+```bash
+kubectl get gatewayclass avi-lb
+```
+
+Create the `inference` namespace and a Gateway named `avi-gateway`:
+
+```yaml
+# gateway.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: avi-gateway
+  namespace: inference
+spec:
+  gatewayClassName: avi-lb
+  listeners:
+  - name: http
+    port: 80
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: Same
+```
+
+```bash
+kubectl create namespace inference
+kubectl apply -f gateway.yaml
+kubectl get gateway -n inference avi-gateway
+```
+
+Create an `InferencePool` that selects `app: mock-llm` — the label the mock LLM pods deployed
+in the next step carry — and an `HTTPRoute` named `llm-route` that sends `/v1` traffic to it:
+
+```yaml
+# inferencepool.yaml
+apiVersion: gateway.inference.x-k8s.io/v1
+kind: InferencePool
+metadata:
+  name: llm-pool
+  namespace: inference
+spec:
+  selector:
+    matchLabels:
+      app: mock-llm        # matches the mock-llm pods deployed in Step 7
+  targetPort: 8000
+```
+
+```yaml
+# httproute.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: llm-route
+  namespace: inference
+spec:
+  parentRefs:
+  - name: avi-gateway
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /v1
+    backendRefs:
+    - group: gateway.inference.x-k8s.io
+      kind: InferencePool
+      name: llm-pool
+```
+
+```bash
+kubectl apply -f inferencepool.yaml
+kubectl apply -f httproute.yaml
+```
+
+---
+
+## Step 7 — Deploy the mock LLM pods (emit token headers)
 
 ```bash
 kubectl apply -f docs/gateway-api/examples/ai-gateway-demo/mock-llm.yaml
@@ -138,11 +312,10 @@ kubectl rollout status deployment/mock-llm-1 -n inference
 kubectl rollout status deployment/mock-llm-2 -n inference
 ```
 
-> **⚠️ Selector.** `mock-llm.yaml` labels pods `app: mock-llm`. Your `InferencePool`
-> must select them — if it was created with `selector: {app: vllm}`, either label these pods
-> `app: vllm` or change the pool selector to `app: mock-llm` (and let AKO re-resolve). The mock
-> returns an OpenAI-compatible JSON body with a `usage` block; the DataScript reads token counts
-> directly from the body (no response headers required).
+`mock-llm.yaml` labels pods `app: mock-llm` — the same label the `InferencePool` in Step 6
+already selects, so AKO resolves the pool to these pods with no extra wiring. The mock returns
+an OpenAI-compatible JSON body with a `usage` block; the DataScript reads token counts directly
+from the body (no response headers required).
 
 Verify the endpoint and headers:
 
@@ -425,7 +598,7 @@ Expected: `alice: 200 200 200 200 200 429`, `bob: 200×10 429`, `dave: 403` with
 Routes each request to a quality/cost tier by the requested `model` field, optionally gated by
 the caller's verified group. Full design + Avi object mapping: [model-routing.md](model-routing.md).
 
-Reuse the two mock-llm pods from Step 6 as two tiers, each with its own `InferencePool`:
+Reuse the two mock-llm pods from Step 7 as two tiers, each with its own `InferencePool`:
 
 ```yaml
 apiVersion: gateway.inference.x-k8s.io/v1
@@ -829,13 +1002,48 @@ kubectl delete -f docs/gateway-api/examples/ai-gateway-demo/jwt-issuer.yaml
 kubectl delete secret jwt-signing-key -n inference
 kubectl delete secret llm-tls -n inference
 kubectl delete -f docs/gateway-api/examples/ai-gateway-demo/mock-llm.yaml
+
+# Core Gateway API objects created in Steps 6-7
+kubectl delete httproute llm-route -n inference --ignore-not-found
+kubectl delete inferencepool llm-pool -n inference --ignore-not-found
+kubectl delete gateway avi-gateway -n inference --ignore-not-found
+```
+
+The steps above remove everything this guide layered on top. AKO itself, the `avi-secret`, and
+the `inference` namespace are left running by default — other workloads (or a re-run of a
+section above) may still depend on them.
+
+### Full teardown (optional)
+
+Only do this if you're done with the cluster entirely — it removes the fresh AKO install from
+Step 4 along with its credentials and namespace:
+
+```bash
+helm uninstall ako -n avi-system
+kubectl delete secret avi-secret -n avi-system --ignore-not-found
+kubectl delete namespace inference --ignore-not-found
+```
+
+Leave the Gateway API / InferencePool / AI Gateway CRDs in place unless you're certain nothing
+else on the cluster uses them — deleting a CRD deletes every custom resource of that kind,
+cluster-wide, not just the ones from this guide:
+
+```bash
+kubectl delete -f https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/download/v1.1.0/manifests.yaml
+kubectl delete -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
+kubectl delete -f helm/ako/crds/ai.ako.vmware.com_aigatewayauthpolicies.yaml
+kubectl delete -f helm/ako/crds/ai.ako.vmware.com_aitokenratelimitpolicies.yaml
+kubectl delete -f helm/ako/crds/ai.ako.vmware.com_aimodelroutepolicies.yaml
+kubectl delete -f helm/ako/crds/ai.ako.vmware.com_aimcproutepolicies.yaml
+kubectl delete -f helm/ako/crds/ai.ako.vmware.com_aia2aroutepolicies.yaml
+kubectl delete -f helm/ako/crds/ai.ako.vmware.com_aiguardrailpolicies.yaml
 ```
 
 ---
 
 ## Troubleshooting
 
-**DataScripts don't appear on the VS** — confirm `AI_GATEWAY_ENABLED=true` (Step 4; the
+**DataScripts don't appear on the VS** — confirm `AI_GATEWAY_ENABLED=true` (Step 5; the
 container is distroless so read the pod spec, not `kubectl exec -- env`).
 
 **5xx / "no available servers"** — the backend pods are down or not selected by the
