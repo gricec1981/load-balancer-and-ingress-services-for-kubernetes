@@ -15,8 +15,8 @@ OpenAI-compatible JSON and — importantly — the token-usage `usage` block in 
 > 1. **Token usage is parsed from the response body.** The DataScript reads the OpenAI `usage`
 >    block straight from the JSON body in the `HTTP_RESP_DATA` event (buffered via
 >    `set_response_body_buffer_size`) — so it works with **stock vLLM**, no token headers or
->    sidecar required. Trade-off: the SE buffers the body, which suits non-streaming traffic;
->    for streaming responses, meter in a proxy instead.
+>    sidecar required. The SE buffers the body, which covers non-streaming traffic; meter
+>    streaming responses in a proxy instead.
 > 2. **Auth is `jwtQuery`, and AKO manages the Avi objects.** Applying an `AIGatewayAuthPolicy`
 >    with `authMode: jwtQuery` makes AKO build a `JWTServerProfile` + `AUTH_PROFILE_JWT` +
 >    `SSO_TYPE_JWT` policy and set `jwt_config` on the child VS directly — **no issuer Pool, no
@@ -25,7 +25,7 @@ OpenAI-compatible JSON and — importantly — the token-usage `usage` block in 
 >    SE-validated token, via the same `jwt_claim()` DataScript helper.
 > 3. **The token still rides in the URL, and the listener still needs TLS.** `jwtQuery` drops
 >    the OAuth callback path, session cookie, and browser redirect — but the SE validates the
->    JWT from a `?jwt=` query parameter, so it must travel encrypted and should be short-lived.
+>    JWT from a `?jwt=` query parameter, so it travels encrypted. Keep tokens short-lived.
 >    See [ai-gateway-auth.md](ai-gateway-auth.md#security-token-in-url).
 
 ---
@@ -44,10 +44,10 @@ OpenAI-compatible JSON and — importantly — the token-usage `usage` block in 
 | Issuer reachable **from AKO**, not from the SE | Under `jwtQuery`, AKO fetches the JWKS itself and embeds it in a `JWTServerProfile` — no issuer Pool, no SE-side reachability needed. (Contrast with `oauthBrowser`, where the SE reaches the issuer at runtime through an AKO-built Pool.) |
 | Avi Controller ≥ 32.1.1 | Only needed for the [MCP](#mcp--aimcproutepolicy) section — the native MCP application profile and session DataScript are 32.1.1+ objects. |
 
-> **Want automatic, Prometheus-driven weight adjustment across pods on top of this?** That's a
-> separate, deeper feature — the `inferenceExtension` scraping controller covered in
-> [inference-install.md](inference-install.md). It's not required for anything in this guide;
-> see that doc if you want it layered on afterward.
+This guide also turns on `inferenceExtension` in Step 4 — the Prometheus-scraping controller
+that auto-adjusts Avi Pool Group member weights across an InferencePool's pods. See [Inference
+Extension — weight-based load balancing](#inference-extension--weight-based-load-balancing) after
+Step 7.
 
 ---
 
@@ -183,15 +183,16 @@ GatewayAPI:
     tag: <tag>                               # from Step 2
 aiGateway:
   enabled: true
+inferenceExtension:
+  enabled: true
+  scrapeIntervalSeconds: 15
+  alphaKVCache: 1.0
+  betaTokenRate: 1.0
 ```
 
-> **`inferenceExtension.enabled` is intentionally left out.** InferencePool→Avi-PoolGroup
-> backendRef resolution for HTTPRoutes is unconditional core Gateway API route processing
-> (`ako-gateway-api/nodes/avi_model_route.go`) — it is **not** gated by the `inferenceExtension`
-> flag. That flag only controls the separate Prometheus-scraping auto-weight-adjustment
-> controller (`ako-gateway-api/inference/`), which nothing in this guide uses. Setting it would
-> be harmless, but it's an extra moving part this guide doesn't need — see
-> [inference-install.md](inference-install.md) if you want that feature on top.
+`inferenceExtension` turns on the Prometheus-scraping controller that auto-adjusts Avi Pool
+Group member weights across the InferencePool's pods — see [Inference Extension — weight-based
+load balancing](#inference-extension--weight-based-load-balancing) below.
 
 Nothing exists yet, so this is a fresh install, not an upgrade:
 
@@ -331,6 +332,42 @@ kill $PF_PID
 
 Expected: `X-Total-Tokens: 100` (and a `usage` block with `total_tokens: 100`). Tune with the
 `PROMPT_TOKENS` / `COMPLETION_TOKENS` env vars on the Deployment.
+
+---
+
+## Inference Extension — weight-based load balancing
+
+AKO scrapes each InferencePool member pod's metrics every `scrapeIntervalSeconds` and adjusts
+Avi Pool Group member weights using `score = 1/(waiting + alpha*kv_cache + beta*token_rate)`.
+
+The mock-llm pods deployed in Step 7 already serve this — their `server.py`'s `GET` handler
+returns the Prometheus `vllm:num_requests_waiting` / `vllm:kv_cache_usage_perc` /
+`vllm:generation_tokens_total` format regardless of path, driven by the same
+`WAITING`/`KV_CACHE`/`TOKEN_RATE` env vars already on those Deployments (see
+[`mock-llm.yaml`](examples/ai-gateway-demo/mock-llm.yaml)). No new pods, no new InferencePool.
+
+### Run it
+
+```bash
+kubectl set env deployment/mock-llm-1 -n inference WAITING=20 KV_CACHE=0.8
+```
+
+Check the ratio shift — either in the Avi UI (**Applications → Virtual Services** → the
+`avi-gateway`-derived VS → **Pool Group → Members**, `Ratio` column) or via:
+
+```bash
+kubectl logs -n avi-system ako-0 -c ako-gateway-api | grep "weights updated"
+```
+
+Expected: mock-llm-1's ratio drops within one scrape interval (15s default), mock-llm-2's rises.
+
+Recover:
+
+```bash
+kubectl set env deployment/mock-llm-1 -n inference WAITING=0 KV_CACHE=0.1
+```
+
+Ratios re-equalize.
 
 ---
 
@@ -724,7 +761,7 @@ spec:
       port: 8000
 ```
 
-> The mock-llm backend doesn't speak JSON-RPC/MCP — that's fine for this verify step. AKO's
+> The mock-llm backend doesn't speak JSON-RPC/MCP — this step doesn't need it to. AKO's
 > tool-authorization check runs in `HTTP_REQ_DATA`, **before** the request ever reaches a pool
 > member: a denied tool call gets its `403` straight from the DataScript and never touches the
 > backend. Only the *allowed* case actually reaches (and gets an unrelated 200 from) mock-llm.
@@ -788,8 +825,8 @@ Expected: `allowed tool: HTTP 200`, `denied tool: HTTP 403`.
 ## A2A — `AIA2ARoutePolicy`
 
 Governs agent↔agent (Agent2Agent, JSON-RPC) traffic: shared-IdP identity, per-agent method RBAC,
-and multi-turn task affinity. No native Avi support — built from the same DataScript machinery as
-model routing. Full design: [ai-gateway-a2a.md](ai-gateway-a2a.md).
+and multi-turn task affinity, built from the same DataScript machinery as model routing. Full
+design: [ai-gateway-a2a.md](ai-gateway-a2a.md).
 
 This one has ready-to-run demo assets — a dedicated A2A Gateway, two mock agents (`ops-agent`,
 `security-agent`), and the `AIA2ARoutePolicy` pair (an orchestrator that may submit tasks to both,
@@ -865,8 +902,8 @@ Expected: `orchestrator tasks/send: HTTP 200`, `security-agent tasks/send: HTTP 
 ## Guardrails — `AIGuardrailPolicy`
 
 Signature/regex DLP on the Avi WAF — blocks secrets, PII, and prompt-injection phrases in request
-bodies. No proxy, no sidecar, no model in the hot path. Full design + the honest ceiling
-(semantic detection is out of scope for this layer): [ai-gateway-guardrails.md](ai-gateway-guardrails.md).
+bodies. No proxy, no sidecar, no model in the hot path. Full design:
+[ai-gateway-guardrails.md](ai-gateway-guardrails.md).
 
 ```yaml
 apiVersion: ai.ako.vmware.com/v1alpha1
@@ -969,6 +1006,88 @@ kubectl annotate aitokenratelimitpolicy llm-limits -n inference \
 
 ---
 
+## Dashboard UI
+
+A console that renders everything above — Dashboard, Governance, Models, Gateways, MCP Registry,
+and Agent Registry tabs — on top of the same policies and endpoints this guide already stood up.
+
+### Get the code
+
+```bash
+git clone git@github-vcf.devops.broadcom.net:ANS/AI-Gateway-UI-chris.git
+cd AI-Gateway-UI-chris
+git checkout feature/shared-counters-ui
+```
+
+This branch includes the agent registry, the shared token-counters dashboard, per-user budget
+gauges, and live polling of the real `/v1/admin/counters` endpoint set up in [Dashboard counters
+endpoint & reset](#dashboard-counters-endpoint--reset) (via `ADMIN_TOKEN`). It also carries the
+streaming-shim tab, present regardless of the rest of this guide.
+
+### Build
+
+```bash
+az acr build -r <your-acr-name> -t ai-gateway-ui:<tag> .
+```
+
+### Deploy
+
+Manifests live in `k8s/`:
+
+```bash
+kubectl apply -f k8s/01-rbac.yaml
+```
+
+Edit `k8s/02-deployment.yaml` (container name `ui`, namespace `inference`). Set the image
+(`k8s/02-deployment.yaml:19`) to `<your-acr-name>.azurecr.io/ai-gateway-ui:<tag>`, and set these
+env vars on the `ui` container:
+
+- `NAMESPACE=inference` (`k8s/02-deployment.yaml:24`)
+- `POLICY_NAME=llm-limits` (`k8s/02-deployment.yaml:25`) — the `AITokenRateLimitPolicy` name from
+  [Token rate limiting](#token-rate-limiting--aitokenratelimitpolicy)
+- `GATEWAY_VIP=<VIP>` (`k8s/02-deployment.yaml:26`), from:
+  ```bash
+  kubectl get gateway avi-gateway -n inference -o jsonpath='{.status.addresses[0].value}'
+  ```
+- `DEMO_HOST=llm.demo.local` (`k8s/02-deployment.yaml:27`)
+- `ISSUER_IP_PREFIX=10.224` (`k8s/02-deployment.yaml:28`) — adjust to your pod CIDR prefix
+- `ISSUER_USERS_URL=http://jwt-issuer.inference.svc.cluster.local:8080/users` — the built-in
+  default (`server.go:106`); set it only if your issuer Service name differs
+- `ISSUER_TOKEN_URL=http://jwt-issuer.inference.svc.cluster.local:8080/token` — same, built-in
+  default (`server.go:107`)
+- `ADMIN_TOKEN` (`k8s/02-deployment.yaml:39-41`), from `secretKeyRef: {name: ai-admin-token, key:
+  token}` — the same secret created in [Dashboard counters endpoint &
+  reset](#dashboard-counters-endpoint--reset)
+- Optionally `AVI_CONTROLLER` / `AVI_USERNAME` / `AVI_PASSWORD` / `AVI_VERSION`
+  (`k8s/02-deployment.yaml:30-35`) to light up the Inference tab's live Avi pool-ratio view — ties
+  to [Inference Extension — weight-based load balancing](#inference-extension--weight-based-load-balancing)
+
+```bash
+kubectl apply -f k8s/02-deployment.yaml
+kubectl rollout status deployment/ai-gateway-ui -n inference
+```
+
+### Expose it
+
+A dedicated Avi Gateway/HTTPRoute, hostname `ai-gw-ui.demo.local`:
+
+```bash
+kubectl apply -f k8s/03-gateway-httproute.yaml
+```
+
+or a direct AKS public LB Service, IP-locked:
+
+```bash
+kubectl apply -f k8s/04-public-lb.yaml
+```
+
+### Verify
+
+Open the exposed address. Confirm the Dashboard, Governance, Models, Gateways, MCP Registry, and
+Agent Registry tabs all load without errors.
+
+---
+
 ## Cleanup
 
 ```bash
@@ -1056,9 +1175,9 @@ add replicas.
 `application/json` response with an OpenAI `usage` block, and that the body fits within
 `RespBodyBufferKB` (default 256 KB — `usage` sits at the end of the body, so a response larger
 than the buffer would normally be truncated; the script now charges `FailClosedTokens` for such a
-completion rather than letting it through unmetered). Note the bundled workload-sim mock can
-report large token counts — reset it (`/set?prompt=25&completion=75`) for a clean
-100-token-per-request demo.
+completion rather than letting it through unmetered). The bundled workload-sim mock can report
+large token counts — reset it (`/set?prompt=25&completion=75`) for a clean 100-token-per-request
+demo.
 
 **Every `jwtQuery` request 401s, even with a valid token** — confirm the listener is HTTPS (both
 auth modes require TLS) and that the token's `aud` matches `spec.jwt.audiences` and its `iss`
