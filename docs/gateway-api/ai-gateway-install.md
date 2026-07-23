@@ -5,7 +5,8 @@ Step-by-step guide to install AKO with Gateway API and AI Gateway enabled, and v
 routing, MCP tool governance, A2A agent-to-agent governance, and WAF-based guardrails —
 starting from a **fresh Kubernetes cluster with nothing pre-installed**: no Gateway API CRDs,
 no AKO, no Gateway/InferencePool/HTTPRoute. This one file is everything you need, start to
-finish.
+finish. It also installs a console UI (Step 6) that drives most of the policy-creation steps
+below through forms instead of `kubectl apply`.
 
 The guide needs **no real LLMs or GPUs**. It reuses the `mock-llm` pod pattern, which returns
 OpenAI-compatible JSON and — importantly — the token-usage `usage` block in the response
@@ -47,7 +48,7 @@ OpenAI-compatible JSON and — importantly — the token-usage `usage` block in 
 This guide also turns on `inferenceExtension` in Step 4 — the Prometheus-scraping controller
 that auto-adjusts Avi Pool Group member weights across an InferencePool's pods. See [Inference
 Extension — weight-based load balancing](#inference-extension--weight-based-load-balancing) after
-Step 7.
+Step 8.
 
 ---
 
@@ -226,7 +227,93 @@ kubectl get pod ako-0 -n avi-system \
 
 ---
 
-## Step 6 — Create the Gateway, InferencePool, and HTTPRoute
+## Step 6 — Install the Dashboard UI
+
+A console UI drives most of the policy-creation work in the sections below — token budgets,
+model routing, gateway objects, and DLP toggles — through forms instead of `kubectl apply`. It
+lives in a separate repo from AKO.
+
+### Get the code
+
+```bash
+git clone git@github-vcf.devops.broadcom.net:ANS/AI-Gateway-UI-chris.git
+cd AI-Gateway-UI-chris
+git checkout feature/shared-counters-ui
+```
+
+This branch carries the Governance (token budgets + model routing), Models, Gateways, MCP
+Registry, and Agent Registry screens this guide uses below, plus a Dashboard tab (Topology,
+Live Counters, Streaming/Shim) and an Avi-backed Inference view.
+
+### Build
+
+```bash
+az acr build -r <your-acr-name> -t ai-gateway-ui:<tag> .
+```
+
+### Deploy
+
+Manifests live in `k8s/`:
+
+```bash
+kubectl apply -f k8s/01-rbac.yaml
+```
+
+Edit `k8s/02-deployment.yaml` (container name `ui`, namespace `inference`). Set the image
+(`k8s/02-deployment.yaml:19`) to `<your-acr-name>.azurecr.io/ai-gateway-ui:<tag>`. Leave the
+rest of the env vars at their defaults for now — nothing downstream exists yet, and they only
+affect the optional Topology / Live-Counters / Inference dashboard views, not the
+policy-creation forms this guide relies on:
+
+- `NAMESPACE=inference` (`k8s/02-deployment.yaml:24`)
+- `POLICY_NAME=llm-limits` (`k8s/02-deployment.yaml:25`) — the `AITokenRateLimitPolicy` name from
+  [Token rate limiting](#token-rate-limiting--aitokenratelimitpolicy)
+- `GATEWAY_VIP=10.225.0.100` (`k8s/02-deployment.yaml:26`) — a placeholder until the real
+  Gateway exists (Step 7)
+- `DEMO_HOST=llm.demo.local` (`k8s/02-deployment.yaml:27`)
+- `ISSUER_IP_PREFIX=10.224` (`k8s/02-deployment.yaml:28`) — adjust to your pod CIDR prefix
+- `ISSUER_USERS_URL` / `ISSUER_TOKEN_URL` — built-in defaults pointing at
+  `http://jwt-issuer.inference.svc.cluster.local:8080` (`server.go:114-115`); leave unset unless
+  your issuer Service name differs
+- Optionally `AVI_CONTROLLER` / `AVI_USERNAME` / `AVI_PASSWORD` / `AVI_VERSION`
+  (`k8s/02-deployment.yaml:30-35`) to light up the Inference tab's live Avi pool-ratio view — ties
+  to [Inference Extension — weight-based load balancing](#inference-extension--weight-based-load-balancing)
+
+```bash
+kubectl apply -f k8s/02-deployment.yaml
+kubectl rollout status deployment/ai-gateway-ui -n inference
+```
+
+### Expose it
+
+A dedicated Avi Gateway/HTTPRoute, hostname `ai-gw-ui.demo.local`:
+
+```bash
+kubectl apply -f k8s/03-gateway-httproute.yaml
+```
+
+or a direct AKS public LB Service, IP-locked:
+
+```bash
+kubectl apply -f k8s/04-public-lb.yaml
+```
+
+### Verify
+
+Open the exposed address. The Dashboard, Governance, Models, Gateways, MCP Registry, and Agent
+Registry tabs all load — everything on them is empty at this point, since nothing from Step 7
+onward has been created yet.
+
+You're currently inside `AI-Gateway-UI-chris`. Move back into the AKO repo before continuing —
+every command from Step 7 on uses paths relative to its root:
+
+```bash
+cd ../AI-Gateway-chris
+```
+
+---
+
+## Step 7 — Create the Gateway, InferencePool, and HTTPRoute
 
 AKO installs a `GatewayClass` automatically. Verify:
 
@@ -260,6 +347,12 @@ kubectl apply -f gateway.yaml
 kubectl get gateway -n inference avi-gateway
 ```
 
+The bare Gateway object can also be created from the UI's Gateways tab (**+ Create**, leave
+Gateway type at its default `LLM`). The Models tab has an InferencePool form too, but it's wired
+to the older `inference.networking.x-k8s.io/v1alpha2` API — not the `gateway.inference.x-k8s.io/v1`
+InferencePool CRD this guide installed in Step 3 — so it won't create a matching object here;
+create the InferencePool and HTTPRoute below with `kubectl`.
+
 Create an `InferencePool` that selects `app: mock-llm` — the label the mock LLM pods deployed
 in the next step carry — and an `HTTPRoute` named `llm-route` that sends `/v1` traffic to it:
 
@@ -273,7 +366,7 @@ metadata:
 spec:
   selector:
     matchLabels:
-      app: mock-llm        # matches the mock-llm pods deployed in Step 7
+      app: mock-llm        # matches the mock-llm pods deployed in Step 8
   targetPort: 8000
 ```
 
@@ -305,7 +398,7 @@ kubectl apply -f httproute.yaml
 
 ---
 
-## Step 7 — Deploy the mock LLM pods (emit token headers)
+## Step 8 — Deploy the mock LLM pods (emit token headers)
 
 ```bash
 kubectl apply -f docs/gateway-api/examples/ai-gateway-demo/mock-llm.yaml
@@ -313,7 +406,7 @@ kubectl rollout status deployment/mock-llm-1 -n inference
 kubectl rollout status deployment/mock-llm-2 -n inference
 ```
 
-`mock-llm.yaml` labels pods `app: mock-llm` — the same label the `InferencePool` in Step 6
+`mock-llm.yaml` labels pods `app: mock-llm` — the same label the `InferencePool` in Step 7
 already selects, so AKO resolves the pool to these pods with no extra wiring. The mock returns
 an OpenAI-compatible JSON body with a `usage` block; the DataScript reads token counts directly
 from the body (no response headers required).
@@ -340,7 +433,7 @@ Expected: `X-Total-Tokens: 100` (and a `usage` block with `total_tokens: 100`). 
 AKO scrapes each InferencePool member pod's metrics every `scrapeIntervalSeconds` and adjusts
 Avi Pool Group member weights using `score = 1/(waiting + alpha*kv_cache + beta*token_rate)`.
 
-The mock-llm pods deployed in Step 7 already serve this — their `server.py`'s `GET` handler
+The mock-llm pods deployed in Step 8 already serve this — their `server.py`'s `GET` handler
 returns the Prometheus `vllm:num_requests_waiting` / `vllm:kv_cache_usage_perc` /
 `vllm:generation_tokens_total` format regardless of path, driven by the same
 `WAITING`/`KV_CACHE`/`TOKEN_RATE` env vars already on those Deployments (see
@@ -372,6 +465,8 @@ Ratios re-equalize.
 ---
 
 ## Auth — `jwtQuery`
+
+The UI doesn't configure this policy yet — apply the CRD directly.
 
 `AIGatewayAuthPolicy` with `authMode: jwtQuery` validates a bearer JWT presented as a `?jwt=`
 query parameter — 401 on failure, no redirect. Every claim-aware policy below (token budgets,
@@ -495,27 +590,14 @@ reaches the DataScript), so detach `llm-auth` first if you completed the Auth se
 kubectl delete aigatewayauthpolicy llm-auth -n inference
 ```
 
-Apply a flat-budget policy:
+Create the policy from the UI instead of `kubectl apply`:
 
-```bash
-cat <<'EOF' | kubectl apply -f -
-apiVersion: ai.ako.vmware.com/v1alpha1
-kind: AITokenRateLimitPolicy
-metadata:
-  name: llm-limits-flat
-  namespace: inference
-spec:
-  targetRef: { group: gateway.networking.k8s.io, kind: HTTPRoute, name: llm-route }
-  identitySource: { header: x-ai-consumer, fallback: clientIP }
-  limits:
-    - name: hourly-tokens
-      key: consumer        # falls back to clientIP when no identity header/JWT
-      tokens: total
-      budget: 500          # 5 x 100-token requests
-      window: 1h
-      action: { type: Reject, statusCode: 429, retryAfter: true }
-EOF
-```
+1. Open **Governance → Token Rate Limits** and click **+ Create**.
+2. Name `llm-limits-flat`, Namespace `inference`, Target HTTPRoute `llm-route`.
+3. Leave the **Per-group budgets** table empty.
+4. Limit settings: Window `1h`, Token dimension `total`, Fallback budget (unknown group) `500`,
+   Reject status code `429`, check **Send Retry-After header**.
+5. Click **Save & apply to cluster**.
 
 Confirm AKO attached the DataScripts:
 
@@ -573,36 +655,15 @@ means the group-budget policy below is **byte-for-byte identical** whether `llm-
 `oauthBrowser` or `jwtQuery` — only the auth policy's `authMode` and how the client presents the
 token change. Verified group1 users get 500 tokens/hr, group2 get 1000; unknown groups → 403.
 
-```bash
-cat <<'EOF' | kubectl apply -f -
-apiVersion: ai.ako.vmware.com/v1alpha1
-kind: AITokenRateLimitPolicy
-metadata:
-  name: llm-limits
-  namespace: inference
-spec:
-  targetRef: { group: gateway.networking.k8s.io, kind: HTTPRoute, name: llm-route }
+Create the policy from the UI:
 
-  # The DataScript reads the verified claims via jwt_claim(); identitySource.header
-  # is only the fallback when no valid ?jwt= token is present, and clientIP is the
-  # final fallback.
-  identitySource:
-    header: x-ai-consumer
-    fallback: clientIP
-
-  limits:
-  - name: hourly-group-budget
-    key: consumer          # per-user counter (verified sub claim)
-    groupHeader: group     # budget ceiling looked up from this verified claim
-    groupBudgets:
-      group1: 500          # 5 x 100-token requests / hr
-      group2: 1000         # 10 x 100-token requests / hr
-    budget: 0               # 0 = reject unknown groups (403); >0 = fallback ceiling
-    tokens: total
-    window: 1h
-    action: { type: Reject, statusCode: 429, retryAfter: true }
-EOF
-```
+1. Open **Governance → Token Rate Limits** and click **+ Create**.
+2. Name `llm-limits`, Namespace `inference`, Target HTTPRoute `llm-route`.
+3. Per-group budgets: **+ Add group** `group1` / `500`, then **+ Add group** `group2` / `1000`.
+4. Limit settings: Window `1h`, Token dimension `total`, Fallback budget (unknown group) `0`
+   (0 = reject unknown groups, HTTP 403), Reject status code `429`, check **Send Retry-After
+   header**.
+5. Click **Save & apply to cluster**.
 
 Run it — mint tokens for two users and drive each to their group's ceiling:
 
@@ -635,7 +696,7 @@ Expected: `alice: 200 200 200 200 200 429`, `bob: 200×10 429`, `dave: 403` with
 Routes each request to a quality/cost tier by the requested `model` field, optionally gated by
 the caller's verified group. Full design + Avi object mapping: [model-routing.md](model-routing.md).
 
-Reuse the two mock-llm pods from Step 7 as two tiers, each with its own `InferencePool`:
+Reuse the two mock-llm pods from Step 8 as two tiers, each with its own `InferencePool`:
 
 ```yaml
 apiVersion: gateway.inference.x-k8s.io/v1
@@ -659,30 +720,27 @@ spec:
   targetPort: 8000
 ```
 
-```yaml
-apiVersion: ai.ako.vmware.com/v1alpha1
-kind: AIModelRoutePolicy
-metadata:
-  name: llm-tiers
-  namespace: inference
-spec:
-  targetRef: { group: gateway.networking.k8s.io, kind: HTTPRoute, name: llm-route }
-  modelField: model
-  tiers:
-    - name: premium
-      backendRef: { group: gateway.inference.x-k8s.io, kind: InferencePool, name: premium-llm }
-    - name: economy
-      backendRef: { group: gateway.inference.x-k8s.io, kind: InferencePool, name: economy-llm }
-  modelTiers:
-    "mock-llm-premium": premium   # anything else falls to defaultTier
-  defaultTier: economy
-```
-
-Apply both, then confirm AKO built the per-tier Pool Groups and DataScript:
-
 ```bash
 kubectl apply -f inferencepools.yaml
-kubectl apply -f llm-tiers.yaml
+```
+
+Create the `AIModelRoutePolicy` from the UI instead of `kubectl apply`:
+
+1. Open **Governance → Model Routing Policies** and click **+ Create**.
+2. Policy: Name `llm-tiers`, Namespace `inference`, Target HTTPRoute `llm-route` (already the
+   default), Model field `model` (already the default).
+3. Tiers: row 1 — Tier name `premium`, Backend kind `InferencePool`, Backend `premium-llm`.
+   Click **+ Add tier** for row 2 — Tier name `economy`, Backend kind `InferencePool`, Backend
+   `economy-llm`.
+4. Model → tier mapping: Requested model `mock-llm-premium` → Tier `premium`. Default tier:
+   `economy`.
+5. Leave **Entitlements** empty and **Unentitled / unknown-model handling** at its defaults
+   (`Downgrade`, `403`).
+6. Click **Create**.
+
+Confirm AKO built the per-tier Pool Groups and DataScript:
+
+```bash
 kubectl logs -n avi-system ako-0 -c ako-gateway-api | grep -i "model.*rout\|tier"
 ```
 
@@ -721,6 +779,10 @@ group"](model-routing.md#tier-entitlement-by-group-with-auth) example.
 Governs agent↔tool (Model Context Protocol) traffic: per-role authorization of individual
 JSON-RPC tool calls. Requires **Avi 32.1.1+** (native MCP application profile + session
 DataScript). Full design: [ai-gateway-mcp.md](ai-gateway-mcp.md).
+
+The UI doesn't configure `AIMCPRoutePolicy`'s tool-access rules yet — apply the CRD directly.
+(The MCP Gateway shell and its registry-backed route can also be created from the UI's Gateways
+and MCP Registry tabs; this guide keeps both on `kubectl` since the RBAC policy needs it anyway.)
 
 MCP gets its own dedicated Gateway (blast-radius isolation from the LLM route) and its own TLS
 listener:
@@ -828,6 +890,10 @@ Governs agent↔agent (Agent2Agent, JSON-RPC) traffic: shared-IdP identity, per-
 and multi-turn task affinity, built from the same DataScript machinery as model routing. Full
 design: [ai-gateway-a2a.md](ai-gateway-a2a.md).
 
+The UI doesn't configure `AIA2ARoutePolicy`'s agent-access rules yet — apply the CRD directly.
+(The A2A Gateway shell can also be created from the UI's Gateways tab; this guide keeps it on
+`kubectl` alongside the mock agents and route policies below.)
+
 This one has ready-to-run demo assets — a dedicated A2A Gateway, two mock agents (`ops-agent`,
 `security-agent`), and the `AIA2ARoutePolicy` pair (an orchestrator that may submit tasks to both,
 a security agent that may only read tasks on `ops-agent`):
@@ -905,26 +971,23 @@ Signature/regex DLP on the Avi WAF — blocks secrets, PII, and prompt-injection
 bodies. No proxy, no sidecar, no model in the hot path. Full design:
 [ai-gateway-guardrails.md](ai-gateway-guardrails.md).
 
-```yaml
-apiVersion: ai.ako.vmware.com/v1alpha1
-kind: AIGuardrailPolicy
-metadata:
-  name: ai-dlp-baseline
-  namespace: inference
-spec:
-  targetRef: { group: gateway.networking.k8s.io, kind: HTTPRoute, name: llm-route }
-  profile: BlockLLM          # DLP (secrets/PII) + prompt-injection signatures
-  inspect: { request: true, response: false }
-  action: { type: Block, statusCode: 403 }
-```
+Turn it on from the **Gateways** tab instead of `kubectl apply`:
+
+1. Open **Gateways**, find the `avi-gateway` row, and check the box in its **DLP** column.
+   Checking it creates a `BlockLLM` guardrail (targeting the gateway, action `Block`) if none
+   exists yet, or flips an existing one to `Block`; unchecking flips it to `Log`
+   (shadow/detect-only).
+
+The toggle is a binary enforce/shadow switch on `BlockLLM`/`BlockMCP`/`BlockLLMAndMCP` — it does
+not expose this guide's `inspect.request`/`inspect.response` or a custom `action.statusCode`;
+anything beyond the toggle still needs `kubectl`.
 
 ```bash
-kubectl apply -f ai-dlp-baseline.yaml
 kubectl logs -n avi-system ako-0 -c ako-gateway-api | grep "attached WAF guardrail"
-# AIGuardrailPolicy inference/ai-dlp-baseline: attached WAF guardrail inference-ai-dlp-baseline-ai-guardrail on VS ...
+# AIGuardrailPolicy inference/avi-gateway-dlp: attached WAF guardrail inference-avi-gateway-dlp-ai-guardrail on VS ...
 ```
 
-In the Avi UI: **Templates → Security → WAF Policies** (`inference-ai-dlp-baseline-ai-guardrail`),
+In the Avi UI: **Templates → Security → WAF Policies** (`inference-avi-gateway-dlp-ai-guardrail`),
 referenced from the VS's `waf_policy_ref`.
 
 > **jwtQuery + guardrails coexist, but only with the fix for commit `591de2438`.** Guardrail
@@ -962,132 +1025,6 @@ Expected: `clean prompt: HTTP 200`, `leaked secret: HTTP 403`.
 
 ---
 
-## Dashboard counters endpoint & reset
-
-A UI can read live per-user usage from a token-gated, read-only endpoint AKO adds to the same
-VS. Enable it by pointing the token-limit policy at a Secret holding the admin token:
-
-```bash
-kubectl create secret generic ai-admin-token -n inference \
-  --from-literal=token=$(openssl rand -hex 16)
-kubectl annotate aitokenratelimitpolicy llm-limits -n inference \
-  ai.ako.vmware.com/admin-token-secret=ai-admin-token
-```
-
-AKO regenerates the request DataScript with a `/v1/admin/counters` branch. Under `jwtQuery`, the
-JWT SSOPolicy AKO builds already ships a `SKIP_AUTHENTICATION` rule for `/v1/admin/` (see
-[`EnsureJWTSSOPolicy`](../../ako-gateway-api/aigateway/jwt_rest.go)) — so the endpoint is reachable
-with no `?jwt=` and no extra config. Read it from an in-cluster pod, or via `--resolve`, passing
-the users you want (the SE counter table can't be enumerated):
-
-```bash
-TOKEN_ADMIN=$(kubectl get secret ai-admin-token -n inference -o jsonpath='{.data.token}' | base64 -d)
-VIP=$(kubectl get gateway avi-gateway -n inference -o jsonpath='{.status.addresses[0].value}')
-curl -sk --resolve "llm.demo.local:443:${VIP}" \
-  "https://llm.demo.local/v1/admin/counters?users=alice,bob,carol" \
-  -H "X-Admin-Token: $TOKEN_ADMIN"
-# {"window":...,"limit":"hourly-group-budget","counters":[{"user":"alice","used":300}, …]}
-# missing / wrong token -> 403 {"error":"forbidden"}
-```
-
-Each user is looked up at the *same* key the response-phase accounting writes, so the values are
-exactly what enforcement sees. The demo JWT issuer exposes its identity→group roster at
-`GET /users`, so a UI knows which users to query.
-
-### Reset all counters
-
-Bump the `counter-epoch` annotation — AKO folds it into every counter key, moving them all to a
-fresh keyspace (an instant reset that leaves budgets and the limit name untouched):
-
-```bash
-kubectl annotate aitokenratelimitpolicy llm-limits -n inference \
-  ai.ako.vmware.com/counter-epoch=2 --overwrite
-```
-
----
-
-## Dashboard UI
-
-A console that renders everything above — Dashboard, Governance, Models, Gateways, MCP Registry,
-and Agent Registry tabs — on top of the same policies and endpoints this guide already stood up.
-
-### Get the code
-
-```bash
-git clone git@github-vcf.devops.broadcom.net:ANS/AI-Gateway-UI-chris.git
-cd AI-Gateway-UI-chris
-git checkout feature/shared-counters-ui
-```
-
-This branch includes the agent registry, the shared token-counters dashboard, per-user budget
-gauges, and live polling of the real `/v1/admin/counters` endpoint set up in [Dashboard counters
-endpoint & reset](#dashboard-counters-endpoint--reset) (via `ADMIN_TOKEN`). It also carries the
-streaming-shim tab, present regardless of the rest of this guide.
-
-### Build
-
-```bash
-az acr build -r <your-acr-name> -t ai-gateway-ui:<tag> .
-```
-
-### Deploy
-
-Manifests live in `k8s/`:
-
-```bash
-kubectl apply -f k8s/01-rbac.yaml
-```
-
-Edit `k8s/02-deployment.yaml` (container name `ui`, namespace `inference`). Set the image
-(`k8s/02-deployment.yaml:19`) to `<your-acr-name>.azurecr.io/ai-gateway-ui:<tag>`, and set these
-env vars on the `ui` container:
-
-- `NAMESPACE=inference` (`k8s/02-deployment.yaml:24`)
-- `POLICY_NAME=llm-limits` (`k8s/02-deployment.yaml:25`) — the `AITokenRateLimitPolicy` name from
-  [Token rate limiting](#token-rate-limiting--aitokenratelimitpolicy)
-- `GATEWAY_VIP=<VIP>` (`k8s/02-deployment.yaml:26`), from:
-  ```bash
-  kubectl get gateway avi-gateway -n inference -o jsonpath='{.status.addresses[0].value}'
-  ```
-- `DEMO_HOST=llm.demo.local` (`k8s/02-deployment.yaml:27`)
-- `ISSUER_IP_PREFIX=10.224` (`k8s/02-deployment.yaml:28`) — adjust to your pod CIDR prefix
-- `ISSUER_USERS_URL=http://jwt-issuer.inference.svc.cluster.local:8080/users` — the built-in
-  default (`server.go:106`); set it only if your issuer Service name differs
-- `ISSUER_TOKEN_URL=http://jwt-issuer.inference.svc.cluster.local:8080/token` — same, built-in
-  default (`server.go:107`)
-- `ADMIN_TOKEN` (`k8s/02-deployment.yaml:39-41`), from `secretKeyRef: {name: ai-admin-token, key:
-  token}` — the same secret created in [Dashboard counters endpoint &
-  reset](#dashboard-counters-endpoint--reset)
-- Optionally `AVI_CONTROLLER` / `AVI_USERNAME` / `AVI_PASSWORD` / `AVI_VERSION`
-  (`k8s/02-deployment.yaml:30-35`) to light up the Inference tab's live Avi pool-ratio view — ties
-  to [Inference Extension — weight-based load balancing](#inference-extension--weight-based-load-balancing)
-
-```bash
-kubectl apply -f k8s/02-deployment.yaml
-kubectl rollout status deployment/ai-gateway-ui -n inference
-```
-
-### Expose it
-
-A dedicated Avi Gateway/HTTPRoute, hostname `ai-gw-ui.demo.local`:
-
-```bash
-kubectl apply -f k8s/03-gateway-httproute.yaml
-```
-
-or a direct AKS public LB Service, IP-locked:
-
-```bash
-kubectl apply -f k8s/04-public-lb.yaml
-```
-
-### Verify
-
-Open the exposed address. Confirm the Dashboard, Governance, Models, Gateways, MCP Registry, and
-Agent Registry tabs all load without errors.
-
----
-
 ## Cleanup
 
 ```bash
@@ -1095,7 +1032,6 @@ Agent Registry tabs all load without errors.
 kubectl delete aigatewayauthpolicy llm-auth -n inference        # AKO deletes the JWTServerProfile/AuthProfile/SSOPolicy
 kubectl delete aitokenratelimitpolicy llm-limits -n inference
 kubectl delete aitokenratelimitpolicy llm-limits-flat -n inference --ignore-not-found
-kubectl delete secret ai-admin-token -n inference --ignore-not-found
 
 # Model routing
 kubectl delete aimodelroutepolicy llm-tiers -n inference --ignore-not-found
@@ -1113,7 +1049,8 @@ kubectl delete -f docs/gateway-api/examples/ai-gateway-demo/a2a-gateway.yaml --i
 kubectl delete -f docs/gateway-api/examples/ai-gateway-demo/mock-a2a-agent.yaml --ignore-not-found
 kubectl delete secret a2a-tls -n inference --ignore-not-found
 
-# Guardrails
+# Guardrails — resource name depends on how you created it above
+kubectl delete aiguardrailpolicy avi-gateway-dlp -n inference --ignore-not-found
 kubectl delete aiguardrailpolicy ai-dlp-baseline -n inference --ignore-not-found
 
 # Shared issuer + LLM listener + mocks
@@ -1122,10 +1059,16 @@ kubectl delete secret jwt-signing-key -n inference
 kubectl delete secret llm-tls -n inference
 kubectl delete -f docs/gateway-api/examples/ai-gateway-demo/mock-llm.yaml
 
-# Core Gateway API objects created in Steps 6-7
+# Core Gateway API objects created in Steps 7-8
 kubectl delete httproute llm-route -n inference --ignore-not-found
 kubectl delete inferencepool llm-pool -n inference --ignore-not-found
 kubectl delete gateway avi-gateway -n inference --ignore-not-found
+
+# Dashboard UI (Step 6) — run from the AI-Gateway-UI-chris directory
+kubectl delete -f k8s/03-gateway-httproute.yaml --ignore-not-found   # if you used the Gateway/HTTPRoute exposure
+kubectl delete -f k8s/04-public-lb.yaml --ignore-not-found           # if you used the public LB exposure
+kubectl delete -f k8s/02-deployment.yaml --ignore-not-found
+kubectl delete -f k8s/01-rbac.yaml --ignore-not-found
 ```
 
 The steps above remove everything this guide layered on top. AKO itself, the `avi-secret`, and
@@ -1207,3 +1150,15 @@ claim name in the policy (`groupClaim` / `roleClaim` / `agentClaim`) matches it 
 **Auth works but 429/403 group/role decision is wrong** — confirm the issued token carries the
 claim named in `groupHeader` / `roleClaim` / `agentClaim` and that its value is a key in the
 corresponding rules map. Check the AKO logs for the relevant `Apply*Policy` line.
+
+**UI create/edit buttons return `k8sError: "k8s not connected"`** — the UI pod can't reach the
+k8s API server; confirm it's actually running in-cluster and that `k8s/01-rbac.yaml` applied
+cleanly (`kubectl get clusterrolebinding ai-gateway-ui`).
+
+**Gateways-tab DLP toggle fails with `AIGuardrailPolicy CRD not installed`** — apply
+`helm/ako/crds/ai.ako.vmware.com_aiguardrailpolicies.yaml` (Step 3) before using the toggle.
+
+**Creating an MCP Route from the UI fails with `server <name> is not in the approved registry`**
+— the MCP Registry tab only routes to servers already listed in the `mcp-registry` ConfigMap;
+unlike the `AIMCPRoutePolicy` backend used in this guide, the UI won't route to an arbitrary
+Service.
