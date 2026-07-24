@@ -111,8 +111,8 @@ kubectl get crd | grep inference
 
 You should see:
 ```
-inferencepools.gateway.inference.x-k8s.io
-inferenceobjectives.gateway.inference.x-k8s.io
+inferencepools.inference.networking.x-k8s.io
+inferenceobjectives.inference.networking.x-k8s.io
 ```
 
 If the CRD is still not found, try the kustomize path instead:
@@ -348,27 +348,16 @@ kubectl get gateway -n inference avi-gateway
 ```
 
 The bare Gateway object can also be created from the UI's Gateways tab (**+ Create**, leave
-Gateway type at its default `LLM`). The Models tab has an InferencePool form too, but it's wired
-to the older `inference.networking.x-k8s.io/v1alpha2` API — not the `gateway.inference.x-k8s.io/v1`
-InferencePool CRD this guide installed in Step 3 — so it won't create a matching object here;
-create the InferencePool and HTTPRoute below with `kubectl`.
+Gateway type at its default `LLM`).
 
-Create an `InferencePool` that selects `app: mock-llm` — the label the mock LLM pods deployed
-in the next step carry — and an `HTTPRoute` named `llm-route` that sends `/v1` traffic to it:
+Create the `InferencePool` from the UI instead of `kubectl apply`:
 
-```yaml
-# inferencepool.yaml
-apiVersion: gateway.inference.x-k8s.io/v1
-kind: InferencePool
-metadata:
-  name: llm-pool
-  namespace: inference
-spec:
-  selector:
-    matchLabels:
-      app: mock-llm        # matches the mock-llm pods deployed in Step 8
-  targetPort: 8000
-```
+1. Open **Models** and click **+ Create**.
+2. Name `llm-pool`, Namespace `inference`, Pod selector `app=mock-llm` — the label the mock LLM
+   pods deployed in the next step carry — Target port `8000`.
+3. Click **Save**.
+
+The `HTTPRoute` that sends `/v1` traffic to it has no UI equivalent — create it with `kubectl`:
 
 ```yaml
 # httproute.yaml
@@ -386,13 +375,12 @@ spec:
         type: PathPrefix
         value: /v1
     backendRefs:
-    - group: gateway.inference.x-k8s.io
+    - group: inference.networking.x-k8s.io
       kind: InferencePool
       name: llm-pool
 ```
 
 ```bash
-kubectl apply -f inferencepool.yaml
 kubectl apply -f httproute.yaml
 ```
 
@@ -696,33 +684,13 @@ Expected: `alice: 200 200 200 200 200 429`, `bob: 200×10 429`, `dave: 403` with
 Routes each request to a quality/cost tier by the requested `model` field, optionally gated by
 the caller's verified group. Full design + Avi object mapping: [model-routing.md](model-routing.md).
 
-Reuse the two mock-llm pods from Step 8 as two tiers, each with its own `InferencePool`:
+Reuse the two mock-llm pods from Step 8 as two tiers, each with its own `InferencePool`. Create
+both from the **Models** tab instead of `kubectl apply`:
 
-```yaml
-apiVersion: gateway.inference.x-k8s.io/v1
-kind: InferencePool
-metadata:
-  name: premium-llm
-  namespace: inference
-spec:
-  selector:
-    matchLabels: { pod: "1" }     # mock-llm-1 only
-  targetPort: 8000
----
-apiVersion: gateway.inference.x-k8s.io/v1
-kind: InferencePool
-metadata:
-  name: economy-llm
-  namespace: inference
-spec:
-  selector:
-    matchLabels: { pod: "2" }     # mock-llm-2 only
-  targetPort: 8000
-```
-
-```bash
-kubectl apply -f inferencepools.yaml
-```
+1. **+ Create**: Name `premium-llm`, Namespace `inference`, Pod selector `pod=1` (mock-llm-1
+   only), Target port `8000`. Click **Save**.
+2. **+ Create**: Name `economy-llm`, Namespace `inference`, Pod selector `pod=2` (mock-llm-2
+   only), Target port `8000`. Click **Save**.
 
 Create the `AIModelRoutePolicy` from the UI instead of `kubectl apply`:
 
