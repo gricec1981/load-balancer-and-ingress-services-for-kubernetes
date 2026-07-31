@@ -111,8 +111,8 @@ spec:
   detectors:
     secrets:                # AKO ships & maintains the regex for these
       - aws-access-key      #   AKIA[0-9A-Z]{16}
-      - openai-api-key      #   sk-[A-Za-z0-9]{20,}
-      - private-key         #   -----BEGIN ... PRIVATE KEY-----
+      - generic-sk-token    #   sk-[A-Za-z0-9]{20,}  (generic sk- token; NOT OpenAI-specific)
+      - private-key         #   -----BEGIN ... PRIVATE KEY----- ... -----END ... (END required)
       - jwt
     pii:
       - ssn                 #   validity-anchored \d{3}-\d{2}-\d{4} (excludes 000/666/900-999 area, 00 group, 0000 serial)
@@ -235,15 +235,44 @@ The built-in **signature library** (AKO-maintained, the value-add — operators 
 |---|---|
 | `aws-access-key` | `AKIA[0-9A-Z]{16}` |
 | `gcp-api-key` | `AIza[0-9A-Za-z_-]{35}` |
-| `openai-api-key` | `sk-(?:proj-\|svcacct-)?[A-Za-z0-9]{20,}` |
+| `generic-sk-token` | `sk-(?:proj-\|svcacct-)?[A-Za-z0-9]{20,}` (generic `sk-` token — matches OpenAI keys *and* other systems' `sk-` tokens; named generically so a match isn't mislabelled as OpenAI-specific) |
 | `github-token` | `gh[pousr]_[A-Za-z0-9]{36}` |
 | `github-fine-grained-pat` | `github_pat_[A-Za-z0-9_]{82,}` |
 | `slack-token` | `xox[baprs]-[0-9A-Za-z-]{10,}` |
-| `private-key` | `-----BEGIN [A-Z ]+PRIVATE KEY-----` |
+| `private-key` | `-----BEGIN [A-Z ]+PRIVATE KEY-----(?:(?!-----END).){0,4096}-----END [A-Z ]+PRIVATE KEY-----` (requires a matching END marker so a bare header / meta-discussion of PEM formats doesn't match; the bounded negative-lookahead is standard PCRE) |
 | `jwt` | `eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+` |
 | `ssn` | `\b(?!000\|666\|9[0-9]{2})[0-9]{3}-(?!00)[0-9]{2}-(?!0000)[0-9]{4}\b` (boundary + validity ranges) |
 | `credit-card` | `\b(?:4[0-9]{12}(?:[0-9]{3})?\|5[1-5][0-9]{14}\|3[47][0-9]{13}\|3(?:0[0-5]\|[68][0-9])[0-9]{11}\|6(?:011\|5[0-9]{2})[0-9]{12})\b` (IIN-anchored) |
 | `email` | `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}` |
+
+**Prompt-injection tiering (false-positive reduction).** The prompt-injection signatures
+(`promptInjection: true`) split into a **specific** tier and a **generic** tier to cut false
+positives. Specific-tier rules follow the policy `action` (Block by default); generic-tier
+rules are **always Log / detection-only regardless of `action`**, because their terms are
+common in ordinary tech/support language and shouldn't hard-block:
+
+| Detector | Specific tier (follows action — Block by default) | Generic tier (always Log) |
+|---|---|---|
+| `ignore-instructions` | — | whole rule (e.g. "disregard the above instruction, use Celsius" is normal speech) |
+| `jailbreak` | `doanythingnow\|danmode\|unfilteredmode\|withoutanyfilter\|withoutrestriction` | `developermode\|jailbreak\|jailbroken` (phone jailbreaking, dev-mode toggles) |
+| `role-injection` | `[system]`, `<\|im_start\|>`, `<\|im_end\|>`, `<system>`, `</system>`, `beginsystemprompt`, `endofprompt` | `###system` / `###instruction` (ordinary Markdown headers — the biggest FP driver) |
+| `override-safety` | verb group + AI nouns `safety\|guardrail\|contentpolic` | verb group + generic IT nouns `restriction\|filter\|moderation` |
+| `reveal-system-prompt` | whole rule (not a FP source — untouched) | — |
+
+Both tiers keep the hardened evasion-resistant transform passes (lowercase + url/unicode-decode
++ whitespace-strip, plus a base64-decode pass).
+
+> ⚠️ **`credit-card` Luhn variant — UNVERIFIED, opt-in only, needs a live-controller spike.**
+> A second credit-card detector chains the IIN-anchored `@rx` match to ModSecurity's native
+> `@verifyCC` (Luhn) operator via the OWASP-CRS capture-and-chain idiom (`capture,chain` →
+> `SecRule TX:0 "@verifyCC \d{13,16}"`), which would drop the false positives the plain `@rx`
+> leaves (IIN-shaped runs that aren't valid cards). `WafRule.Rule` is "Rule as per Modsec
+> language", so this *should* work — **but whether Avi's WAF-engine build implements `@verifyCC`
+> has NOT been verified on a live controller.** If unsupported, the controller will likely reject
+> the rule at compile/apply (non-201) — that's the concrete thing to check. It is therefore **not
+> wired into any profile** (`BlockLLM`/`BlockMCP`/`BlockLLMAndMCP`); the plain `@rx` `credit-card`
+> rule stays the known-good default. The generator + shape test exist so it's ready the moment a
+> controller spike confirms the operator.
 
 ---
 

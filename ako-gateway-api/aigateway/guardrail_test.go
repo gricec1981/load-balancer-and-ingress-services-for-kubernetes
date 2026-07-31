@@ -15,6 +15,7 @@
 package aigateway
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 
@@ -24,8 +25,12 @@ import (
 func TestResolveBlockProfile(t *testing.T) {
 	s := AIGuardrailPolicySpec{Profile: ProfileBlockLLMAndMCP}
 	r := s.Resolve()
-	if len(r.Secrets) == 0 || !contains(r.Secrets, "aws-access-key") || !contains(r.Secrets, "openai-api-key") {
+	if len(r.Secrets) == 0 || !contains(r.Secrets, "aws-access-key") || !contains(r.Secrets, "generic-sk-token") {
 		t.Errorf("BlockLLMAndMCP should include the secret library: %v", r.Secrets)
+	}
+	// The generic sk- token detector must NOT be labelled as an OpenAI key anymore.
+	if contains(r.Secrets, "openai-api-key") {
+		t.Errorf("openai-api-key should have been renamed to generic-sk-token: %v", r.Secrets)
 	}
 	if !contains(r.PII, "ssn") || !contains(r.PII, "credit-card") {
 		t.Errorf("BlockLLMAndMCP should include core PII: %v", r.PII)
@@ -107,19 +112,19 @@ func TestGenerateGuardrailRulesRequest(t *testing.T) {
 	}
 	blob := rulesString(rules)
 	for _, sub := range []string{
-		`@rx AKIA[0-9A-Z]{16}`,               // aws secret
+		`@rx AKIA[0-9A-Z]{16}`, // aws secret
 		`@rx \b(?!000|666|9[0-9]{2})[0-9]{3}-(?!00)[0-9]{2}-(?!0000)[0-9]{4}\b`, // ssn (boundaries + validity ranges)
-		`(ignore|disregard|forget|override)`, // prompt injection
-		`ARGS|REQUEST_BODY`,                  // request target
-		`!ARGS:jwt`,                          // jwtQuery auth token excluded from WAF inspection
-		`phase:2`,                            // request phase
-		`deny`,                               // block action
-		`WAF_MODE_ENFORCEMENT`,               // per-rule enforce mode
-		`t:lowercase`,                        // PI case-insensitive
-		`t:removeWhitespace`,                 // hardening: defeats "i g n o r e" spacing
-		`t:base64Decode`,                     // hardening: defeats base64-encoded injection
-		`t:urlDecodeUni`,                     // hardening: defeats %-encoding / unicode
-		`role-injection`,                     // role/delimiter family ([system], <|im_start|>)
+		`(ignore|disregard|forget|override)`,                                    // prompt injection
+		`ARGS|REQUEST_BODY`,                                                     // request target
+		`!ARGS:jwt`,                                                             // jwtQuery auth token excluded from WAF inspection
+		`phase:2`,                                                               // request phase
+		`deny`,                                                                  // block action
+		`WAF_MODE_ENFORCEMENT`,                                                  // per-rule enforce mode
+		`t:lowercase`,                                                           // PI case-insensitive
+		`t:removeWhitespace`,                                                    // hardening: defeats "i g n o r e" spacing
+		`t:base64Decode`,                                                        // hardening: defeats base64-encoded injection
+		`t:urlDecodeUni`,                                                        // hardening: defeats %-encoding / unicode
+		`role-injection`,                                                        // role/delimiter family ([system], <|im_start|>)
 	} {
 		if !strings.Contains(blob, sub) {
 			t.Errorf("request rules missing %q", sub)
@@ -203,6 +208,215 @@ func TestUnstructuredToGuardrailPolicy(t *testing.T) {
 	}
 }
 
+// keywordDenylistRegex returns the @rx pattern the keyword-denylist detector
+// generates for the given keywords, or "" if none was emitted.
+func keywordDenylistRegex(t *testing.T, kw *GuardrailKeywords) string {
+	t.Helper()
+	for _, d := range (ResolvedDetectors{Keywords: kw}).flatten() {
+		if d.name == "keyword-denylist" {
+			return d.regex
+		}
+	}
+	t.Fatal("no keyword-denylist detector generated")
+	return ""
+}
+
+func TestKeywordDenylistWordBoundary(t *testing.T) {
+	// Bug 1: the alternation must be \b-anchored so a keyword only matches whole
+	// words — "internal" must not match inside "internally".
+	pat := keywordDenylistRegex(t, &GuardrailKeywords{Match: []string{"internal"}, CaseSensitive: true})
+	if pat != `\b(internal)\b` {
+		t.Fatalf("expected word-boundary-anchored pattern, got %q", pat)
+	}
+	// Compile and exercise it the way the WAF would (PCRE \b == Go regexp \b here).
+	re := regexp.MustCompile(pat)
+	if re.MatchString("internally") {
+		t.Error(`pattern should NOT match the substring inside "internally"`)
+	}
+	if !re.MatchString("internal use only") {
+		t.Error(`pattern should match the standalone word in "internal use only"`)
+	}
+}
+
+func TestKeywordDenylistCaseInsensitiveLowercasesPattern(t *testing.T) {
+	// Bug 2: with caseSensitive:false the input is matched under t:lowercase, so the
+	// pattern must be lowercased too or it can never fire.
+	pat := keywordDenylistRegex(t, &GuardrailKeywords{Match: []string{"CONFIDENTIAL"}, CaseSensitive: false})
+	if pat != `\b(confidential)\b` {
+		t.Fatalf("case-insensitive pattern should be lowercased to match t:lowercase input, got %q", pat)
+	}
+	// The lowercased pattern lines up with the lowercased input the transform produces.
+	if !regexp.MustCompile(pat).MatchString(strings.ToLower("This is CONFIDENTIAL data")) {
+		t.Error("lowercased pattern should match the lowercased input")
+	}
+	// And the case-insensitive detector still carries the t:lowercase transform.
+	blob := rulesString(GenerateGuardrailRules(
+		ResolvedDetectors{Keywords: &GuardrailKeywords{Match: []string{"CONFIDENTIAL"}, CaseSensitive: false}},
+		true, false, true, 403))
+	if !strings.Contains(blob, `@rx \b(confidential)\b`) || !strings.Contains(blob, "t:lowercase") {
+		t.Errorf("expected lowercased @rx pattern with t:lowercase transform:\n%s", blob)
+	}
+}
+
+func TestKeywordDenylistCaseSensitivePreservesCase(t *testing.T) {
+	// caseSensitive:true keeps the keyword as typed (no lowercasing), still \b-anchored.
+	pat := keywordDenylistRegex(t, &GuardrailKeywords{Match: []string{"CONFIDENTIAL"}, CaseSensitive: true})
+	if pat != `\b(CONFIDENTIAL)\b` {
+		t.Fatalf("case-sensitive pattern should preserve original case, got %q", pat)
+	}
+}
+
+func TestPrivateKeyRequiresEndMarker(t *testing.T) {
+	// Change 1: the private-key signature must require a matching END marker so a bare
+	// header (partial paste / meta-discussion of PEM formats) does NOT match — only a
+	// full BEGIN...body...END block does.
+	blob := rulesString(GenerateGuardrailRules(
+		ResolvedDetectors{Secrets: []string{"private-key"}}, true, false, true, 403))
+	// String-content assertion: Go's stdlib regexp (RE2) can't compile the PCRE
+	// negative lookahead the shipped pattern uses, so assert on the generated SecRule.
+	if !strings.Contains(blob, `-----END [A-Z ]+PRIVATE KEY-----`) {
+		t.Errorf("private-key rule must require an END marker:\n%s", blob)
+	}
+	if !strings.Contains(blob, `(?:(?!-----END).)`) {
+		t.Errorf("private-key rule should use the bounded negative-lookahead guard:\n%s", blob)
+	}
+
+	// Behavioural check via an RE2-equivalent stand-in: Go can't run the PCRE lookahead
+	// form, so translate the bounded "not-END" repetition into a non-greedy dot-all
+	// match — identical accept/reject semantics for these two inputs.
+	re := regexp.MustCompile(`-----BEGIN [A-Z ]+PRIVATE KEY-----(?s:.*?)-----END [A-Z ]+PRIVATE KEY-----`)
+	if re.MatchString("-----BEGIN RSA PRIVATE KEY-----") {
+		t.Error("a bare BEGIN header with no END marker should NOT match")
+	}
+	full := "-----BEGIN RSA PRIVATE KEY-----\nMIIBVAIBADANBgkqhkiG9w0BAQEF...base64...\n-----END RSA PRIVATE KEY-----"
+	if !re.MatchString(full) {
+		t.Error("a full BEGIN...body...END block should match")
+	}
+}
+
+func TestPromptInjectionTierSplit(t *testing.T) {
+	// Change 3: call with block=true (the caller wants enforcement). Specific-tier PI
+	// rules must enforce (Block); generic-tier rules must stay detection-only (Log)
+	// regardless of the requested action — they're too common to hard-block by default.
+	rules := GenerateGuardrailRules(
+		ResolvedDetectors{PromptInjection: true}, true, false, true /* block */, 403)
+
+	specific := []string{
+		"pi-jailbreak-req",
+		"pi-role-injection-req",
+		"pi-override-safety-req",
+		"pi-reveal-system-prompt-req", // untouched — stays Block
+	}
+	generic := []string{
+		"pi-ignore-instructions-req", // whole rule moved to always-Log
+		"pi-jailbreak-generic-req",
+		"pi-role-injection-generic-req",
+		"pi-override-safety-generic-req",
+	}
+	for _, name := range specific {
+		if m := modeOf(rules, name); m != "WAF_MODE_ENFORCEMENT" {
+			t.Errorf("specific-tier %s should enforce (Block), got mode=%q", name, m)
+		}
+		if !strings.Contains(secRuleOf(rules, name), ",deny,") {
+			t.Errorf("specific-tier %s SecRule should use deny:\n%s", name, secRuleOf(rules, name))
+		}
+	}
+	for _, name := range generic {
+		if m := modeOf(rules, name); m != "WAF_MODE_DETECTION_ONLY" {
+			t.Errorf("generic-tier %s should be Log/detection-only even under Block, got mode=%q", name, m)
+		}
+		rule := secRuleOf(rules, name)
+		if strings.Contains(rule, ",deny,") {
+			t.Errorf("generic-tier %s SecRule must NOT deny:\n%s", name, rule)
+		}
+		// Generic-tier rules keep the hardened evasion-resistant transform passes.
+		if !strings.Contains(rule, "t:removeWhitespace") {
+			t.Errorf("generic-tier %s should keep hardened transforms:\n%s", name, rule)
+		}
+	}
+}
+
+func TestPromptInjectionTierRegexBoundaries(t *testing.T) {
+	// PI patterns have no lookahead, so Go's regexp can exercise them directly. Inputs
+	// are pre-normalised (lowercase, whitespace removed) to mirror the t:lowercase +
+	// t:removeWhitespace transform the hardened rules apply before matching.
+	pat := func(name string) string {
+		for _, d := range (ResolvedDetectors{PromptInjection: true}).flatten() {
+			if d.name == name {
+				return d.regex
+			}
+		}
+		t.Fatalf("no detector %q", name)
+		return ""
+	}
+
+	jbSpecific := regexp.MustCompile(pat("pi-jailbreak"))
+	jbGeneric := regexp.MustCompile(pat("pi-jailbreak-generic"))
+	// "developermode" is a generic term: generic tier matches, specific tier does not.
+	if jbSpecific.MatchString("developermode") {
+		t.Error("specific jailbreak tier should NOT match the generic term 'developermode'")
+	}
+	if !jbGeneric.MatchString("developermode") {
+		t.Error("generic jailbreak tier should match 'developermode'")
+	}
+	// "doanythingnow" is AI-specific: specific tier matches.
+	if !jbSpecific.MatchString("doanythingnow") {
+		t.Error("specific jailbreak tier should match 'doanythingnow'")
+	}
+	// Benign tech-support text matches neither tier.
+	if jbSpecific.MatchString("pleasehelpmedebugmycode") || jbGeneric.MatchString("pleasehelpmedebugmycode") {
+		t.Error("benign text should not match any jailbreak tier")
+	}
+
+	riSpecific := regexp.MustCompile(pat("pi-role-injection"))
+	riGeneric := regexp.MustCompile(pat("pi-role-injection-generic"))
+	// A Markdown header "### system" (normalised → "###system") is the big FP driver:
+	// the generic tier logs it, the specific tier ignores it.
+	if riSpecific.MatchString("###system") {
+		t.Error("specific role-injection tier should NOT match a markdown '###system' header")
+	}
+	if !riGeneric.MatchString("###system") {
+		t.Error("generic role-injection tier should match '###system'")
+	}
+	// A real chat-template delimiter still hits the specific (Block) tier.
+	if !riSpecific.MatchString("<|im_start|>") {
+		t.Error("specific role-injection tier should match '<|im_start|>'")
+	}
+}
+
+func TestCreditCardVerifyCCChainGeneration(t *testing.T) {
+	// ⚠️ Change 4 — shape-only test. Asserts the generated chain's SecRule text has the
+	// right `chain` action and `@verifyCC` operator syntax. Actual Luhn behaviour can't
+	// be tested without a live WAF (Go's regexp has no @verifyCC), and Avi's WAF-engine
+	// support for @verifyCC is UNVERIFIED — this rule is intentionally NOT wired into any
+	// default profile and needs a live-controller spike before use.
+	rule := generateCreditCardVerifyCCRule(guardrailRuleIDBase+900, 2, "ARGS|REQUEST_BODY", true, 403)
+	for _, sub := range []string{
+		"@rx ",         // rule 1: IIN-anchored candidate match
+		"capture",      // captures the candidate into TX:0
+		"chain",        // links to the validation rule
+		"SecRule TX:0", // rule 2 operates on the captured value
+		"@verifyCC ",   // ModSecurity Luhn operator
+		`\d{13,16}`,    // verifyCC candidate shape
+		"deny",         // block action when block=true
+		"status:403",
+	} {
+		if !strings.Contains(rule, sub) {
+			t.Errorf("verifyCC chain missing %q:\n%s", sub, rule)
+		}
+	}
+	// Two chained directives: chain on rule 1, a second SecRule for the validation.
+	if strings.Count(rule, "SecRule ") != 2 {
+		t.Errorf("expected a 2-directive chained rule:\n%s", rule)
+	}
+	// Not wired into defaults: BlockLLMAndMCP must NOT emit the @verifyCC variant.
+	blob := rulesString(GenerateGuardrailRules(
+		(&AIGuardrailPolicySpec{Profile: ProfileBlockLLMAndMCP}).Resolve(), true, false, true, 403))
+	if strings.Contains(blob, "verifyCC") || strings.Contains(blob, "credit-card-luhn") {
+		t.Errorf("the @verifyCC variant must NOT be wired into default profiles:\n%s", blob)
+	}
+}
+
 // helpers
 func rulesString(rules []map[string]interface{}) string {
 	var b strings.Builder
@@ -213,6 +427,26 @@ func rulesString(rules []map[string]interface{}) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// modeOf returns the WAF mode of the generated rule with the exact given name.
+func modeOf(rules []map[string]interface{}, name string) string {
+	for _, r := range rules {
+		if r["name"].(string) == name {
+			return r["mode"].(string)
+		}
+	}
+	return ""
+}
+
+// secRuleOf returns the SecRule text of the generated rule with the exact given name.
+func secRuleOf(rules []map[string]interface{}, name string) string {
+	for _, r := range rules {
+		if r["name"].(string) == name {
+			return r["rule"].(string)
+		}
+	}
+	return ""
 }
 func contains(ss []string, s string) bool {
 	for _, x := range ss {
