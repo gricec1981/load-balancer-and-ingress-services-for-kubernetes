@@ -246,22 +246,66 @@ func ApplyTokenRateLimitPolicy(key string, policy *AITokenRateLimitPolicy, vsNod
 		key, policy.Namespace, policy.Name, vsName)
 }
 
-// ApplyGuardrailPolicy authors the Avi WafPolicy for the guardrail spec (DLP +
-// prompt-injection signatures) and attaches it to the VS via waf_policy_ref. The
-// authoring is what AKO adds — attachment could also be done with the L7Rule CRD,
-// but L7Rule only references a WafPolicy by name; nothing else creates it.
+// ApplyGuardrailPolicy authors the Avi objects for the guardrail spec and
+// attaches them to the VS. Two independent layers, both authored by AKO:
+//
+//   - Signature (WAF): a WafPolicy (DLP + known-phrase injection) set on the VS
+//     via waf_policy_ref. Attachment could also be done with the L7Rule CRD, but
+//     L7Rule only references a WafPolicy by name; nothing else creates it.
+//   - Semantic (ICAP): a prompt-injection classifier the SE calls over ICAP
+//     REQMOD, for the novel/paraphrased injection the signature layer misses.
+//     This needs TWO Avi objects — the icapprofile AND an HTTPPolicySet whose
+//     security rule action is REQUEST_CHECK_ICAP (attaching the profile alone is
+//     a no-op; Spike-1) — set on the VS via icap_request_profile_refs and
+//     http_policies respectively.
+//
+// The layers compose: on 32.1.1 WAF short-circuits before ICAP; on 31.2.1 the
+// ICAP check runs first. Either way both block before the request is forwarded.
 func ApplyGuardrailPolicy(key string, policy *AIGuardrailPolicy, vsNode nodes.AviVsEvhSniModel) {
 	if policy == nil {
 		return
 	}
-	name, err := EnsureGuardrailWafPolicy(key, policy)
-	if err != nil {
-		utils.AviLog.Warnf("key: %s, msg: AIGuardrailPolicy %s/%s: %v", key, policy.Namespace, policy.Name, err)
-		return
+
+	// ── Signature layer (WafPolicy) — skipped for a semantic-only policy. ──
+	if policy.Spec.Resolve().HasAny() {
+		name, err := EnsureGuardrailWafPolicy(key, policy)
+		if err != nil {
+			utils.AviLog.Warnf("key: %s, msg: AIGuardrailPolicy %s/%s: %v", key, policy.Namespace, policy.Name, err)
+		} else {
+			vsNode.SetWafPolicyRef(proto.String("/api/wafpolicy?name=" + name))
+			utils.AviLog.Infof("key: %s, msg: AIGuardrailPolicy %s/%s: attached WAF guardrail %s on VS %s",
+				key, policy.Namespace, policy.Name, name, vsNode.GetName())
+		}
 	}
-	vsNode.SetWafPolicyRef(proto.String("/api/wafpolicy?name=" + name))
-	utils.AviLog.Infof("key: %s, msg: AIGuardrailPolicy %s/%s: attached WAF guardrail %s on VS %s",
-		key, policy.Namespace, policy.Name, name, vsNode.GetName())
+
+	// ── Semantic layer (ICAP classifier) — author the icapprofile AND the ──
+	// REQUEST_CHECK_ICAP HTTPPolicySet, then set both on the VS.
+	if policy.Spec.SemanticEnabled() {
+		refs, err := EnsureGuardrailIcap(key, policy)
+		if err != nil {
+			utils.AviLog.Warnf("key: %s, msg: AIGuardrailPolicy %s/%s: semantic ICAP: %v", key, policy.Namespace, policy.Name, err)
+			return
+		}
+		if refs != nil {
+			vsNode.SetICAPProfileRefs([]string{refs.ICAPProfileRef})
+			// Merge (not overwrite) the security HTTPPolicySet: L7Rule/HTTPRoute
+			// filters may also program http_policies. De-dup by ref.
+			existing := vsNode.GetHttpPolicySetRefs()
+			found := false
+			for _, r := range existing {
+				if r == refs.SecurityHPSRef {
+					found = true
+					break
+				}
+			}
+			if !found {
+				existing = append(existing, refs.SecurityHPSRef)
+			}
+			vsNode.SetHttpPolicySetRefs(existing)
+			utils.AviLog.Infof("key: %s, msg: AIGuardrailPolicy %s/%s: attached semantic ICAP (%s + %s) on VS %s",
+				key, policy.Namespace, policy.Name, refs.ICAPProfileRef, refs.SecurityHPSRef, vsNode.GetName())
+		}
+	}
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────

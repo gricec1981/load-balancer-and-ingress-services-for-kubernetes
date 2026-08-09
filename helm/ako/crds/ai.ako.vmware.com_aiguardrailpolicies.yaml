@@ -23,8 +23,9 @@ spec:
           AIGuardrailPolicy enforces DLP and content guardrails on AI traffic
           (inference and MCP). AKO authors an Avi WAF policy from this spec — secrets/PII
           DLP plus prompt-injection signatures — and attaches it to the targeted route's
-          Virtual Service. Detection runs entirely on the Service Engine WAF (no proxy,
-          no sidecar). Semantic detection is out of scope (signatures only).
+          Virtual Service. Detection runs on the Service Engine (no proxy, no sidecar).
+          An optional semantic layer (spec.semantic) has the SE call a prompt-injection
+          classifier over ICAP to catch novel/paraphrased injection the signatures miss.
         type: object
         required:
         - spec
@@ -138,6 +139,57 @@ spec:
                     default: 403
                     minimum: 400
                     maximum: 599
+              semantic:
+                description: |-
+                  Semantic (ICAP classifier) layer. The Service Engine calls an
+                  out-of-band prompt-injection classifier over ICAP REQMOD and
+                  enforces its verdict, catching novel/paraphrased injection the
+                  signature layer misses. AKO authors both the icapprofile and the
+                  HTTP_SECURITY_ACTION_REQUEST_CHECK_ICAP HTTPPolicySet that makes
+                  ICAP fire. No proxy in the request path — the classifier is a
+                  callable inspection service.
+                type: object
+                properties:
+                  enabled:
+                    description: Turn the ICAP classifier layer on for this route.
+                    type: boolean
+                    default: false
+                  classifier:
+                    description: The ICAP server (classifier shim) Service. AKO builds the Pool + authors the icapprofile from this.
+                    type: object
+                    required:
+                    - backendRef
+                    properties:
+                      backendRef:
+                        type: object
+                        required:
+                        - name
+                        properties:
+                          name:
+                            type: string
+                          namespace:
+                            description: Defaults to the policy namespace.
+                            type: string
+                          port:
+                            type: integer
+                            default: 1344
+                  threshold:
+                    description: Injection-score cutoff the shim enforces (0..1).
+                    type: number
+                    default: 0.6
+                    minimum: 0
+                    maximum: 1
+                  failOpen:
+                    description: ICAP error/timeout behaviour. true (default) allows on failure (availability); false denies (security).
+                    type: boolean
+                    default: true
+                  action:
+                    description: Block (default, reject) or Log (shadow mode — classify and log, don't reject).
+                    type: string
+                    default: Block
+                    enum:
+                    - Block
+                    - Log
           status:
             type: object
             properties:

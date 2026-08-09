@@ -16,6 +16,7 @@ package aigateway
 
 import (
 	"fmt"
+	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -59,6 +60,51 @@ type AIGuardrailPolicySpec struct {
 	// Action controls what happens on a match.
 	// +optional
 	Action *GuardrailAction `json:"action,omitempty"`
+
+	// Semantic enables the ICAP classifier layer: the SE calls an out-of-band
+	// prompt-injection classifier over ICAP REQMOD and enforces its verdict. This
+	// catches novel / paraphrased injection the signature layer provably misses
+	// (see docs/gateway-api/ai-gateway-guardrails-semantic.md). AKO authors both
+	// the icapprofile AND the HTTP_SECURITY_ACTION_REQUEST_CHECK_ICAP HTTPPolicySet
+	// that makes ICAP fire.
+	// +optional
+	Semantic *GuardrailSemantic `json:"semantic,omitempty"`
+}
+
+// GuardrailSemantic configures the ICAP classifier layer.
+type GuardrailSemantic struct {
+	// Enabled turns the ICAP classifier layer on for this route.
+	Enabled bool `json:"enabled,omitempty"`
+	// Classifier locates the ICAP server (the classifier + shim Service).
+	Classifier *GuardrailClassifier `json:"classifier,omitempty"`
+	// Threshold is the injection-score cutoff the shim enforces (default 0.6).
+	// Passed to the shim on the icapprofile service_uri query string.
+	// +optional
+	Threshold *float64 `json:"threshold,omitempty"`
+	// FailOpen controls ICAP error/timeout behaviour. true (default) favours
+	// availability (allow on ICAP failure); false favours security (deny). Maps to
+	// icapprofile.fail_action ICAP_FAIL_OPEN / ICAP_FAIL_CLOSED.
+	// +optional
+	FailOpen *bool `json:"failOpen,omitempty"`
+	// Action is "Block" (default, reject on match) or "Log" (shadow mode: classify
+	// and log, don't reject). Passed to the shim as mode=block|log.
+	// +optional
+	Action string `json:"action,omitempty"`
+}
+
+// GuardrailClassifier is a reference to the ICAP server Service. AKO builds the
+// Avi Pool from this Service's ready endpoints and authors the icapprofile that
+// points at it.
+type GuardrailClassifier struct {
+	// BackendRef is the ICAP server Service (the classifier shim, port 1344).
+	BackendRef GuardrailBackendRef `json:"backendRef"`
+}
+
+// GuardrailBackendRef identifies a Kubernetes Service and port.
+type GuardrailBackendRef struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace,omitempty"`
+	Port      int32  `json:"port,omitempty"`
 }
 
 // GuardrailInspect selects request/response body inspection.
@@ -163,6 +209,38 @@ func (s *AIGuardrailPolicySpec) EffectiveStatusCode() int {
 	return 403
 }
 
+// ─── Semantic (ICAP) layer accessors ─────────────────────────────────────────
+
+// SemanticEnabled reports whether the ICAP classifier layer is on.
+func (s *AIGuardrailPolicySpec) SemanticEnabled() bool {
+	return s.Semantic != nil && s.Semantic.Enabled
+}
+
+// SemanticThreshold returns the injection-score cutoff (default 0.6).
+func (g *GuardrailSemantic) SemanticThreshold() float64 {
+	if g != nil && g.Threshold != nil {
+		return *g.Threshold
+	}
+	return 0.6
+}
+
+// SemanticFailOpen returns the ICAP failure behaviour (default true = fail-open).
+func (g *GuardrailSemantic) SemanticFailOpen() bool {
+	if g != nil && g.FailOpen != nil {
+		return *g.FailOpen
+	}
+	return true
+}
+
+// SemanticMode returns "block" (default) or "log" (shadow mode), lower-cased for
+// the shim's service_uri query.
+func (g *GuardrailSemantic) SemanticMode() string {
+	if g != nil && strings.EqualFold(g.Action, "Log") {
+		return "log"
+	}
+	return "block"
+}
+
 // ─── Detector resolution (profile + explicit) ────────────────────────────────
 
 // ResolvedDetectors is the concrete detector set after expanding the Profile and
@@ -227,6 +305,14 @@ func (s *AIGuardrailPolicySpec) Validate() error {
 	if s.Profile != "" && !knownProfiles[s.Profile] {
 		return fmt.Errorf("unknown profile %q", s.Profile)
 	}
+	if s.SemanticEnabled() {
+		if s.Semantic.Classifier == nil || s.Semantic.Classifier.BackendRef.Name == "" {
+			return fmt.Errorf("semantic.enabled requires semantic.classifier.backendRef.name")
+		}
+		if a := s.Semantic.Action; a != "" && !strings.EqualFold(a, "Block") && !strings.EqualFold(a, "Log") {
+			return fmt.Errorf("semantic.action must be Block or Log, got %q", a)
+		}
+	}
 	r := s.Resolve()
 	for _, name := range r.Secrets {
 		if _, ok := builtinSecretSignatures[name]; !ok {
@@ -243,8 +329,10 @@ func (s *AIGuardrailPolicySpec) Validate() error {
 			return fmt.Errorf("custom detector requires name and regex")
 		}
 	}
-	if !r.HasAny() {
-		return fmt.Errorf("policy resolves to no detectors (set a profile or detectors)")
+	// A semantic-only policy (ICAP classifier, no signature detectors) is valid;
+	// the classifier is the enforcement in that case.
+	if !r.HasAny() && !s.SemanticEnabled() {
+		return fmt.Errorf("policy resolves to no detectors (set a profile, detectors, or semantic)")
 	}
 	return nil
 }

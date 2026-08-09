@@ -132,9 +132,13 @@ func SetupGuardrailPolicyEventHandlers(
 			p := ps.guardrailPolicyByNsName[pNsName]
 			ps.mu.RUnlock()
 			if p != nil {
-				// Re-enqueue (drops waf_policy_ref off the VS), then delete the AKO-authored WafPolicy.
+				// Re-enqueue (drops waf_policy_ref / ICAP refs off the VS), then
+				// delete the AKO-authored objects for both layers.
 				enqueueTargetRoute(ns, p.Spec.TargetRef.Name, lib.AIGuardrailPolicy, workqueues, numWorkers)
 				DeleteGuardrailWafPolicy("AIGuardrailPolicy/"+ns+"/"+name, p)
+				if p.Spec.SemanticEnabled() {
+					DeleteGuardrailIcap("AIGuardrailPolicy/"+ns+"/"+name, p)
+				}
 			}
 			ps.deleteGuardrailPolicy(ns, name)
 		},
@@ -237,6 +241,42 @@ func unstructuredToGuardrailPolicy(obj *unstructured.Unstructured) (*AIGuardrail
 			a.StatusCode = int(v)
 		}
 		p.Spec.Action = a
+	}
+
+	if sv, found, _ := unstructured.NestedMap(spec, "semantic"); found {
+		sem := &GuardrailSemantic{}
+		if b, _, _ := unstructured.NestedBool(sv, "enabled"); b {
+			sem.Enabled = true
+		}
+		if a, _, _ := unstructured.NestedString(sv, "action"); a != "" {
+			sem.Action = a
+		}
+		// threshold may arrive as float64 or int64 depending on the YAML literal.
+		if t, found, _ := unstructured.NestedFloat64(sv, "threshold"); found {
+			sem.Threshold = &t
+		} else if ti, found, _ := unstructured.NestedInt64(sv, "threshold"); found {
+			tf := float64(ti)
+			sem.Threshold = &tf
+		}
+		if fo, found, _ := unstructured.NestedBool(sv, "failOpen"); found {
+			sem.FailOpen = &fo
+		}
+		if cv, found, _ := unstructured.NestedMap(sv, "classifier"); found {
+			c := &GuardrailClassifier{}
+			if br, found, _ := unstructured.NestedMap(cv, "backendRef"); found {
+				if v, _, _ := unstructured.NestedString(br, "name"); v != "" {
+					c.BackendRef.Name = v
+				}
+				if v, _, _ := unstructured.NestedString(br, "namespace"); v != "" {
+					c.BackendRef.Namespace = v
+				}
+				if v, found, _ := unstructured.NestedInt64(br, "port"); found {
+					c.BackendRef.Port = int32(v)
+				}
+			}
+			sem.Classifier = c
+		}
+		p.Spec.Semantic = sem
 	}
 
 	return p, nil
