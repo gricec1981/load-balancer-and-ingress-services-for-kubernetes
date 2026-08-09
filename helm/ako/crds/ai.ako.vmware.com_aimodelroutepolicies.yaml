@@ -180,6 +180,37 @@ spec:
                     default: 403
                     minimum: 400
                     maximum: 599
+              discovery:
+                description: |-
+                  discovery, when enabled, extends modelTiers with aliases discovered
+                  from running pods: any pod in an allowed namespace carrying the alias
+                  annotation and a tier label naming a declared tier is merged into the
+                  model-to-tier table at translation time. Static modelTiers entries win
+                  over discovered ones; pods claiming an undeclared tier or a duplicate
+                  alias are ignored with a warning. Deleting the pods un-registers the
+                  alias (requests fall back to defaultTier).
+                type: object
+                required:
+                - enabled
+                properties:
+                  enabled:
+                    description: Turns pod-based model alias discovery on.
+                    type: boolean
+                  aliasAnnotation:
+                    description: Pod annotation carrying the model alias to publish.
+                    type: string
+                    default: ai.ako.vmware.com/model-alias
+                  tierLabel:
+                    description: Pod label carrying the tier name; must name a declared tier.
+                    type: string
+                    default: ai.ako.vmware.com/tier
+                  namespaces:
+                    description: |-
+                      Namespaces whose pods may register aliases (the governance gate).
+                      Defaults to the policy's own namespace.
+                    type: array
+                    items:
+                      type: string
           status:
             description: Status reflects the observed state of the policy.
             type: object

@@ -256,5 +256,23 @@ func unstructuredToModelRoutePolicy(obj *unstructured.Unstructured) (*AIModelRou
 		p.Spec.OnUnentitled = a
 	}
 
+	// discovery
+	if d, found, _ := unstructured.NestedMap(spec, "discovery"); found {
+		disc := &ModelDiscovery{}
+		if v, found, _ := unstructured.NestedBool(d, "enabled"); found {
+			disc.Enabled = v
+		}
+		if v, _, _ := unstructured.NestedString(d, "aliasAnnotation"); v != "" {
+			disc.AliasAnnotation = v
+		}
+		if v, _, _ := unstructured.NestedString(d, "tierLabel"); v != "" {
+			disc.TierLabel = v
+		}
+		if nss, _, _ := unstructured.NestedStringSlice(d, "namespaces"); len(nss) > 0 {
+			disc.Namespaces = nss
+		}
+		p.Spec.Discovery = disc
+	}
+
 	return p, nil
 }

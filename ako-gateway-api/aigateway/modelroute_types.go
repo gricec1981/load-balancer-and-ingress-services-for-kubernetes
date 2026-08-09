@@ -65,6 +65,42 @@ type AIModelRoutePolicySpec struct {
 	// entitled to (or an unknown model maps to a disallowed default).
 	// +optional
 	OnUnentitled *UnentitledAction `json:"onUnentitled,omitempty"`
+
+	// Discovery, when enabled, extends ModelTiers with aliases discovered from
+	// running pods: any pod (in an allowed namespace) carrying the alias
+	// annotation and a tier label naming a declared tier is merged into the
+	// model→tier table at translation time. Static ModelTiers entries always win
+	// over discovered ones. Deploying a labeled model server and publishing it
+	// through the gateway thereby become the same action; deleting the pods
+	// un-registers the alias (requests fall back to DefaultTier).
+	// +optional
+	Discovery *ModelDiscovery `json:"discovery,omitempty"`
+}
+
+// ModelDiscovery configures pod-label based model alias discovery. It is
+// deliberately engine-agnostic: any workload that produces pods with the
+// annotation/label pair participates (KServe predictors, plain Deployments,
+// anything) — and with no such pods present it discovers nothing.
+type ModelDiscovery struct {
+	// Enabled turns discovery on. Off (or Discovery absent) leaves behaviour
+	// byte-identical to a static-only policy.
+	Enabled bool `json:"enabled"`
+
+	// AliasAnnotation names the pod annotation carrying the model alias to
+	// publish. Defaults to "ai.ako.vmware.com/model-alias".
+	// +optional
+	AliasAnnotation string `json:"aliasAnnotation,omitempty"`
+
+	// TierLabel names the pod label carrying the tier. Its value must name a
+	// declared tier or the pod is ignored (with a warning). Defaults to
+	// "ai.ako.vmware.com/tier".
+	// +optional
+	TierLabel string `json:"tierLabel,omitempty"`
+
+	// Namespaces scopes discovery: only pods in these namespaces may register
+	// aliases (the governance gate). Defaults to the policy's own namespace.
+	// +optional
+	Namespaces []string `json:"namespaces,omitempty"`
 }
 
 // ModelTier is one routing destination.
@@ -135,6 +171,52 @@ func (s *AIModelRoutePolicySpec) EffectiveModelField() string {
 		return s.ModelField
 	}
 	return "model"
+}
+
+// Default discovery convention keys.
+const (
+	DefaultAliasAnnotation = "ai.ako.vmware.com/model-alias"
+	DefaultTierLabel       = "ai.ako.vmware.com/tier"
+)
+
+// IsEnabled reports whether pod-based model discovery is turned on.
+func (d *ModelDiscovery) IsEnabled() bool {
+	return d != nil && d.Enabled
+}
+
+// EffectiveAliasAnnotation returns the alias annotation key, defaulted.
+func (d *ModelDiscovery) EffectiveAliasAnnotation() string {
+	if d != nil && d.AliasAnnotation != "" {
+		return d.AliasAnnotation
+	}
+	return DefaultAliasAnnotation
+}
+
+// EffectiveTierLabel returns the tier label key, defaulted.
+func (d *ModelDiscovery) EffectiveTierLabel() string {
+	if d != nil && d.TierLabel != "" {
+		return d.TierLabel
+	}
+	return DefaultTierLabel
+}
+
+// EffectiveNamespaces returns the namespaces discovery may read from,
+// defaulting to the policy's own namespace.
+func (d *ModelDiscovery) EffectiveNamespaces(policyNamespace string) []string {
+	if d != nil && len(d.Namespaces) > 0 {
+		return d.Namespaces
+	}
+	return []string{policyNamespace}
+}
+
+// AllowsNamespace reports whether discovery may read pods in ns.
+func (d *ModelDiscovery) AllowsNamespace(policyNamespace, ns string) bool {
+	for _, allowed := range d.EffectiveNamespaces(policyNamespace) {
+		if allowed == ns {
+			return true
+		}
+	}
+	return false
 }
 
 // EffectiveGroupClaim returns the entitlement group claim, defaulting to "group".

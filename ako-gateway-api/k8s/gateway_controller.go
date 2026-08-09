@@ -30,6 +30,7 @@ import (
 	gatewayclientset "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
 	gatewayexternalversions "sigs.k8s.io/gateway-api/pkg/client/informers/externalversions"
 
+	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/aigateway"
 	akogatewayapiinference "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/inference"
 	akogatewayapilib "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/lib"
 	akogatewayapiobjects "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/objects"
@@ -396,9 +397,12 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 					if ic := akogatewayapiinference.SharedInferenceController(); ic != nil {
 						ic.HandlePodEvent(pod)
 					}
+					// Model-alias discovery: a labeled pod appearing may add an
+					// alias to a discovery-enabled AIModelRoutePolicy.
+					aigateway.HandleDiscoveryPodEvent(pod, c.workqueue, numWorkers)
 				}
 			},
-			UpdateFunc: func(_, cur interface{}) {
+			UpdateFunc: func(old, cur interface{}) {
 				if c.DisableSync {
 					return
 				}
@@ -406,6 +410,12 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 					if ic := akogatewayapiinference.SharedInferenceController(); ic != nil {
 						ic.HandlePodEvent(pod)
 					}
+					aigateway.HandleDiscoveryPodEvent(pod, c.workqueue, numWorkers)
+				}
+				// An update that REMOVED the alias annotation must also
+				// re-translate; only the old pod carries the evidence.
+				if oldPod, ok := old.(*corev1.Pod); ok {
+					aigateway.HandleDiscoveryPodEvent(oldPod, c.workqueue, numWorkers)
 				}
 			},
 			DeleteFunc: func(obj interface{}) {
@@ -426,6 +436,8 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 				if ic := akogatewayapiinference.SharedInferenceController(); ic != nil {
 					ic.HandlePodEvent(pod)
 				}
+				// A deleted pod un-registers its alias.
+				aigateway.HandleDiscoveryPodEvent(pod, c.workqueue, numWorkers)
 			},
 		}
 		c.informers.PodInformer.Informer().AddEventHandler(inferencePodHandler)

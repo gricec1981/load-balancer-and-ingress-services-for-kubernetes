@@ -46,6 +46,10 @@ func (o *AviObjectGraph) ApplyModelRoutePolicy(key string, policy *akogatewayapi
 		return
 	}
 
+	// Merge pod-discovered model aliases into the model→tier table (no-op when
+	// spec.discovery is off; the stored policy is never mutated).
+	policy = akogatewayapiaigateway.WithDiscoveredModels(key, policy)
+
 	routeKey := lib.HTTPRoute + "/" + routeModel.GetNamespace() + "/" + routeModel.GetName()
 	parentNs, _, parentName := lib.ExtractTypeNameNamespace(parentNsName)
 	listeners := akogatewayapiobjects.GatewayApiLister().GetRouteToGatewayListener(routeKey, parentNsName)
