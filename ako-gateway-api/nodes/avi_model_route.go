@@ -15,6 +15,11 @@
 package nodes
 
 import (
+	"fmt"
+	"strconv"
+
+	"github.com/vmware/alb-sdk/go/models"
+
 	akogatewayapiaigateway "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/aigateway"
 	akogatewayapilib "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/lib"
 	akogatewayapiobjects "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/objects"
@@ -63,8 +68,8 @@ func (o *AviObjectGraph) ApplyModelRoutePolicy(key string, policy *akogatewayapi
 	tierPG := make(map[string]string, len(policy.Spec.Tiers))
 	var pgRefNames []string
 	for _, tier := range policy.Spec.Tiers {
-		if tier.BackendRef.Kind != lib.InferencePool {
-			utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: only InferencePool backends are supported, skipping", key, policy.Namespace, policy.Name, tier.Name)
+		if tier.BackendRef.Kind != lib.InferencePool && tier.BackendRef.Kind != utils.Service {
+			utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: only InferencePool and Service backends are supported, skipping", key, policy.Namespace, policy.Name, tier.Name)
 			continue
 		}
 		pgName := akogatewayapilib.GetPoolGroupName(parentNs, parentName,
@@ -77,12 +82,20 @@ func (o *AviObjectGraph) ApplyModelRoutePolicy(key string, policy *akogatewayapi
 			HTTPRouteName:      routeModel.GetName(),
 			HTTPRouteNamespace: routeModel.GetNamespace(),
 		}
-		hb := &HTTPBackend{Backend: &Backend{
-			Name:      tier.BackendRef.Name,
-			Namespace: policy.Namespace,
-			Kind:      lib.InferencePool,
-		}}
-		o.buildInferencePoolMembers(key, routeKey, hb, parentNs, parentName, rule, PG, childVsNode, listenerProtocol, parentNsName)
+		if tier.BackendRef.Kind == utils.Service {
+			// A core Service tier: members come from the Service's endpoints, so a
+			// selectorless Service + manual EndpointSlice can front infrastructure
+			// outside the cluster (GPU VMs, bare metal) as a first-class tier.
+			o.buildModelRouteServicePool(key, policy.Namespace, policy.Name, tier.Name, tier.BackendRef.Name,
+				parentNs, parentName, routeModel, childVsNode, listenerProtocol, PG)
+		} else {
+			hb := &HTTPBackend{Backend: &Backend{
+				Name:      tier.BackendRef.Name,
+				Namespace: policy.Namespace,
+				Kind:      lib.InferencePool,
+			}}
+			o.buildInferencePoolMembers(key, routeKey, hb, parentNs, parentName, rule, PG, childVsNode, listenerProtocol, parentNsName)
+		}
 		if len(PG.Members) == 0 {
 			utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: pool group %s has no members yet (pool not reconciled?), skipping tier", key, policy.Namespace, policy.Name, tier.Name, pgName)
 			continue
@@ -121,6 +134,74 @@ func attachModelRoutePoolGroup(childVsNode *nodes.AviEvhVsNode, PG *nodes.AviPoo
 		}
 	}
 	childVsNode.PoolGroupRefs = append(childVsNode.PoolGroupRefs, PG)
+}
+
+// buildModelRouteServicePool builds one Avi pool from a core-Service tier backend
+// and adds it to the tier's Pool Group. Members come from the Service's endpoints
+// (PopulateServers), so a selectorless Service backed by a manual EndpointSlice
+// exposes out-of-cluster serving infrastructure (GPU VMs, bare metal) as a tier.
+func (o *AviObjectGraph) buildModelRouteServicePool(key, policyNs, policyName, tierName, svcName string,
+	parentNs, parentName string, routeModel RouteModel, childVsNode *nodes.AviEvhVsNode,
+	listenerProtocol string, PG *nodes.AviPoolGroupNode) {
+	svcObj, err := utils.GetInformers().ServiceInformer.Lister().Services(policyNs).Get(svcName)
+	if err != nil {
+		utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: service %s/%s not found: %v", key, policyNs, policyName, tierName, policyNs, svcName, err)
+		return
+	}
+	if len(svcObj.Spec.Ports) == 0 {
+		utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: service %s/%s has no ports", key, policyNs, policyName, tierName, policyNs, svcName)
+		return
+	}
+	port := svcObj.Spec.Ports[0].Port
+	poolName := akogatewayapilib.GetPoolName(parentNs, parentName,
+		routeModel.GetNamespace(), routeModel.GetName(),
+		"aimr-"+policyName+"-"+tierName,
+		policyNs, svcName, strconv.Itoa(int(port)))
+	poolNode := &nodes.AviPoolNode{
+		Name:       poolName,
+		Tenant:     childVsNode.Tenant,
+		Protocol:   listenerProtocol,
+		PortName:   akogatewayapilib.FindPortName(svcName, policyNs, port, key),
+		TargetPort: akogatewayapilib.FindTargetPort(svcName, policyNs, port, key),
+		Port:       port,
+		ServiceMetadata: lib.ServiceMetadataObj{
+			NamespaceServiceName: []string{policyNs + "/" + svcName},
+		},
+		VrfContext: lib.GetVrf(),
+	}
+	poolNode.AviMarkers = utils.AviObjectMarkers{
+		GatewayName:        parentName,
+		GatewayNamespace:   parentNs,
+		HTTPRouteName:      routeModel.GetName(),
+		HTTPRouteNamespace: routeModel.GetNamespace(),
+		BackendNs:          policyNs,
+		BackendName:        svcName,
+	}
+	poolNode.NetworkPlacementSettings = lib.GetNodeNetworkMap()
+	serviceType := lib.GetServiceType()
+	if serviceType == lib.NodePortLocal {
+		if servers := nodes.PopulateServersForNPL(poolNode, policyNs, svcName, false, key); servers != nil {
+			poolNode.Servers = servers
+		}
+	} else if serviceType == lib.NodePort {
+		if servers := nodes.PopulateServersForNodePort(poolNode, policyNs, svcName, false, key); servers != nil {
+			poolNode.Servers = servers
+		}
+	} else {
+		if servers := nodes.PopulateServers(poolNode, policyNs, svcName, false, key); servers != nil {
+			poolNode.Servers = servers
+		}
+	}
+	if len(poolNode.Servers) == 0 {
+		utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: service %s/%s has no endpoints", key, policyNs, policyName, tierName, policyNs, svcName)
+		return
+	}
+	if childVsNode.CheckPoolNChecksum(poolNode.Name, poolNode.GetCheckSum()) {
+		childVsNode.ReplaceEvhPoolInEVHNode(poolNode, key)
+	}
+	poolRef := fmt.Sprintf("/api/pool?name=%s", poolNode.Name)
+	ratio := uint32(1)
+	PG.Members = append(PG.Members, &models.PoolGroupMember{PoolRef: &poolRef, Ratio: &ratio})
 }
 
 // attachModelRouteDS adds (or replaces by name) a model-route DataScript on the
