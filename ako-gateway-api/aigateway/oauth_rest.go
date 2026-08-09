@@ -139,7 +139,7 @@ func EnsureIssuerPool(key string, policy *AIGatewayAuthPolicy) (poolName, firstI
 	}
 
 	poolName = issuerPoolName(policy)
-	tenant := lib.GetTenant()
+	tenant := lib.GetTenantInNamespace(policy.Namespace)
 	client := avicache.SharedAVIClients(tenant).AviClient[0]
 
 	servers := make([]*avimodels.Server, 0, len(ips))
@@ -201,7 +201,7 @@ func EnsureIssuerPool(key string, policy *AIGatewayAuthPolicy) (poolName, firstI
 // the token's `iss` claim.
 func EnsureOAuthAuthProfile(key string, policy *AIGatewayAuthPolicy, poolName, firstIP string, port int32) (string, error) {
 	name := oauthAuthProfileName(policy)
-	tenant := lib.GetTenant()
+	tenant := lib.GetTenantInNamespace(policy.Namespace)
 	client := avicache.SharedAVIClients(tenant).AviClient[0]
 
 	ep := fmt.Sprintf("http://%s:%d", firstIP, port)
@@ -248,7 +248,7 @@ func EnsureOAuthAuthProfile(key string, policy *AIGatewayAuthPolicy, poolName, f
 // the VS. Returns the policy name for use in SsoPolicyRef.
 func EnsureOAuthSSOPolicy(key string, policy *AIGatewayAuthPolicy) (string, error) {
 	name := oauthSSOPolicyName(policy)
-	tenant := lib.GetTenant()
+	tenant := lib.GetTenantInNamespace(policy.Namespace)
 	client := avicache.SharedAVIClients(tenant).AviClient[0]
 
 	sso := avimodels.SSOPolicy{
@@ -303,7 +303,7 @@ func EnsureOAuthSSOPolicy(key string, policy *AIGatewayAuthPolicy) (string, erro
 
 // DeleteOAuthObjects removes the AKO-managed OAuth object graph for the policy.
 func DeleteOAuthObjects(key string, policy *AIGatewayAuthPolicy) {
-	tenant := lib.GetTenant()
+	tenant := lib.GetTenantInNamespace(policy.Namespace)
 	client := avicache.SharedAVIClients(tenant).AviClient[0]
 	delByName := func(api, name string) {
 		var check struct {

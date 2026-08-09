@@ -94,7 +94,7 @@ func EnsureGuardrailWafPolicy(key string, policy *AIGuardrailPolicy) (string, er
 		return "", fmt.Errorf("invalid AIGuardrailPolicy %s/%s: %w", policy.Namespace, policy.Name, err)
 	}
 	name := guardrailWafPolicyName(policy)
-	tenant := lib.GetTenant()
+	tenant := lib.GetTenantInNamespace(policy.Namespace)
 	client := avicache.SharedAVIClients(tenant).AviClient[0]
 
 	profileRef, crsRef := resolveWafBaseRefs(client)
@@ -139,7 +139,7 @@ func EnsureGuardrailWafPolicy(key string, policy *AIGuardrailPolicy) (string, er
 // the delete is safe.
 func DeleteGuardrailWafPolicy(key string, policy *AIGuardrailPolicy) {
 	name := guardrailWafPolicyName(policy)
-	tenant := lib.GetTenant()
+	tenant := lib.GetTenantInNamespace(policy.Namespace)
 	client := avicache.SharedAVIClients(tenant).AviClient[0]
 	var check struct {
 		Count   int `json:"count"`

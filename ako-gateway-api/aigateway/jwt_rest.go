@@ -102,7 +102,7 @@ func EnsureJWTServerProfile(key string, policy *AIGatewayAuthPolicy) (string, er
 		return "", err
 	}
 	name := jwtServerProfileName(policy)
-	tenant := lib.GetTenant()
+	tenant := lib.GetTenantInNamespace(policy.Namespace)
 	client := avicache.SharedAVIClients(tenant).AviClient[0]
 
 	profile := avimodels.JWTServerProfile{
@@ -142,7 +142,7 @@ func EnsureJWTServerProfile(key string, policy *AIGatewayAuthPolicy) (string, er
 // JWTServerProfile.
 func EnsureJWTAuthProfile(key string, policy *AIGatewayAuthPolicy, serverProfileName string) (string, error) {
 	name := jwtAuthProfileName(policy)
-	tenant := lib.GetTenant()
+	tenant := lib.GetTenantInNamespace(policy.Namespace)
 	client := avicache.SharedAVIClients(tenant).AviClient[0]
 
 	profile := avimodels.AuthProfile{
@@ -182,7 +182,7 @@ func EnsureJWTAuthProfile(key string, policy *AIGatewayAuthPolicy, serverProfile
 // endpoint (GET /v1/admin/...) reachable without a token.
 func EnsureJWTSSOPolicy(key string, policy *AIGatewayAuthPolicy, authProfileName string) (string, error) {
 	name := jwtSSOPolicyName(policy)
-	tenant := lib.GetTenant()
+	tenant := lib.GetTenantInNamespace(policy.Namespace)
 	client := avicache.SharedAVIClients(tenant).AviClient[0]
 
 	sso := avimodels.SSOPolicy{
@@ -233,7 +233,7 @@ func EnsureJWTSSOPolicy(key string, policy *AIGatewayAuthPolicy, authProfileName
 
 // DeleteJWTObjects removes the AKO-managed JWT object graph for the policy.
 func DeleteJWTObjects(key string, policy *AIGatewayAuthPolicy) {
-	tenant := lib.GetTenant()
+	tenant := lib.GetTenantInNamespace(policy.Namespace)
 	client := avicache.SharedAVIClients(tenant).AviClient[0]
 	delByName := func(api, name string) {
 		var check struct {

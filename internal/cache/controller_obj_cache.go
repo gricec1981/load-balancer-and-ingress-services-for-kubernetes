@@ -2516,9 +2516,17 @@ func (c *AviObjCache) AviObjVSCachePopulate(client *clients.AviClient, cloud str
 							dsName, foundDs := c.DSCache.AviCacheGetNameByUuid(dsUuid)
 							if foundDs {
 								dsKey := NamespaceName{Namespace: tenant, Name: dsName.(string)}
-								// Fetch the associated PGs with the DS.
-								dsObj, _ := c.DSCache.AviCacheGet(dsKey)
-								for _, pgName := range dsObj.(*AviDSCache).PoolGroups {
+								// Fetch the associated PGs with the DS. The name→uuid map can be
+								// populated while the per-tenant entry is not (e.g. a VS moved
+								// across tenants still referencing the old tenant's DataScript):
+								// guard the lookup instead of panicking on the type assertion.
+								dsObj, foundDsObj := c.DSCache.AviCacheGet(dsKey)
+								dsCacheObj, okDs := dsObj.(*AviDSCache)
+								if !foundDsObj || !okDs {
+									utils.AviLog.Warnf("Datascript %s (uuid %s) referenced by VS in tenant %s has no cache entry, skipping", dsName, dsUuid, tenant)
+									continue
+								}
+								for _, pgName := range dsCacheObj.PoolGroups {
 									// For each PG, formulate the key and then populate the pg collection cache
 									pgKey := NamespaceName{Namespace: tenant, Name: pgName}
 									poolgroupKeys = append(poolgroupKeys, pgKey)
