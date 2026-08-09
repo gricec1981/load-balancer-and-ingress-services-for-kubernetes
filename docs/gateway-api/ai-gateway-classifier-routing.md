@@ -9,14 +9,65 @@
 
 # AKO AI Gateway — Classifier-Based Routing (intent/complexity → tier)
 
-> **Status: Design draft (stretch). The classifier + ICAP shim it builds on are
-> built and live on openshift06 (prompt-injection scoring, verified 2026-08-09);
-> the routing head and the `AIModelRoutePolicy` input below are NOT built.** This
-> design routes a request to a different model **tier** based on what the prompt
-> *is* — its **intent/complexity class** (e.g. `code`, `general`, `simple`) —
-> scored by the **same ICAP classifier** the [semantic guardrail](ai-gateway-guardrails-semantic.md)
-> already calls. The motivating example: **send code prompts to a Claude tier and
-> everyday prompts to a Gemini tier**, or simple prompts to the fast local model.
+> **Status: the SE-native ICAP-header mechanism below (§2–§4) is BLOCKED on Avi
+> 31.2.1 — SPIKE-DISPROVEN 2026-08-09. Implemented instead as UI-orchestrated
+> classification (§0), which is BUILT + live on openshift06.** This design routes a
+> request to a different model based on what the prompt *is* — its **intent class**
+> (`code` vs everything else) — scored by the on-cluster classifier. The motivating
+> example: **send code prompts to Claude, everyday prompts to a local model, with
+> Gemini selectable.**
+
+---
+
+## 0. What was built — UI-orchestrated classification (the ordering finding)
+
+> **Make-or-break, run live on Avi 31.2.1 (2026-08-09): the ICAP-injects-a-header,
+> DataScript-reads-it mechanism (§2) does NOT work on this build — the routing
+> DataScript runs BEFORE the ICAP check.** Spike: the shim was modified to inject
+> `X-AI-Class` on allow (REQMOD 200-with-modified-req-hdr), and a debug DataScript
+> on the child VS read the header. Result: the DataScript saw `X-AI-Class=(none)`
+> **and the ICAP shim was never called** — because a body-phase (`HTTP_REQ_DATA`)
+> DataScript short-circuits *before* the pipeline reaches the ICAP security stage.
+> Observed order: `DataScripts (HTTP_REQ → HTTP_REQ_DATA, routing) → ICAP check →
+> pool → backend`. ICAP is a good late-stage **gate** (block/allow — which is why
+> guardrails still work), but it cannot feed an **earlier** routing decision. The
+> DataScript sandbox also can't embed or call the classifier itself. Streaming does
+> not help: it changes body *delivery*, not stage *order*, and request-body
+> buffering (which routing depends on) is the opposite of streaming.
+>
+> **Implemented pivot (BUILT + verified live):** compute the class at the gateway
+> **edge** — the AI-Gateway UI backend — *before* the request reaches the SE, and
+> express it via the `model` field the existing model-route DataScript already
+> routes on. No new pool selector, no ICAP dependency, all SE enforcement (auth,
+> guardrails, budgets) unchanged.
+>
+> ```
+> prompt → UI /api/chat classifies (HTTP → prompt-injection-icap /classify → nomic-embed)
+>        → code?  model="claude"  :  model="qwen-fast"
+>        → governed front door (?jwt=)   → auth ✓ guardrails/ICAP ✓ budgets ✓
+>        → model-route DataScript reads "model" → tier/pool
+> ```
+>
+> - **Classifier head:** an embedding code-vs-general intent scorer added to the
+>   shim (reuses the running `nomic-embed`; `POST /classify {text}` → `{label,
+>   score}`). Validated live: code prompts 0.88–0.99, general 0.00–0.29.
+> - **Routing:** the UI's `model="auto"` path (`chat.go`) calls `/classify`, sets
+>   `model` to `AUTO_CODE_MODEL` (default `claude`) or `AUTO_DEFAULT_MODEL`
+>   (default `qwen-fast`); classifier-down fails safe to local. The reply shows the
+>   route chip `✦ code (0.99) → claude`.
+> - **Verified 2026-08-09:** "write a python function…" → code(0.99) → `claude`;
+>   "recipe for banana bread" → other(0.00) → `qwen-fast`; both 200 through the
+>   front door. (`claude` falls through to the default local tier until the real
+>   provider backend — LiteLLM egress + keys — is wired; that is a backend swap, no
+>   UI/classifier change.)
+>
+> **Trade-off vs the SE-native ideal:** the routing *decision* is computed at the
+> edge (the UI, which is gateway infrastructure — not the end user's client) rather
+> than inside the SE. The classifier is still on-cluster/private and all policy is
+> still SE-enforced. A fully SE-native version needs a build whose content
+> inspection runs *before* pool selection — re-test the §2 spike on a 32.1.1
+> upgrade. The rest of this document (§2–§4) is retained as the SE-native design
+> for that future path.
 
 ---
 
