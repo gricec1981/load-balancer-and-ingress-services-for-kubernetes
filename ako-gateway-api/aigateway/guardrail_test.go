@@ -272,18 +272,21 @@ func TestPrivateKeyRequiresEndMarker(t *testing.T) {
 	// full BEGIN...body...END block does.
 	blob := rulesString(GenerateGuardrailRules(
 		ResolvedDetectors{Secrets: []string{"private-key"}}, true, false, true, 403))
-	// String-content assertion: Go's stdlib regexp (RE2) can't compile the PCRE
-	// negative lookahead the shipped pattern uses, so assert on the generated SecRule.
 	if !strings.Contains(blob, `-----END [A-Z ]+PRIVATE KEY-----`) {
 		t.Errorf("private-key rule must require an END marker:\n%s", blob)
 	}
-	if !strings.Contains(blob, `(?:(?!-----END).)`) {
-		t.Errorf("private-key rule should use the bounded negative-lookahead guard:\n%s", blob)
+	// The window must be a counted CLASS repeat, not a counted group-with-lookahead:
+	// PCRE expands `(?:(?!-----END).){0,4096}` per iteration and the compiled pattern
+	// exceeds the Avi Controller's WAF regex size limit ("regular expression is too
+	// large", verified on 31.2.1). `[\s\S]{0,4096}?` compiles to a single opcode and
+	// the lazy quantifier stops at the first END marker — equivalent detection.
+	if !strings.Contains(blob, `[\s\S]{0,4096}?`) {
+		t.Errorf("private-key rule should use the lazy bounded class-repeat window:\n%s", blob)
 	}
 
-	// Behavioural check via an RE2-equivalent stand-in: Go can't run the PCRE lookahead
-	// form, so translate the bounded "not-END" repetition into a non-greedy dot-all
-	// match — identical accept/reject semantics for these two inputs.
+	// Behavioural check via an RE2 stand-in: the shipped pattern's `{0,4096}` exceeds
+	// RE2's repeat-count limit (1000), so substitute an unbounded lazy window —
+	// identical accept/reject semantics for these two inputs.
 	re := regexp.MustCompile(`-----BEGIN [A-Z ]+PRIVATE KEY-----(?s:.*?)-----END [A-Z ]+PRIVATE KEY-----`)
 	if re.MatchString("-----BEGIN RSA PRIVATE KEY-----") {
 		t.Error("a bare BEGIN header with no END marker should NOT match")

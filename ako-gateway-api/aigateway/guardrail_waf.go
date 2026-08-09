@@ -51,12 +51,15 @@ var builtinSecretSignatures = map[string]string{
 	// Require a matching END marker within a bounded window so a bare header (a
 	// partial paste, or pure meta-discussion of PEM formats — "what does a private
 	// key header look like") does NOT match; only a real BEGIN...body...END block
-	// does. The `(?:(?!-----END).){0,4096}` guard is a standard PCRE negative
-	// lookahead in a bounded repetition (Avi's WAF engine is PCRE-compatible, so
-	// this is fine); it's less obviously readable than the other flat signatures,
-	// hence this note. Go's stdlib regexp (RE2) can't compile lookaheads, so the
-	// unit test asserts on the generated SecRule text / an RE2-equivalent stand-in.
-	"private-key": `-----BEGIN [A-Z ]+PRIVATE KEY-----(?:(?!-----END).){0,4096}-----END [A-Z ]+PRIVATE KEY-----`,
+	// does. The window is a LAZY bounded repetition of a character class
+	// (`[\s\S]{0,4096}?`), NOT a tempered `(?:(?!-----END).){0,4096}` group:
+	// PCRE compiles a counted repetition of a group-with-lookahead by expanding
+	// the group per iteration, and at {0,4096} the compiled pattern exceeds the
+	// Avi Controller's WAF regex size limit — the wafpolicy POST fails with
+	// "regular expression is too large" (verified on 31.2.1). A counted class
+	// repeat compiles to a single opcode, and the lazy quantifier stops at the
+	// first END marker, so detection behaviour is equivalent.
+	"private-key": `-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]{0,4096}?-----END [A-Z ]+PRIVATE KEY-----`,
 	"jwt":         `eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+`,
 }
 
