@@ -562,7 +562,8 @@ groups, since torn down. Results:
 | 2.x | `AIModelRoutePolicy` — model→tier routing via request-body DataScript + `avi.poolgroup.select` | ✅ Done — verified end-to-end on a live cluster |
 | 2.x | Group-based tier entitlement (reuse verified `group` claim) | ✅ Done |
 | 2.x | Per-tier token budgets (`groupHeader: "reqvar:ai_tier"`, enforced in `HTTP_REQ_DATA`) | ✅ Done |
-| 2.x | Service (non-InferencePool) tier backends | Planned |
+| 2.x | Service (non-InferencePool) tier backends | ✅ Done |
+| 2.x | External-provider tiers (`tier.provider`) — route to an OpenAI-compatible API (Gemini) over SE egress; AKO authors an FQDN pool (backend TLS/SNI) + the DataScript rewrites path/Host and injects the key from a Secret; token metering skipped (chunked responses). **Verified live on Avi 31.2.1 — real Gemini answers through the governed front door, injection still 403.** | ✅ Done |
 | 3 | Budget-aware downgrade (over-budget premium → economy instead of 429) | Idea |
 | 3 | LoRA-adapter-aware routing (route to pods with a matching adapter) | Idea |
 | 3 | Weighted canary within a tier (split a model name across two versions) | Idea |
