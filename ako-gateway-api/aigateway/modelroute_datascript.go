@@ -64,7 +64,7 @@ type ModelRouteScripts struct {
 // Every Pool Group named here must also be listed in the DataScriptSet's
 // pool_group_refs, or Avi rejects the script (HTTP 400) — see the model-routing
 // design doc.
-func GenerateModelRouteScripts(policy *AIModelRoutePolicy, tierPG map[string]string, mode AuthClaimMode) ModelRouteScripts {
+func GenerateModelRouteScripts(policy *AIModelRoutePolicy, tierPG map[string]string, providers map[string]*ProviderRuntime, mode AuthClaimMode) ModelRouteScripts {
 	spec := policy.Spec
 
 	reqScript := fmt.Sprintf(
@@ -80,6 +80,7 @@ func GenerateModelRouteScripts(policy *AIModelRoutePolicy, tierPG map[string]str
 	b.WriteString(luaPrefixes("PREFIXES", spec.prefixEntries()))
 	fmt.Fprintf(&b, "local DEFAULT_TIER = %s\n", luaStr(spec.DefaultTier))
 	b.WriteString(luaStringMap("TIER_PG", tierPG))
+	b.WriteString(luaProviders("PROVIDERS", providers))
 	b.WriteString(luaList("PREF", spec.tierNames()))
 
 	entitled := spec.Entitlements != nil && len(spec.Entitlements.Rules) > 0
@@ -142,8 +143,26 @@ end
 	// ── Route to the tier's Pool Group + record tier for token policy ────────
 	b.WriteString(`
 local pg = TIER_PG[tier]
-if pg then avi.poolgroup.select(pg) end
-pcall(function() avi.http.set_reqvar("ai_tier", tier) end)`)
+if pg then avi.poolgroup.select(pg) end`)
+
+	// ── External-provider tier: rewrite path + Host and inject the API key ───
+	// (spike-verified on Avi 31.2.1: set_path/replace_header/add_header reach the
+	// provider over the FQDN pool's backend TLS). ai_skip_meter tells the token
+	// policy's response script to skip body metering — a provider response is
+	// chunked, which the response-body metering can't parse anyway.
+	if len(providers) > 0 {
+		b.WriteString(`
+local _pv = PROVIDERS[tier]
+if _pv then
+  avi.http.set_path(_pv.p)
+  pcall(function() avi.http.set_query("") end)
+  avi.http.replace_header("Host", _pv.h)
+  if _pv.ah ~= "" then avi.http.remove_header(_pv.ah) avi.http.add_header(_pv.ah, _pv.av) end
+  pcall(function() avi.http.set_reqvar("ai_skip_meter", "1") end)
+end`)
+	}
+
+	b.WriteString("\npcall(function() avi.http.set_reqvar(\"ai_tier\", tier) end)")
 
 	return ModelRouteScripts{ReqScript: reqScript, ReqDataScript: b.String()}
 }
@@ -215,6 +234,25 @@ func luaPrefixes(name string, entries []prefixEntry) string {
 	var parts []string
 	for _, e := range entries {
 		parts = append(parts, fmt.Sprintf("{k=%s, v=%s}", luaStr(e.Prefix), luaStr(e.Tier)))
+	}
+	return fmt.Sprintf("local %s = { %s }\n", name, strings.Join(parts, ", "))
+}
+
+// luaProviders renders the per-tier provider rewrite table:
+//   local <name> = { ["gemini"]={p="/path", h="host", ah="Authorization", av="Bearer k"} }
+// The API key is baked into the SE-side Lua (tenant-scoped Avi config), the same
+// way group budgets and model→tier maps are baked in.
+func luaProviders(name string, providers map[string]*ProviderRuntime) string {
+	tiers := make([]string, 0, len(providers))
+	for t := range providers {
+		tiers = append(tiers, t)
+	}
+	sort.Strings(tiers)
+	var parts []string
+	for _, t := range tiers {
+		p := providers[t]
+		parts = append(parts, fmt.Sprintf("[%s]={p=%s, h=%s, ah=%s, av=%s}",
+			luaStr(t), luaStr(p.Path), luaStr(p.Host), luaStr(p.AuthHeader), luaStr(p.AuthValue)))
 	}
 	return fmt.Sprintf("local %s = { %s }\n", name, strings.Join(parts, ", "))
 }

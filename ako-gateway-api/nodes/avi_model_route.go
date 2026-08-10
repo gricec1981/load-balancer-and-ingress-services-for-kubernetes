@@ -66,8 +66,24 @@ func (o *AviObjectGraph) ApplyModelRoutePolicy(key string, policy *akogatewayapi
 
 	// Build one Pool Group per tier and collect tier→PG-name for the DataScript.
 	tierPG := make(map[string]string, len(policy.Spec.Tiers))
+	providers := make(map[string]*akogatewayapiaigateway.ProviderRuntime)
 	var pgRefNames []string
 	for _, tier := range policy.Spec.Tiers {
+		// External-provider tier (e.g. Gemini): AKO authors an FQDN pool + pool
+		// group over REST (backend TLS/SNI); the DataScript rewrites path/Host and
+		// injects the key. No node-graph pool — the DataScript selects the REST PG
+		// by name (declared in pool_group_refs).
+		if tier.IsProvider() {
+			rt, err := akogatewayapiaigateway.EnsureProviderTier(key, policy, tier)
+			if err != nil {
+				utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: provider setup failed: %v", key, policy.Namespace, policy.Name, tier.Name, err)
+				continue
+			}
+			tierPG[tier.Name] = rt.PGName
+			pgRefNames = append(pgRefNames, rt.PGName)
+			providers[tier.Name] = rt
+			continue
+		}
 		if tier.BackendRef.Kind != lib.InferencePool && tier.BackendRef.Kind != utils.Service {
 			utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: only InferencePool and Service backends are supported, skipping", key, policy.Namespace, policy.Name, tier.Name)
 			continue
@@ -109,7 +125,7 @@ func (o *AviObjectGraph) ApplyModelRoutePolicy(key string, policy *akogatewayapi
 		return
 	}
 
-	scripts := akogatewayapiaigateway.GenerateModelRouteScripts(policy, tierPG, mode)
+	scripts := akogatewayapiaigateway.GenerateModelRouteScripts(policy, tierPG, providers, mode)
 	vsName := childVsNode.Name
 	// HTTP_REQ: enable request-body buffering (no pool refs needed).
 	attachModelRouteDS(childVsNode, akogatewayapiaigateway.DSModelRouteReqName(vsName),

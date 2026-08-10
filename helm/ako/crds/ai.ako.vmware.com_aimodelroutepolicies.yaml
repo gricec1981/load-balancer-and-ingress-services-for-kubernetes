@@ -84,7 +84,6 @@ spec:
                   type: object
                   required:
                   - name
-                  - backendRef
                   properties:
                     name:
                       description: |-
@@ -95,11 +94,8 @@ spec:
                       description: |-
                         backendRef is the backend that serves this tier. Typically an
                         InferencePool (group gateway.inference.x-k8s.io); a core Service
-                        is also supported.
+                        is also supported. Omit when provider is set.
                       type: object
-                      required:
-                      - kind
-                      - name
                       properties:
                         group:
                           type: string
@@ -111,6 +107,55 @@ spec:
                           - Service
                         name:
                           type: string
+                    provider:
+                      description: |-
+                        provider routes this tier to an external OpenAI-compatible API
+                        (e.g. Gemini) over the Service Engine's egress. AKO authors an FQDN
+                        pool with backend TLS/SNI and the model-route DataScript rewrites
+                        the path + Host and injects the API key (from a Secret) before
+                        forwarding. Mutually exclusive with backendRef.
+                      type: object
+                      required:
+                      - host
+                      - path
+                      properties:
+                        host:
+                          description: Provider FQDN, e.g. generativelanguage.googleapis.com. The SE resolves it by DNS.
+                          type: string
+                        port:
+                          type: integer
+                          default: 443
+                        tls:
+                          description: Backend TLS + SNI to host. Default true.
+                          type: boolean
+                          default: true
+                        path:
+                          description: Provider chat-completions path the request is rewritten to (e.g. /v1beta/openai/chat/completions).
+                          type: string
+                        auth:
+                          description: Injects the provider API key (from a Secret) as a request header.
+                          type: object
+                          required:
+                          - secretRef
+                          properties:
+                            secretRef:
+                              type: object
+                              required:
+                              - name
+                              properties:
+                                name:
+                                  type: string
+                                key:
+                                  description: Secret data key. Defaults to the Secret's single key.
+                                  type: string
+                            header:
+                              description: Header to set. Default Authorization.
+                              type: string
+                              default: Authorization
+                            scheme:
+                              description: Value prefix. Default "Bearer". Set "" for a raw key.
+                              type: string
+                              default: Bearer
               modelTiers:
                 description: |-
                   modelTiers maps a requested model name to a tier name. Keys may be an

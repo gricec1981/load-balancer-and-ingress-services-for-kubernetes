@@ -110,8 +110,87 @@ type ModelTier struct {
 	Name string `json:"name"`
 
 	// BackendRef is the backend that serves this tier (an InferencePool to keep
-	// per-pod metric weighting, or a core Service).
-	BackendRef ModelBackendRef `json:"backendRef"`
+	// per-pod metric weighting, or a core Service). Omitted when Provider is set.
+	// +optional
+	BackendRef ModelBackendRef `json:"backendRef,omitempty"`
+
+	// Provider routes this tier to an external OpenAI-compatible provider (e.g.
+	// Gemini) over the Service Engine's egress. AKO authors an FQDN pool with
+	// backend TLS/SNI, and the model-route DataScript rewrites the path + Host and
+	// injects the provider's API key (read from a Secret) before forwarding. The
+	// SE never proxies for it — it forwards the OpenAI-shaped request unchanged.
+	// +optional
+	Provider *ModelProvider `json:"provider,omitempty"`
+}
+
+// ModelProvider describes an external OpenAI-compatible provider endpoint.
+type ModelProvider struct {
+	// Host is the provider's FQDN (e.g. generativelanguage.googleapis.com). AKO
+	// builds an FQDN pool whose server the SE resolves by DNS and reaches over TLS.
+	Host string `json:"host"`
+	// Port defaults to 443.
+	// +optional
+	Port int32 `json:"port,omitempty"`
+	// TLS enables backend TLS + SNI to Host. Defaults to true.
+	// +optional
+	TLS *bool `json:"tls,omitempty"`
+	// Path is the provider's chat-completions path the request is rewritten to
+	// (e.g. /v1beta/openai/chat/completions for Gemini).
+	Path string `json:"path"`
+	// Auth injects the provider API key as a request header.
+	// +optional
+	Auth *ProviderAuth `json:"auth,omitempty"`
+}
+
+// ProviderAuth injects a provider credential (from a Secret) as a request header.
+type ProviderAuth struct {
+	// SecretRef names the Secret (in the policy namespace) holding the API key.
+	SecretRef ProviderSecretRef `json:"secretRef"`
+	// Header is the header to set. Defaults to "Authorization".
+	// +optional
+	Header string `json:"header,omitempty"`
+	// Scheme prefixes the key value. Defaults to "Bearer". Set "" for a raw key
+	// (e.g. an "x-goog-api-key"-style header).
+	// +optional
+	Scheme *string `json:"scheme,omitempty"`
+}
+
+// ProviderSecretRef references a key inside a Secret.
+type ProviderSecretRef struct {
+	Name string `json:"name"`
+	// Key is the Secret data key. Defaults to the Secret's single key if omitted.
+	// +optional
+	Key string `json:"key,omitempty"`
+}
+
+// IsProvider reports whether this tier routes to an external provider.
+func (t *ModelTier) IsProvider() bool { return t.Provider != nil }
+
+// EffectivePort returns the provider port (default 443).
+func (p *ModelProvider) EffectivePort() int32 {
+	if p.Port > 0 {
+		return p.Port
+	}
+	return 443
+}
+
+// EffectiveTLS reports whether backend TLS is on (default true).
+func (p *ModelProvider) EffectiveTLS() bool { return p.TLS == nil || *p.TLS }
+
+// EffectiveHeader returns the auth header name (default Authorization).
+func (a *ProviderAuth) EffectiveHeader() string {
+	if a != nil && a.Header != "" {
+		return a.Header
+	}
+	return "Authorization"
+}
+
+// EffectiveScheme returns the auth scheme prefix (default "Bearer").
+func (a *ProviderAuth) EffectiveScheme() string {
+	if a != nil && a.Scheme != nil {
+		return *a.Scheme
+	}
+	return "Bearer"
 }
 
 // ModelBackendRef references the backend that serves a tier.
@@ -347,6 +426,16 @@ func (s *AIModelRoutePolicySpec) Validate() error {
 		}
 		if known[t.Name] {
 			return fmt.Errorf("duplicate tier name %q", t.Name)
+		}
+		if t.IsProvider() {
+			if t.Provider.Host == "" || t.Provider.Path == "" {
+				return fmt.Errorf("tier %q: provider requires host and path", t.Name)
+			}
+			if t.Provider.Auth != nil && t.Provider.Auth.SecretRef.Name == "" {
+				return fmt.Errorf("tier %q: provider.auth requires secretRef.name", t.Name)
+			}
+		} else if t.BackendRef.Name == "" {
+			return fmt.Errorf("tier %q: backendRef.name or provider is required", t.Name)
 		}
 		known[t.Name] = true
 	}

@@ -136,6 +136,8 @@ func SetupModelRoutePolicyEventHandlers(
 			if p != nil {
 				// Re-enqueue before deleting so the translator sees the last targetRef.
 				enqueueTargetRoute(ns, p.Spec.TargetRef.Name, lib.AIModelRoutePolicy, workqueues, numWorkers)
+				// Tear down any AKO-authored external-provider pools/pool groups.
+				DeleteProviderTiers("AIModelRoutePolicy/"+ns+"/"+name, p)
 			}
 			ps.deleteModelRoutePolicy(ns, name)
 		},
@@ -204,6 +206,38 @@ func unstructuredToModelRoutePolicy(obj *unstructured.Unstructured) (*AIModelRou
 			}
 			if v, _, _ := unstructured.NestedString(tm, "backendRef", "name"); v != "" {
 				tier.BackendRef.Name = v
+			}
+			if pv, found, _ := unstructured.NestedMap(tm, "provider"); found {
+				prov := &ModelProvider{}
+				if v, _, _ := unstructured.NestedString(pv, "host"); v != "" {
+					prov.Host = v
+				}
+				if v, _, _ := unstructured.NestedString(pv, "path"); v != "" {
+					prov.Path = v
+				}
+				if v, found, _ := unstructured.NestedInt64(pv, "port"); found {
+					prov.Port = int32(v)
+				}
+				if v, found, _ := unstructured.NestedBool(pv, "tls"); found {
+					prov.TLS = &v
+				}
+				if av, found, _ := unstructured.NestedMap(pv, "auth"); found {
+					auth := &ProviderAuth{}
+					if v, _, _ := unstructured.NestedString(av, "header"); v != "" {
+						auth.Header = v
+					}
+					if v, found, _ := unstructured.NestedString(av, "scheme"); found {
+						auth.Scheme = &v
+					}
+					if v, _, _ := unstructured.NestedString(av, "secretRef", "name"); v != "" {
+						auth.SecretRef.Name = v
+					}
+					if v, _, _ := unstructured.NestedString(av, "secretRef", "key"); v != "" {
+						auth.SecretRef.Key = v
+					}
+					prov.Auth = auth
+				}
+				tier.Provider = prov
 			}
 			p.Spec.Tiers = append(p.Spec.Tiers, tier)
 		}

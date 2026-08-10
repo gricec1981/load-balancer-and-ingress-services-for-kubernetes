@@ -156,6 +156,15 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 		}
 	}
 
+	// ── Skip metering for external-provider tiers ────────────────────────
+	// A provider tier (e.g. Gemini) is routed by AIModelRoutePolicy, which sets
+	// the ai_skip_meter reqvar. Its response is chunked (like streaming), which
+	// the body-based usage parser can't read anyway, so skip the response phases
+	// entirely rather than error on it.
+	skipGuard := `if avi.http.get_reqvar("ai_skip_meter") == "1" then return end`
+	respParts = append(respParts, skipGuard)
+	respDataParts = append(respDataParts, skipGuard)
+
 	// ── Response-header phase: enable body buffering ──────────────────────
 	// The body is not available in HTTP_RESP; this only turns on buffering (for
 	// POST responses with a JSON content-type) so HTTP_RESP_DATA can read it.

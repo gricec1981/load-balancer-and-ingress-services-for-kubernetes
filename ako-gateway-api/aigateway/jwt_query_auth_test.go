@@ -73,7 +73,7 @@ func TestJwtClaimHelperQueryMode(t *testing.T) {
 // The three claim-consuming generators must honour the mode and emit the
 // query-decoding helper (not the OAuth one) when asked.
 func TestGeneratorsThreadJWTQueryMode(t *testing.T) {
-	model := GenerateModelRouteScripts(&AIModelRoutePolicy{Spec: sampleSpec()}, tierPGForTest(), ClaimModeJWTQuery).ReqDataScript
+	model := GenerateModelRouteScripts(&AIModelRoutePolicy{Spec: sampleSpec()}, tierPGForTest(), nil, ClaimModeJWTQuery).ReqDataScript
 	if !strings.Contains(model, "_b64url_decode") || strings.Contains(model, "oauth_get_claim") {
 		t.Errorf("model-route script did not switch to query-decode helper:\n%s", model)
 	}

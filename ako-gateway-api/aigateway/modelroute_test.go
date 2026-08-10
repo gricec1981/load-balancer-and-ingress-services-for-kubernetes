@@ -150,7 +150,7 @@ func tierPGForTest() map[string]string {
 
 func TestGenerateModelRouteScriptsReq(t *testing.T) {
 	p := &AIModelRoutePolicy{Spec: sampleSpec()}
-	scripts := GenerateModelRouteScripts(p, tierPGForTest(), ClaimModeOAuth)
+	scripts := GenerateModelRouteScripts(p, tierPGForTest(), nil, ClaimModeOAuth)
 
 	if !strings.Contains(scripts.ReqScript, "set_request_body_buffer_size(32768)") {
 		t.Errorf("ReqScript should enable 32KB buffering, got:\n%s", scripts.ReqScript)
@@ -159,7 +159,7 @@ func TestGenerateModelRouteScriptsReq(t *testing.T) {
 
 func TestGenerateModelRouteScriptsReqData(t *testing.T) {
 	p := &AIModelRoutePolicy{Spec: sampleSpec()}
-	s := GenerateModelRouteScripts(p, tierPGForTest(), ClaimModeOAuth).ReqDataScript
+	s := GenerateModelRouteScripts(p, tierPGForTest(), nil, ClaimModeOAuth).ReqDataScript
 
 	mustContain := []string{
 		"avi.http.get_req_body(32768)",           // verified read API
@@ -192,7 +192,7 @@ func TestGenerateModelRouteScriptsNoEntitlement(t *testing.T) {
 	spec := sampleSpec()
 	spec.Entitlements = nil
 	p := &AIModelRoutePolicy{Spec: spec}
-	s := GenerateModelRouteScripts(p, tierPGForTest(), ClaimModeOAuth).ReqDataScript
+	s := GenerateModelRouteScripts(p, tierPGForTest(), nil, ClaimModeOAuth).ReqDataScript
 
 	for _, absent := range []string{"ENTITLE", "jwt_claim", "tier_not_entitled"} {
 		if strings.Contains(s, absent) {
@@ -209,7 +209,7 @@ func TestGenerateRejectMode(t *testing.T) {
 	spec := sampleSpec()
 	spec.OnUnentitled = &UnentitledAction{Type: "Reject", StatusCode: 451}
 	p := &AIModelRoutePolicy{Spec: spec}
-	s := GenerateModelRouteScripts(p, tierPGForTest(), ClaimModeOAuth).ReqDataScript
+	s := GenerateModelRouteScripts(p, tierPGForTest(), nil, ClaimModeOAuth).ReqDataScript
 
 	if !strings.Contains(s, "avi.http.response(451") {
 		t.Errorf("Reject mode should use configured status 451\n%s", s)
