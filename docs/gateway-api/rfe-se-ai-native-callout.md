@@ -57,6 +57,16 @@ These are not hypotheticals; each was run live and torn down on the demo control
 - **WAF semantic ceiling.** Custom prompt-injection SecRules block *known* phrases
   ("ignore all previous instructions" → 403) but a novel paraphrase → 200. Signatures cannot
   close the semantic gap; that is what drove us to the ICAP classifier in the first place.
+- **Classifier-based routing blocked by pipeline stage order (31.2.1, spike-disproven
+  2026-08-09).** We extended the ICAP classifier with an intent head (code vs. general) to
+  route prompts to different model tiers. The mechanism — ICAP REQMOD injects `X-AI-Class`,
+  the routing DataScript reads it — **cannot work**: the observed pipeline order is
+  `DataScripts (routing) → ICAP → pool`, so the classifier verdict arrives **after** the
+  routing decision it was meant to inform, and a body-phase DataScript short-circuits before
+  the ICAP stage fires at all. ICAP is structurally a late-stage *gate*; it can never be a
+  routing *input*. We shipped the workaround — classification at the gateway edge, upstream
+  of the SE ([ai-gateway-classifier-routing.md](ai-gateway-classifier-routing.md) §0) — which
+  works but moves an AI decision off the data plane the thesis says should own it.
 
 Every one of these compromises disappears with a single primitive: a **streaming-aware,
 bidirectional, transformative AI callout.**
@@ -89,6 +99,13 @@ A native SE feature (working name **AI Inspection Callout** / SE ExtProc) with t
 8. **CRD / Gateway-API attachable.** Configurable as a referenceable object the way WAF and
    ICAP profiles are, so AKO can author and attach it (and author it *correctly* — no silent
    two-object trigger).
+9. **Placeable before routing, with the verdict visible to routing.** The callout must be
+   invokable at a request stage that runs **before pool/pool-group selection**, and its
+   verdict (class label, score, arbitrary key/values) must be readable by the routing
+   decision (DataScript reqvar / policy match criteria). Without this, every property above
+   still leaves intent/complexity-based model routing impossible on the SE — the exact wall
+   the 2026-08-09 spike hit (§2). This is a *placement* requirement, orthogonal to transport
+   and streaming: verdict-feeds-routing is what turns the callout from a gate into a signal.
 
 A complementary/alternative form: **native AI-guardrail and LLM-inspection objects** (an
 `llmprofile` / guardrail object that runs a classifier natively) — but the callout above is more
@@ -106,6 +123,7 @@ general and unblocks more, so it is the primary ask.
 | **Output guardrails / system-prompt-leak detection** | Response-side inspection. |
 | **Redaction / masking** (vs. block-only) | Transformative `modify` on request and response. |
 | Semantic caching response synthesis | Foundation for serving/capturing responses at the callout. |
+| **Classifier/intent-based model routing** (blocked by stage order; today edge-orchestrated) | Pre-routing callout stage (§3.9) exposes the class verdict to tier selection — the routing decision returns to the data plane. |
 | ICAP misconfiguration footgun, bespoke shim, legacy protocol | Replaced by a single, correctly-attachable, `ext_proc`-style object. |
 
 One feature, the whole response-side AI surface — the exact surface where the no-proxy thesis
@@ -136,6 +154,7 @@ metering — each carrying the limits in §1. This RFE is the path from "works, 
 ## 6. Related
 
 - [Semantic Guardrails (ICAP)](ai-gateway-guardrails-semantic.md) — the workaround this replaces, and its spike evidence
+- [Classifier-Based Routing](ai-gateway-classifier-routing.md) — the stage-order disproof (§0) and the edge-orchestration workaround this returns to the SE
 - [Guardrails & DLP (WAF)](ai-gateway-guardrails.md) — the signature layer and its semantic ceiling
 - [Streaming token limit](ai-token-streaming-limit.md) — the metering wall this subsumes
 - [AI Gateway](ai-gateway.md) — the policy family that rides on these primitives

@@ -49,6 +49,7 @@ The following capabilities are built and callable in the gateway today.
 | [Model Routing](#model-routing) | Model-aware routing to quality/cost tiers, with entitlements |
 | [Guardrails & DLP](#guardrails--dlp) | WAF-native data-loss prevention and content guardrails |
 | [MCP](#mcp-agenttool) | The same governance for agent↔tool (Model Context Protocol) traffic |
+| [Semantic Guardrails](#semantic-guardrails) | Model-based prompt-injection detection over ICAP, escalating past what WAF signatures catch |
 
 The agent loop has three governance surfaces; the gateway covers the first two today:
 
@@ -191,6 +192,23 @@ the MCP Gateway is callable today.
 
 ---
 
+## Semantic Guardrails
+
+The model-based half of `AIGuardrailPolicy`: a **prompt-injection classifier** the SE calls over
+**ICAP** to catch the novel/paraphrased injection the signature layer provably misses. It
+preserves the no-proxy model — the SE buffers the request body and *calls* the classifier as a
+service (as it already calls the OIDC issuer), then the SE enforces the block; the model is
+never a proxy in the request path. **Built and verified end-to-end** on live Avi 31.2.1
+(openshift06): an embedding-prototype classifier, a pure-stdlib ICAP shim, and AKO authoring of
+the `icapprofile` + security-policy rule from `AIGuardrailPolicy.semantic`. FP-hardened to v2 and
+re-verified live (openshift06, 2026-08-14) — the classifier's benign-anchor set now covers
+imperative-but-benign prompts (counting, output-format constraints, agent/tool traffic) that had
+been false-positiving, plus a gray-zone LLM-judge cascade for uncertain scores.
+
+→ [Semantic Guardrails (prompt-injection over ICAP)](ai-gateway-guardrails-semantic.md)
+
+---
+
 # Planned
 
 The following are specified but not yet built. They are included here so the full
@@ -198,22 +216,11 @@ The following are specified but not yet built. They are included here so the ful
 
 | Capability | What it provides |
 |---|---|
-| [Semantic Guardrails](#semantic-guardrails) | Model-based prompt-injection detection over ICAP |
 | [A2A](#a2a-agentagent) | Governance for agent↔agent (Agent2Agent) delegation traffic |
 | [Backend mTLS](#backend-mtls-spiffespire) | SE↔backend mutual TLS with SPIFFE/SPIRE short-lived identity · *spike-gated* |
 | [Multi-Site Delivery](#multi-site-cross-cluster-delivery) | Cross-cluster model routing via AMKO + Avi GSLB · *spike-gated* |
 
 ---
-
-## Semantic Guardrails
-
-The model-based half of `AIGuardrailPolicy`: a **prompt-injection classifier** the SE calls over
-**ICAP** to catch the novel/paraphrased injection the signature layer provably misses. It
-preserves the no-proxy model — the SE buffers the request body and *calls* the classifier as a
-service (as it already calls the OIDC issuer), then the SE enforces the block; the model is
-never a proxy in the request path. **In design**; nothing built yet.
-
-→ [Semantic Guardrails (prompt-injection over ICAP)](ai-gateway-guardrails-semantic.md)
 
 ## A2A (agent↔agent)
 

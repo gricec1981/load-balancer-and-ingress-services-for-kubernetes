@@ -376,7 +376,8 @@ Where we stay credible and escalate to a model:
   an external **guardrail service** (ICAP content-adaptation, or an ext-authz-style hook),
   keeping the SE as the enforcement point and the model a callable service (same shape as the
   OIDC issuer the SE already calls). Or a future **native SE AI-guardrail** (RFE — check 32.1.1+).
-  **Designed in detail:** [ai-gateway-guardrails-semantic.md](ai-gateway-guardrails-semantic.md)
+  **Built and verified end-to-end** (openshift06, 31.2.1), FP-hardened to v2 2026-08-14:
+  [ai-gateway-guardrails-semantic.md](ai-gateway-guardrails-semantic.md)
   (classifier over ICAP REQMOD; `AIGuardrailPolicy.semantic` knob).
 - **Free-text PII** (names, addresses) — not fixed-format → needs NER, not regex.
 - **Redaction / masking** — the WAF **blocks**; inline body masking is harder (WAF data-masking
@@ -486,7 +487,7 @@ Mirrors how `AIModelRoutePolicy` was wired (`c05fc5bc` → `a2e7b995` → `40477
 | 3 | OWASP CRS with surface-aware auto-exclusions | Design; Spike-3 |
 | 3 | Prompt-injection signature rules | Design; Spike-4 (started) |
 | 3.x | Response-body DLP (non-streaming) | Design; Spike-5 |
-| 4 | Semantic guardrails via callable model service (ICAP / ext-authz) | **Designed** — [ai-gateway-guardrails-semantic.md](ai-gateway-guardrails-semantic.md) |
+| 4 | Semantic guardrails via callable model service (ICAP / ext-authz) | **Built + verified (31.2.1)**, FP-hardened v2 (2026-08-14) — [ai-gateway-guardrails-semantic.md](ai-gateway-guardrails-semantic.md) |
 | 4 | Redaction/masking (vs block) | Idea |
 | 4 | Native SE AI-guardrails (if a future build ships them) | Idea / RFE |
 
