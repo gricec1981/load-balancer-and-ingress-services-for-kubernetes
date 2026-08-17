@@ -115,6 +115,7 @@ end`, ReqBodyBufferBytes)
 		reqData.WriteString(luaNestedBoolMap("ALLOW", agentExact))
 		reqData.WriteString(luaListMap("ALLOW_PFX", agentPrefix))
 		fmt.Fprintf(&reqData, "  local AGENT_CLAIM = %s\n", luaStr(spec.AgentAccess.EffectiveAgentClaim()))
+		fmt.Fprintf(&reqData, "  local SKILL_CLAIM = %s\n", luaStr(spec.AgentAccess.EffectiveSkillClaim()))
 		reqData.WriteString(jwtClaimHelper(mode))
 	}
 
@@ -146,17 +147,24 @@ end`, ReqBodyBufferBytes)
 		reqData.WriteString(`
   if method ~= "" then
     local _agent = jwt_claim(AGENT_CLAIM)
+    -- The skill the caller says it is invoking, from its per-target token. A
+    -- legacy token carries no skill, leaving this empty; the empty string is
+    -- never tested, so method-only policies behave exactly as before.
+    local _skill = jwt_claim(SKILL_CLAIM)
     local _ok2 = false
     if AGENT_STAR[_agent] then
       _ok2 = true
     else
       local _ex = ALLOW[_agent]
       if _ex and _ex[method] then _ok2 = true end
+      if not _ok2 and _skill ~= "" and _ex and _ex[_skill] then _ok2 = true end
       if not _ok2 then
         local _pf = ALLOW_PFX[_agent]
         if _pf then
           for i = 1, #_pf do
-            if string.sub(method, 1, string.len(_pf[i])) == _pf[i] then _ok2 = true break end
+            local _p = _pf[i]
+            if string.sub(method, 1, string.len(_p)) == _p then _ok2 = true break end
+            if _skill ~= "" and string.sub(_skill, 1, string.len(_p)) == _p then _ok2 = true break end
           end
         end
       end

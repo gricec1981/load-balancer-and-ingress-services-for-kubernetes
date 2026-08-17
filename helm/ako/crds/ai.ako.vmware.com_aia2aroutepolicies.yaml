@@ -118,6 +118,17 @@ spec:
                       to separate human-user and agent tokens from the same IdP.
                     type: string
                     default: sub
+                  skillClaim:
+                    description: |-
+                      skillClaim names the verified JWT claim carrying the agent-card skill
+                      the caller is invoking. Defaults to "skill", which is what the issuer's
+                      token-exchange endpoint mints. Allow-list entries are matched against
+                      this claim as well as against the JSON-RPC method, so a policy can
+                      restrict a caller to specific skills rather than whole methods. A
+                      legacy token carries no skill, in which case only the method is
+                      matched and existing policies behave unchanged.
+                    type: string
+                    default: skill
                   rules:
                     description: |-
                       rules lists, per calling-agent identity, the A2A JSON-RPC methods
@@ -134,9 +145,11 @@ spec:
                           type: string
                         allow:
                           description: |-
-                            A2A JSON-RPC methods this agent may invoke (e.g. "tasks/send",
-                            "tasks/sendSubscribe"). A single "*" allows all methods; a trailing
-                            "*" is a prefix glob (e.g. "tasks/*").
+                            A2A JSON-RPC methods (e.g. "tasks/send", "tasks/sendSubscribe")
+                            and/or agent-card skills (e.g. "log.collection") this agent may
+                            invoke. An entry matches if it equals either the request's method
+                            or the caller's skill claim. A single "*" allows everything; a
+                            trailing "*" is a prefix glob (e.g. "tasks/*", "log.*").
                           type: array
                           items:
                             type: string

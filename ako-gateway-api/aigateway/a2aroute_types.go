@@ -110,19 +110,34 @@ type A2AAgentAccess struct {
 	// separate human-user and agent tokens issued by the same IdP.
 	AgentClaim string `json:"agentClaim,omitempty"`
 
-	// Rules lists, per calling-agent identity, the A2A JSON-RPC methods that
-	// agent may invoke.
+	// SkillClaim names the verified JWT claim carrying the agent-card skill the
+	// caller is invoking. Defaults to "skill", which is what the issuer's
+	// token-exchange endpoint mints. An allow-list entry is matched against this
+	// claim as well as against the JSON-RPC method, so a policy can restrict a
+	// caller to specific skills rather than to whole methods.
+	//
+	// The claim is only meaningful when the caller obtained a per-target token
+	// (token exchange). A legacy token carries no skill, in which case the claim
+	// is empty and only the method is matched — existing method-based rules keep
+	// working unchanged.
+	SkillClaim string `json:"skillClaim,omitempty"`
+
+	// Rules lists, per calling-agent identity, the A2A JSON-RPC methods and/or
+	// agent-card skills that agent may invoke.
 	Rules []AgentAccessRule `json:"rules,omitempty"`
 }
 
-// AgentAccessRule permits a named calling agent to invoke a set of A2A methods.
+// AgentAccessRule permits a named calling agent to invoke a set of A2A methods
+// or skills.
 type AgentAccessRule struct {
 	// Agent is the agentClaim value this rule applies to (exact match).
 	Agent string `json:"agent"`
 
 	// Allow lists the A2A JSON-RPC methods (e.g. "tasks/send",
-	// "tasks/sendSubscribe") this agent may invoke. A single "*" allows all
-	// methods; a trailing "*" is a prefix glob (e.g. "tasks/*").
+	// "tasks/sendSubscribe") and/or agent-card skills (e.g. "log.collection")
+	// this agent may invoke. An entry matches if it equals either the request's
+	// method or the caller's skill claim. A single "*" allows everything; a
+	// trailing "*" is a prefix glob (e.g. "tasks/*", "log.*").
 	Allow []string `json:"allow"`
 }
 
@@ -151,31 +166,56 @@ func (a *A2AAgentAccess) EffectiveAgentClaim() string {
 	return "sub"
 }
 
+// EffectiveSkillClaim returns the JWT claim carrying the invoked skill,
+// defaulting to "skill" — the claim name the issuer's token-exchange endpoint
+// mints.
+func (a *A2AAgentAccess) EffectiveSkillClaim() string {
+	if a != nil && a.SkillClaim != "" {
+		return a.SkillClaim
+	}
+	return "skill"
+}
+
 // ─── Method authorization (pure Go, mirrors the generated Lua) ───────────────
 
 // IsMethodAllowed reports whether agent may invoke method. An empty method
 // is never allowed. When no agentAccess rules are configured every method
 // is allowed (authorization by OAuth alone).
 func (s *AIA2ARoutePolicySpec) IsMethodAllowed(agent, method string) bool {
+	return s.IsCallAllowed(agent, method, "")
+}
+
+// IsCallAllowed reports whether agent may invoke method while presenting skill.
+// An allow-list entry matches either dimension, so a policy can be written in
+// terms of methods, skills, or both. An empty skill is never tested, which is
+// what keeps a legacy token (no skill claim) behaving exactly as before.
+//
+// Mirrors the Lua emitted by buildA2AScripts; keep the two in step.
+func (s *AIA2ARoutePolicySpec) IsCallAllowed(agent, method, skill string) bool {
 	if s.AgentAccess == nil || len(s.AgentAccess.Rules) == 0 {
 		return true
 	}
 	if method == "" {
 		return false
 	}
+	matches := func(entry, candidate string) bool {
+		if candidate == "" {
+			return false
+		}
+		if strings.HasSuffix(entry, "*") {
+			return strings.HasPrefix(candidate, strings.TrimSuffix(entry, "*"))
+		}
+		return entry == candidate
+	}
 	for _, r := range s.AgentAccess.Rules {
 		if r.Agent != agent {
 			continue
 		}
 		for _, a := range r.Allow {
-			switch {
-			case a == "*":
+			if a == "*" {
 				return true
-			case strings.HasSuffix(a, "*"):
-				if strings.HasPrefix(method, strings.TrimSuffix(a, "*")) {
-					return true
-				}
-			case a == method:
+			}
+			if matches(a, method) || matches(a, skill) {
 				return true
 			}
 		}
