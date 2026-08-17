@@ -69,8 +69,16 @@ func DequeueIngestion(key string, fullsync bool) {
 		return
 	}
 	utils.AviLog.Infof("key: %s, msg: processing gateways %v", key, gatewayNsNameList)
+	// handleGateway rebuilds the parent VS, which used to drop every EVH child from the
+	// shared model until the route loop below put them back. Two things now keep the REST
+	// layer from ever seeing that gap: handleGateway carries the existing children onto the
+	// new parent (carryOverEvhChildren), and it defers its publish to this function, so a
+	// model only reaches the REST layer once its route rebuild has finished. Both are needed
+	// — the REST layer reads the shared lister directly, so suppressing the publish alone
+	// would still expose a childless model to any key already queued for it.
+	gatewayModelChanged := false
 	if objType == lib.Gateway {
-		handleGateway(namespace, name, fullsync, key)
+		gatewayModelChanged = handleGateway(namespace, name, fullsync, key, true)
 	}
 
 	if objType == utils.Service {
@@ -103,13 +111,19 @@ func DequeueIngestion(key string, fullsync bool) {
 			tenant = lib.GetTenant()
 		}
 		modelName := lib.GetModelName(tenant, akogatewayapilib.GetGatewayParentName(parentNs, parentName))
+		// Carries the publish that handleGateway deferred to this loop. It belongs to the
+		// model handled here: GatewayGetGw returns exactly the one gateway for a Gateway key,
+		// and modelName is derived from the same tenant lister that handleGateway consulted,
+		// after it ran. For every other objType this stays false until the Secret branch
+		// below sets it.
+		parentModelChanged := gatewayModelChanged
 
 		modelFound, modelIntf := objects.SharedAviGraphLister().Get(modelName)
 		// Seq: GW first and the secret created.
 		modelNil := !modelFound || modelIntf == nil
 		if objType == utils.Secret {
 			if modelNil {
-				handleGateway(parentNs, parentName, fullsync, key)
+				parentModelChanged = handleGateway(parentNs, parentName, fullsync, key, true)
 				modelFound, modelIntf = objects.SharedAviGraphLister().Get(modelName)
 				modelNil = !modelFound || modelIntf == nil
 				if modelNil {
@@ -173,8 +187,11 @@ func DequeueIngestion(key string, fullsync bool) {
 		}
 
 		// Only add this node to the list of models if the checksum has changed.
+		// parentModelChanged covers a Gateway-only change that the route loop leaves
+		// untouched (no routes attached, or none whose child VS differs), whose publish
+		// handleGateway deferred to here.
 		modelChanged := saveAviModel(modelName, model.AviObjectGraph, key)
-		if modelChanged && !fullsync {
+		if (modelChanged || parentModelChanged) && !fullsync {
 			sharedQueue := utils.SharedWorkQueue().GetQueueByName(utils.GraphLayer)
 			nodes.PublishKeyToRestLayer(modelName, key, sharedQueue)
 		}
@@ -243,7 +260,15 @@ func handleSecrets(gatewayNamespace string, gatewayName string, key string, obje
 	}
 	return false
 }
-func handleGateway(namespace, name string, fullsync bool, key string) {
+// handleGateway (re)builds the parent VS model for a Gateway and returns whether the saved
+// model changed.
+//
+// Set deferPublish when the caller will republish the model itself once its routes have been
+// rebuilt onto it; the model saved here is only half-reconciled until then. A deferring
+// caller must honour the returned value, because a Gateway-only change leaves the caller's
+// own saveAviModel with nothing to report. The early returns below publish regardless: they
+// store a nil model, which has no children to lose and which the caller skips over.
+func handleGateway(namespace, name string, fullsync bool, key string, deferPublish bool) bool {
 	utils.AviLog.Debugf("key: %s, msg: processing gateway: %s", key, name)
 
 	tenant := objects.SharedNamespaceTenantLister().GetTenantInNamespace(namespace + "/" + name)
@@ -262,7 +287,7 @@ func handleGateway(namespace, name string, fullsync bool, key string) {
 	if err != nil {
 		if !k8serrors.IsNotFound(err) {
 			utils.AviLog.Infof("key: %s, msg: got error while getting gateway class: %v", key, err)
-			return
+			return false
 		}
 		utils.AviLog.Debugf("key: %s, msg: gateway not found: %s/%s", key, namespace, name)
 		if !modelFound {
@@ -281,7 +306,7 @@ func handleGateway(namespace, name string, fullsync bool, key string) {
 				nodes.PublishKeyToRestLayer(modelName, key, sharedQueue)
 			}
 		}
-		return
+		return false
 	}
 	gwClass := string(gatewayObj.Spec.GatewayClassName)
 	utils.AviLog.Debugf("key: %s, msg: fetching gateway class %s for gateway: %s/%s", key, gwClass, namespace, name)
@@ -294,16 +319,17 @@ func handleGateway(namespace, name string, fullsync bool, key string) {
 			sharedQueue := utils.SharedWorkQueue().GetQueueByName(utils.GraphLayer)
 			nodes.PublishKeyToRestLayer(modelName, key, sharedQueue)
 		}
-		return
+		return false
 	}
 	utils.AviLog.Debugf("key: %s, msg: fetching gateway class found: %s", key, gwClass)
 	if !isAkoCtrl {
 		//AKO is not the controller, do not build model
 		utils.AviLog.Infof("key: %s, msg: Controller is not AKO for %s, not building VS model", key, modelName)
-		return
+		return false
 	}
 	aviModelGraph := NewAviObjectGraph()
 	aviModelGraph.BuildGatewayVs(gatewayObj, key)
+	carryOverEvhChildren(modelName, aviModelGraph, key)
 
 	// Reload the tenant to handle the change in tenant annotation in a Namespace
 	tenant = objects.SharedNamespaceTenantLister().GetTenantInNamespace(namespace + "/" + name)
@@ -312,10 +338,46 @@ func handleGateway(namespace, name string, fullsync bool, key string) {
 	}
 	modelName = lib.GetModelName(tenant, akogatewayapilib.GetGatewayParentName(namespace, name))
 	modelChanged := saveAviModel(modelName, aviModelGraph.AviObjectGraph, key)
-	if modelChanged && !fullsync {
+	if modelChanged && !fullsync && !deferPublish {
 		sharedQueue := utils.SharedWorkQueue().GetQueueByName(utils.GraphLayer)
 		nodes.PublishKeyToRestLayer(modelName, key, sharedQueue)
 	}
+	return modelChanged
+}
+
+// carryOverEvhChildren moves the EVH children of the stored model onto a freshly built
+// parent before it replaces that model.
+//
+// BuildGatewayVs only builds the parent, so without this the model spends the whole route
+// rebuild in DequeueIngestion holding no children at all. That state is not private: the
+// REST layer reads models straight out of the shared lister, so any key already queued for
+// this model would observe it, find every cached child missing from the graph, and delete
+// the child virtual services off the Controller — they come back on the next publish, but
+// the route status and the data path churn in between. Carrying the children over keeps the
+// Gateway path consistent with every other object type, none of which empty the model.
+//
+// The route loop reconciles these nodes immediately afterwards — updating them, adding new
+// ones and pruning through DeleteStaleChildVSes/ProcessRouteDeletion — so carrying them over
+// cannot strand a child whose route is gone. A tenant change is the one case that must not
+// carry over, and it is handled for free: BuildGatewayParent nils out the old tenant's model
+// first, so the lookup below finds nothing.
+func carryOverEvhChildren(modelName string, newGraph *AviObjectGraph, key string) {
+	found, prevModelIntf := objects.SharedAviGraphLister().Get(modelName)
+	if !found || prevModelIntf == nil {
+		return
+	}
+	prevModel, ok := prevModelIntf.(*nodes.AviObjectGraph)
+	if !ok {
+		return
+	}
+	prevParents := prevModel.GetAviEvhVS()
+	newParents := newGraph.GetAviEvhVS()
+	if len(prevParents) == 0 || len(newParents) == 0 || len(prevParents[0].EvhNodes) == 0 {
+		return
+	}
+	newParents[0].EvhNodes = prevParents[0].EvhNodes
+	utils.AviLog.Infof("key: %s, msg: carried over %d EVH children onto the rebuilt parent of model %s",
+		key, len(newParents[0].EvhNodes), modelName)
 }
 
 func saveAviModel(modelName string, aviGraph *nodes.AviObjectGraph, key string) bool {

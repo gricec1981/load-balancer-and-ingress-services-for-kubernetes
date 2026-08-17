@@ -198,21 +198,26 @@ func (o *httproute) updateHTTPRouteStatusWithVSUUID(key string, httpRoute *gatew
 			(httpRouteStatus.Parents[i].ParentRef.Namespace == nil || string(*httpRouteStatus.Parents[i].ParentRef.Namespace) == gatewayNamespace) {
 			parentStatus := &httpRouteStatus.Parents[i]
 
-			// Add VSUUID only if the HTTPRoute is Accepted for this Gateway
+			// Record the VS UUID against the parent's Accepted condition.
 			for _, condition := range parentStatus.Conditions {
-				if condition.Type == string(gatewayv1.RouteConditionAccepted) && condition.Status == metav1.ConditionTrue {
-					message, err := o.buildJSONMessage(parentStatus.Conditions, ruleName, virtualServiceUUID, false)
-					if err != nil {
-						return err
-					}
-					newCondition := NewCondition().
-						Type(string(gatewayv1.RouteConditionAccepted)).
-						Status(metav1.ConditionTrue).
-						Reason(string(gatewayv1.RouteReasonAccepted)).
-						ObservedGeneration(httpRoute.ObjectMeta.Generation).
-						Message(message)
-					newCondition.SetIn(&parentStatus.Conditions)
+				if condition.Type != string(gatewayv1.RouteConditionAccepted) {
+					continue
 				}
+				if !acceptedConditionTakesVSUUID(condition) {
+					break
+				}
+				message, err := o.buildJSONMessage(parentStatus.Conditions, ruleName, virtualServiceUUID, false)
+				if err != nil {
+					return err
+				}
+				newCondition := NewCondition().
+					Type(string(gatewayv1.RouteConditionAccepted)).
+					Status(metav1.ConditionTrue).
+					Reason(string(gatewayv1.RouteReasonAccepted)).
+					ObservedGeneration(httpRoute.ObjectMeta.Generation).
+					Message(message)
+				newCondition.SetIn(&parentStatus.Conditions)
+				break
 			}
 		}
 	}
@@ -281,6 +286,22 @@ func (o *httproute) removeVSUUIDFromHTTPRouteStatus(key string, httpRoute *gatew
 	akogatewayapiobjects.GatewayApiLister().UpdateRouteToRouteStatusMapping(lib.HTTPRoute+"/"+options.ServiceMetadata.HTTPRoute, httpRouteStatus)
 	// Patch the HTTPRoute status
 	return o.Patch(key, httpRoute, &status.Status{HTTPRouteStatus: httpRouteStatus})
+}
+
+// acceptedConditionTakesVSUUID reports whether an existing Accepted condition should be
+// rewritten when the REST layer reports a VS UUID it has programmed for this parent.
+//
+// A VS UUID means the rule is live on the Gateway, so the route is Accepted by that parent
+// and an already-True condition is simply refreshed with the new UUID. A Pending condition
+// is repaired rather than skipped: removeVSUUIDFromHTTPRouteStatus flips Accepted to
+// False/Pending when it drops the last rule, so requiring True here would latch a route at
+// Pending forever whenever its child VS is deleted and recreated — which the REST layer does
+// routinely when a parent VS model is rebuilt. Every other False reason is a real rejection
+// from the route validator (no matching listener, not allowed by listeners, ...) and must
+// survive until the validator itself clears it.
+func acceptedConditionTakesVSUUID(condition metav1.Condition) bool {
+	return condition.Status == metav1.ConditionTrue ||
+		condition.Reason == string(gatewayv1.RouteReasonPending)
 }
 
 // buildJSONMessage builds or updates a JSON message for HTTPRoute conditions
