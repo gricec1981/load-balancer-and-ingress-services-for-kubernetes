@@ -124,10 +124,15 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 
 	// ── Read-only counters endpoint (dashboard UI) ────────────────────────
 	// Prepended *before* enforcement so it intercepts GET /v1/admin/counters and
-	// returns the live per-user token usage as JSON, then returns. Only emitted
-	// when an admin token is configured (AdminTokenSecretAnnotation); the SE table
+	// returns the live per-user token usage as JSON, then returns. The SE table
 	// cannot be enumerated, so the caller passes the users it wants in ?users=.
-	if policy.AdminToken != "" && len(spec.Limits) > 0 {
+	//
+	// Emitted when EITHER credential is configured. Gating on the admin token
+	// alone made the shared secret the feature's on-switch as well as its lock:
+	// dropping the Secret to get the plaintext out of the generated DataScript
+	// deleted the endpoint instead of retiring the credential, which is the one
+	// end state this whole mechanism exists to reach.
+	if (policy.AdminToken != "" || policy.AdminClaimName != "") && len(spec.Limits) > 0 {
 		reqParts = append(reqParts, buildCountersEndpointBlock(spec.Limits[0], policy.CounterEpoch,
 			policy.AdminToken, policy.AdminClaimName, policy.AdminClaimValue))
 	}
@@ -406,6 +411,17 @@ func buildCountersEndpointBlock(limit TokenLimit, epoch, adminToken, claimName, 
 	if epoch != "" {
 		prefix = epoch + ":" + limit.Name
 	}
+	// The shared-secret gate is emitted ONLY when a secret is configured. Passing
+	// an empty adminToken through would generate `get_header(...) == ""`, which any
+	// caller sending an empty X-Admin-Token header satisfies — turning the gate off
+	// rather than removing it. Omitting the branch is what lets the secret actually
+	// be retired: drop the admin-token Secret annotation, keep the claim, and no
+	// credential is baked into the generated config at all.
+	tokenGate := ""
+	if adminToken != "" {
+		tokenGate = fmt.Sprintf(`
+    if avi.http.get_header("X-Admin-Token", avi.HTTP_REQUEST) == %q then _authed = true end`, adminToken)
+	}
 	// pcall: jwt_claim reads the SE-validated token, which is absent on an
 	// unauthenticated request. A raw error here would abort the whole HTTP_REQ
 	// script, so failure must degrade to "claim did not match".
@@ -420,8 +436,7 @@ func buildCountersEndpointBlock(limit TokenLimit, epoch, adminToken, claimName, 
 	return fmt.Sprintf(`-- AKO AI Gateway: read-only token-counters endpoint (dashboard UI)
 do
   if avi.http.get_path() == "/v1/admin/counters" then
-    local _authed = false
-    if avi.http.get_header("X-Admin-Token", avi.HTTP_REQUEST) == %q then _authed = true end%s
+    local _authed = false%s%s
     if not _authed then
       avi.http.response(403, {["Content-Type"]="application/json"}, '{"error":"forbidden"}')
       return
@@ -455,7 +470,7 @@ do
       '{"window":'..wb..',"limit":%q,"counters":['..table.concat(parts, ",")..']}')
     return
   end
-end`, adminToken, claimGate, windowSec, windowSec, prefix, limit.Name)
+end`, tokenGate, claimGate, windowSec, windowSec, prefix, limit.Name)
 }
 
 // counterKeyIdentityExpr returns the Lua expression that evaluates to the key

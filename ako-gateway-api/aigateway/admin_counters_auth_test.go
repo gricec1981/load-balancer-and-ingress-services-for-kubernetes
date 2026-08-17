@@ -112,6 +112,44 @@ func TestCountersGateAcceptsHeaderOrClaim(t *testing.T) {
 	}
 }
 
+// The end state of the migration: no admin-token Secret at all, claim only. The
+// endpoint must still be generated, and no credential may appear in the config.
+func TestClaimOnlyKeepsEndpointAndBakesNoSecret(t *testing.T) {
+	p := countersPolicy()
+	p.AdminToken = "" // Secret annotation removed
+	p.AdminClaimName, p.AdminClaimValue = "scope", "counters:read"
+	req := GenerateTokenAccountingScripts(p, ClaimModeJWTQuery).ReqScript
+
+	if !strings.Contains(req, "/v1/admin/counters") {
+		t.Fatal("endpoint disappeared when the admin token was removed — " +
+			"the secret is still acting as the feature's on-switch")
+	}
+	if strings.Contains(req, "X-Admin-Token") {
+		t.Error("header gate emitted with no secret configured")
+	}
+	// The specific hazard: `get_header(...) == ""` authenticates any caller that
+	// sends an empty header, which is worse than the secret it replaces.
+	if strings.Contains(req, `avi.http.get_header("X-Admin-Token", avi.HTTP_REQUEST) == ""`) {
+		t.Error("empty-string comparison emitted: the gate would accept an empty header")
+	}
+	if !strings.Contains(req, `pcall(jwt_claim, "scope")`) {
+		t.Error("claim gate missing, so the endpoint would be unauthenticated")
+	}
+	if !strings.Contains(req, `'{"error":"forbidden"}'`) {
+		t.Error("reject branch missing")
+	}
+}
+
+// With neither credential the endpoint must not exist at all — an unauthenticated
+// counters endpoint would expose every consumer's usage.
+func TestNoCredentialEmitsNoEndpoint(t *testing.T) {
+	p := countersPolicy()
+	p.AdminToken, p.AdminClaimName, p.AdminClaimValue = "", "", ""
+	if req := GenerateTokenAccountingScripts(p, ClaimModeJWTQuery).ReqScript; strings.Contains(req, "/v1/admin/counters") {
+		t.Error("counters endpoint emitted with no credential configured")
+	}
+}
+
 func TestEffectiveAdminSkipPath(t *testing.T) {
 	cases := []struct {
 		annotation string
