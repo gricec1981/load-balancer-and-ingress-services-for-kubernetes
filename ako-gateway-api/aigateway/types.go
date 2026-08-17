@@ -40,6 +40,44 @@ type AIGatewayAuthPolicy struct {
 
 	Spec   AIGatewayAuthPolicySpec   `json:"spec"`
 	Status AIGatewayAuthPolicyStatus `json:"status,omitempty"`
+
+	// AdminSkipPath is read from AdminSkipPathAnnotation and controls the
+	// SKIP_AUTHENTICATION authn rule that keeps the read-only counters endpoint
+	// reachable by a client that cannot complete the IdP flow. Empty (the
+	// default) preserves the historical "/v1/admin/" prefix; a narrower prefix
+	// such as "/v1/admin/counters" shrinks what bypasses authentication; the
+	// literal "none" drops the rule entirely so the SE validates the JWT before
+	// the DataScript runs (requires the counters endpoint to accept a claim —
+	// see AdminClaimAnnotation — and the caller to present a token).
+	AdminSkipPath string `json:"-"`
+}
+
+// AdminSkipPathAnnotation, when set on an AIGatewayAuthPolicy, overrides the
+// path prefix exempted from authentication for the read-only admin endpoints.
+// Absent = "/v1/admin/" (historical behaviour). "none" = emit no skip rule.
+//
+// Rollback is an annotation edit: removing it restores the previous rule on the
+// next reconcile, with no image change.
+const AdminSkipPathAnnotation = "ai.ako.vmware.com/admin-skip-path"
+
+// DefaultAdminSkipPath is the historical exemption prefix. It is deliberately
+// broader than the single endpoint the DataScript implements, which is why it
+// is worth narrowing: any other path under it reaches the enforcement block
+// with no validated JWT (today it is stopped only by the unknown-group
+// fail-closed, i.e. by a limit whose Budget is 0).
+const DefaultAdminSkipPath = "/v1/admin/"
+
+// EffectiveAdminSkipPath returns the prefix to exempt, and false when the rule
+// should be omitted altogether.
+func (p *AIGatewayAuthPolicy) EffectiveAdminSkipPath() (string, bool) {
+	switch p.AdminSkipPath {
+	case "":
+		return DefaultAdminSkipPath, true
+	case "none":
+		return "", false
+	default:
+		return p.AdminSkipPath, true
+	}
 }
 
 // AuthClaimMode selects how the Avi SE validates the caller's JWT and how the
@@ -163,7 +201,25 @@ type AITokenRateLimitPolicy struct {
 	// dashboard UI polls for per-user token usage, gated by this token in the
 	// X-Admin-Token header. Empty means the endpoint is not generated.
 	AdminToken string `json:"-"`
+
+	// AdminClaimName/AdminClaimValue are read from AdminClaimAnnotation. When
+	// set, the counters endpoint ALSO accepts a caller whose SE-validated JWT
+	// carries that claim value — so the dashboard can authenticate as itself
+	// (short-lived, revocable, attributable) instead of presenting a shared
+	// secret that is baked verbatim into the generated DataScript.
+	//
+	// This is deliberately additive: the X-Admin-Token header keeps working
+	// while the annotation is set, so callers migrate one at a time and
+	// removing the annotation reverts to token-only with no image change.
+	AdminClaimName  string `json:"-"`
+	AdminClaimValue string `json:"-"`
 }
+
+// AdminClaimAnnotation, when set on an AITokenRateLimitPolicy as
+// "<claim>=<value>" (e.g. "scope=counters:read"), lets the read-only counters
+// endpoint accept a validated JWT carrying that claim, in addition to the
+// X-Admin-Token header. Absent = token only (historical behaviour).
+const AdminClaimAnnotation = "ai.ako.vmware.com/admin-claim"
 
 // CounterEpochAnnotation, when set on an AITokenRateLimitPolicy, prefixes the SE
 // token-counter keys. Bumping it clears all of that policy's running counters.

@@ -251,28 +251,37 @@ func EnsureOAuthSSOPolicy(key string, policy *AIGatewayAuthPolicy) (string, erro
 	tenant := lib.GetTenantInNamespace(policy.Namespace)
 	client := avicache.SharedAVIClients(tenant).AviClient[0]
 
+	// Exempt the read-only dashboard counters endpoint from the OAuth
+	// authorization-code flow. Without this, GET /v1/admin/counters would be
+	// 302'd into the login redirect and never reach the DataScript that gates
+	// it on X-Admin-Token. The path lives under the route's /v1 prefix so the
+	// EVH parent still content-switches it to this child VS.
+	//
+	// Unlike jwtQuery, a machine client cannot complete this flow at all, so
+	// dropping the rule here ("none") leaves the endpoint unreachable rather
+	// than claim-gated — narrowing the prefix is the useful setting.
+	var authnRules []*avimodels.AuthenticationRule
+	if skipPath, emit := policy.EffectiveAdminSkipPath(); emit {
+		authnRules = append(authnRules, &avimodels.AuthenticationRule{
+			Name:   proto.String("ai-admin-skip"),
+			Index:  proto.Int32(1),
+			Enable: proto.Bool(true),
+			Action: &avimodels.AuthenticationAction{Type: proto.String("SKIP_AUTHENTICATION")},
+			Match: &avimodels.AuthenticationMatch{
+				Path: &avimodels.PathMatch{
+					MatchCriteria: proto.String("BEGINS_WITH"),
+					MatchStr:      []string{skipPath},
+				},
+			},
+		})
+	}
+
 	sso := avimodels.SSOPolicy{
 		Name:      proto.String(name),
 		TenantRef: proto.String("/api/tenant/?name=" + lib.GetEscapedValue(tenant)),
 		Type:      proto.String("SSO_TYPE_OAUTH"),
-		// Exempt the read-only dashboard counters endpoint from the OAuth
-		// authorization-code flow. Without this, GET /v1/admin/counters would be
-		// 302'd into the login redirect and never reach the DataScript that gates
-		// it on X-Admin-Token. The path lives under the route's /v1 prefix so the
-		// EVH parent still content-switches it to this child VS.
 		AuthenticationPolicy: &avimodels.AuthenticationPolicy{
-			AuthnRules: []*avimodels.AuthenticationRule{{
-				Name:   proto.String("ai-admin-skip"),
-				Index:  proto.Int32(1),
-				Enable: proto.Bool(true),
-				Action: &avimodels.AuthenticationAction{Type: proto.String("SKIP_AUTHENTICATION")},
-				Match: &avimodels.AuthenticationMatch{
-					Path: &avimodels.PathMatch{
-						MatchCriteria: proto.String("BEGINS_WITH"),
-						MatchStr:      []string{"/v1/admin/"},
-					},
-				},
-			}},
+			AuthnRules: authnRules,
 		},
 	}
 

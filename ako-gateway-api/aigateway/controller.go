@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"sync"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -359,6 +360,17 @@ func parseTokenRateLimitPolicy(client dynamic.Interface, ns, name string) (*AITo
 	if secretName := obj.GetAnnotations()[AdminTokenSecretAnnotation]; secretName != "" {
 		p.AdminToken = resolveAdminToken(client, ns, secretName)
 	}
+	// Optional claim gate for the same endpoint, as "<claim>=<value>". Additive:
+	// the header gate stays in place, so this can be set and unset freely.
+	if claim := obj.GetAnnotations()[AdminClaimAnnotation]; claim != "" {
+		claimName, claimValue, ok := strings.Cut(claim, "=")
+		if ok && claimName != "" && claimValue != "" {
+			p.AdminClaimName, p.AdminClaimValue = claimName, claimValue
+		} else {
+			utils.AviLog.Warnf("AITokenRateLimitPolicy %s/%s: annotation %s must be \"<claim>=<value>\", got %q — ignored",
+				ns, name, AdminClaimAnnotation, claim)
+		}
+	}
 	return p, nil
 }
 
@@ -394,6 +406,7 @@ func resolveAdminToken(client dynamic.Interface, ns, secretName string) string {
 // unstructuredToAuthPolicy converts an unstructured object to AIGatewayAuthPolicy.
 func unstructuredToAuthPolicy(obj *unstructured.Unstructured) (*AIGatewayAuthPolicy, error) {
 	p := &AIGatewayAuthPolicy{}
+	p.AdminSkipPath = obj.GetAnnotations()[AdminSkipPathAnnotation]
 	p.Name = obj.GetName()
 	p.Namespace = obj.GetNamespace()
 

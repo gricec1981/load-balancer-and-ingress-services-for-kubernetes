@@ -185,24 +185,31 @@ func EnsureJWTSSOPolicy(key string, policy *AIGatewayAuthPolicy, authProfileName
 	tenant := lib.GetTenantInNamespace(policy.Namespace)
 	client := avicache.SharedAVIClients(tenant).AviClient[0]
 
+	// The exemption prefix is annotation-driven so it can be narrowed (or dropped
+	// entirely, once callers present a token) without rebuilding AKO.
+	var authnRules []*avimodels.AuthenticationRule
+	if skipPath, emit := policy.EffectiveAdminSkipPath(); emit {
+		authnRules = append(authnRules, &avimodels.AuthenticationRule{
+			Name:   proto.String("ai-admin-skip"),
+			Index:  proto.Int32(1),
+			Enable: proto.Bool(true),
+			Action: &avimodels.AuthenticationAction{Type: proto.String("SKIP_AUTHENTICATION")},
+			Match: &avimodels.AuthenticationMatch{
+				Path: &avimodels.PathMatch{
+					MatchCriteria: proto.String("BEGINS_WITH"),
+					MatchStr:      []string{skipPath},
+				},
+			},
+		})
+	}
+
 	sso := avimodels.SSOPolicy{
 		Name:      proto.String(name),
 		TenantRef: proto.String("/api/tenant/?name=" + lib.GetEscapedValue(tenant)),
 		Type:      proto.String("SSO_TYPE_JWT"),
 		AuthenticationPolicy: &avimodels.AuthenticationPolicy{
 			DefaultAuthProfileRef: proto.String("/api/authprofile/?name=" + authProfileName),
-			AuthnRules: []*avimodels.AuthenticationRule{{
-				Name:   proto.String("ai-admin-skip"),
-				Index:  proto.Int32(1),
-				Enable: proto.Bool(true),
-				Action: &avimodels.AuthenticationAction{Type: proto.String("SKIP_AUTHENTICATION")},
-				Match: &avimodels.AuthenticationMatch{
-					Path: &avimodels.PathMatch{
-						MatchCriteria: proto.String("BEGINS_WITH"),
-						MatchStr:      []string{"/v1/admin/"},
-					},
-				},
-			}},
+			AuthnRules:            authnRules,
 		},
 	}
 

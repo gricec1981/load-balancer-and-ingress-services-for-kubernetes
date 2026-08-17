@@ -116,18 +116,24 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 	// jwt_claim helper is shared by both phases (identity + group extraction).
 	helper := jwtClaimHelper(mode)
 
+	// jwt_claim must be defined before ANY block that calls it: Lua resolves a
+	// `local function` only from its declaration onward, so a call emitted above
+	// this point would hit a nil global at request time. The counters endpoint
+	// calls it when claim-gating is configured, hence emitting it first.
+	reqParts = append(reqParts, helper)
+
 	// ── Read-only counters endpoint (dashboard UI) ────────────────────────
 	// Prepended *before* enforcement so it intercepts GET /v1/admin/counters and
 	// returns the live per-user token usage as JSON, then returns. Only emitted
 	// when an admin token is configured (AdminTokenSecretAnnotation); the SE table
 	// cannot be enumerated, so the caller passes the users it wants in ?users=.
 	if policy.AdminToken != "" && len(spec.Limits) > 0 {
-		reqParts = append(reqParts, buildCountersEndpointBlock(spec.Limits[0], policy.CounterEpoch, policy.AdminToken))
+		reqParts = append(reqParts, buildCountersEndpointBlock(spec.Limits[0], policy.CounterEpoch,
+			policy.AdminToken, policy.AdminClaimName, policy.AdminClaimValue))
 	}
 
 	// ── Request-phase: enforce limits ─────────────────────────────────────
 	reqParts = append(reqParts, "-- AKO AI Gateway: token-budget enforcement")
-	reqParts = append(reqParts, helper)
 	reqParts = append(reqParts, identityBlock)
 	reqParts = append(reqParts, "local now = os.time()")
 
@@ -389,16 +395,34 @@ func counterKeyExpr(limit TokenLimit, epoch string) string {
 //
 // Key parsing avoids Lua patterns (string.match/gmatch are restricted in the SE
 // sandbox); it uses plain string.find/string.sub only.
-func buildCountersEndpointBlock(limit TokenLimit, epoch, adminToken string) string {
+// When claimName/claimValue are non-empty the gate also accepts a caller whose
+// SE-validated JWT carries that claim, so a client can authenticate as itself
+// instead of replaying a shared secret. Both gates are live at once: that is what
+// makes the migration reversible — callers move one at a time, and clearing the
+// annotation drops back to header-only without touching the image.
+func buildCountersEndpointBlock(limit TokenLimit, epoch, adminToken, claimName, claimValue string) string {
 	windowSec := windowSeconds(limit.Window)
 	prefix := limit.Name
 	if epoch != "" {
 		prefix = epoch + ":" + limit.Name
 	}
+	// pcall: jwt_claim reads the SE-validated token, which is absent on an
+	// unauthenticated request. A raw error here would abort the whole HTTP_REQ
+	// script, so failure must degrade to "claim did not match".
+	claimGate := ""
+	if claimName != "" && claimValue != "" {
+		claimGate = fmt.Sprintf(`
+    if not _authed then
+      local _okc, _cv = pcall(jwt_claim, %q)
+      if _okc and _cv == %q then _authed = true end
+    end`, claimName, claimValue)
+	}
 	return fmt.Sprintf(`-- AKO AI Gateway: read-only token-counters endpoint (dashboard UI)
 do
   if avi.http.get_path() == "/v1/admin/counters" then
-    if avi.http.get_header("X-Admin-Token", avi.HTTP_REQUEST) ~= %q then
+    local _authed = false
+    if avi.http.get_header("X-Admin-Token", avi.HTTP_REQUEST) == %q then _authed = true end%s
+    if not _authed then
       avi.http.response(403, {["Content-Type"]="application/json"}, '{"error":"forbidden"}')
       return
     end
@@ -431,7 +455,7 @@ do
       '{"window":'..wb..',"limit":%q,"counters":['..table.concat(parts, ",")..']}')
     return
   end
-end`, adminToken, windowSec, windowSec, prefix, limit.Name)
+end`, adminToken, claimGate, windowSec, windowSec, prefix, limit.Name)
 }
 
 // counterKeyIdentityExpr returns the Lua expression that evaluates to the key
