@@ -46,9 +46,12 @@ type AIGatewayAuthPolicy struct {
 	// reachable by a client that cannot complete the IdP flow. Empty (the
 	// default) preserves the historical "/v1/admin/" prefix; a narrower prefix
 	// such as "/v1/admin/counters" shrinks what bypasses authentication; the
-	// literal "none" drops the rule entirely so the SE validates the JWT before
-	// the DataScript runs (requires the counters endpoint to accept a claim —
-	// see AdminClaimAnnotation — and the caller to present a token).
+	// literal "none" makes the SE validate the JWT before the DataScript runs
+	// (requires the counters endpoint to accept a claim — see
+	// AdminClaimAnnotation — and the caller to present a token).
+	//
+	// "none" flips the rule's action rather than removing it; see adminAuthnRules
+	// for why an empty rule list takes the whole gateway down.
 	AdminSkipPath string `json:"-"`
 }
 
@@ -67,14 +70,16 @@ const AdminSkipPathAnnotation = "ai.ako.vmware.com/admin-skip-path"
 // fail-closed, i.e. by a limit whose Budget is 0).
 const DefaultAdminSkipPath = "/v1/admin/"
 
-// EffectiveAdminSkipPath returns the prefix to exempt, and false when the rule
-// should be omitted altogether.
+// EffectiveAdminSkipPath returns the admin path prefix the authn rule matches,
+// and whether that rule should SKIP authentication for it. A false second value
+// means "match the same path, but authenticate it normally" — the rule is still
+// emitted (see adminAuthnRules).
 func (p *AIGatewayAuthPolicy) EffectiveAdminSkipPath() (string, bool) {
 	switch p.AdminSkipPath {
 	case "":
 		return DefaultAdminSkipPath, true
 	case "none":
-		return "", false
+		return DefaultAdminSkipPath, false
 	default:
 		return p.AdminSkipPath, true
 	}

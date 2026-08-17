@@ -258,23 +258,9 @@ func EnsureOAuthSSOPolicy(key string, policy *AIGatewayAuthPolicy) (string, erro
 	// EVH parent still content-switches it to this child VS.
 	//
 	// Unlike jwtQuery, a machine client cannot complete this flow at all, so
-	// dropping the rule here ("none") leaves the endpoint unreachable rather
-	// than claim-gated — narrowing the prefix is the useful setting.
-	var authnRules []*avimodels.AuthenticationRule
-	if skipPath, emit := policy.EffectiveAdminSkipPath(); emit {
-		authnRules = append(authnRules, &avimodels.AuthenticationRule{
-			Name:   proto.String("ai-admin-skip"),
-			Index:  proto.Int32(1),
-			Enable: proto.Bool(true),
-			Action: &avimodels.AuthenticationAction{Type: proto.String("SKIP_AUTHENTICATION")},
-			Match: &avimodels.AuthenticationMatch{
-				Path: &avimodels.PathMatch{
-					MatchCriteria: proto.String("BEGINS_WITH"),
-					MatchStr:      []string{skipPath},
-				},
-			},
-		})
-	}
+	// setting "none" here leaves the endpoint unreachable rather than
+	// claim-gated — narrowing the prefix is the useful setting.
+	authnRules := adminAuthnRules(policy)
 
 	sso := avimodels.SSOPolicy{
 		Name:      proto.String(name),

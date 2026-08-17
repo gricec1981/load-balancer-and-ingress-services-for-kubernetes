@@ -154,18 +154,53 @@ func TestEffectiveAdminSkipPath(t *testing.T) {
 	cases := []struct {
 		annotation string
 		wantPath   string
-		wantEmit   bool
+		wantSkip   bool
 	}{
 		{"", DefaultAdminSkipPath, true},                   // untouched: historical behaviour
 		{"/v1/admin/counters", "/v1/admin/counters", true}, // narrowed
-		{"none", "", false},                                // rule dropped: SE validates first
+		{"none", DefaultAdminSkipPath, false},              // same path, authenticated instead
 	}
 	for _, c := range cases {
 		p := &AIGatewayAuthPolicy{AdminSkipPath: c.annotation}
-		got, emit := p.EffectiveAdminSkipPath()
-		if got != c.wantPath || emit != c.wantEmit {
+		got, skip := p.EffectiveAdminSkipPath()
+		if got != c.wantPath || skip != c.wantSkip {
 			t.Errorf("AdminSkipPath=%q: got (%q,%v), want (%q,%v)",
-				c.annotation, got, emit, c.wantPath, c.wantEmit)
+				c.annotation, got, skip, c.wantPath, c.wantSkip)
+		}
+	}
+}
+
+// Regression guard for a live outage: emitting an SSO policy with NO authn rules
+// is accepted by the controller, but the VS referencing it then fails to PUT and
+// AKO abandons every remaining child of that EVH parent — the VIP stops
+// answering entirely. "Do not exempt this path" must therefore be a rule with
+// USE_DEFAULT_AUTHENTICATION, never the absence of a rule.
+func TestAdminAuthnRulesNeverEmpty(t *testing.T) {
+	cases := []struct {
+		annotation string
+		wantAction string
+		wantPath   string
+	}{
+		{"", authnActionSkip, DefaultAdminSkipPath},
+		{"/v1/admin/counters", authnActionSkip, "/v1/admin/counters"},
+		{"none", authnActionDefault, DefaultAdminSkipPath},
+	}
+	for _, c := range cases {
+		rules := adminAuthnRules(&AIGatewayAuthPolicy{AdminSkipPath: c.annotation})
+		if len(rules) != 1 {
+			t.Fatalf("AdminSkipPath=%q: got %d authn rules, want exactly 1 — "+
+				"an empty rule list takes the whole gateway down", c.annotation, len(rules))
+		}
+		r := rules[0]
+		if r.Action == nil || r.Action.Type == nil || *r.Action.Type != c.wantAction {
+			t.Errorf("AdminSkipPath=%q: action = %v, want %q", c.annotation, r.Action, c.wantAction)
+		}
+		if r.Match == nil || r.Match.Path == nil || len(r.Match.Path.MatchStr) != 1 ||
+			r.Match.Path.MatchStr[0] != c.wantPath {
+			t.Errorf("AdminSkipPath=%q: match path = %v, want %q", c.annotation, r.Match, c.wantPath)
+		}
+		if r.Enable == nil || !*r.Enable {
+			t.Errorf("AdminSkipPath=%q: rule is not enabled", c.annotation)
 		}
 	}
 }

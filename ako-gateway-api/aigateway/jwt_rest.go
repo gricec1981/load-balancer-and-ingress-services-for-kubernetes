@@ -177,6 +177,47 @@ func EnsureJWTAuthProfile(key string, policy *AIGatewayAuthPolicy, serverProfile
 
 // ─── JWT SSO Policy ──────────────────────────────────────────────────────────
 
+// Avi authentication actions (AuthenticationAction.Type). The SDK documents the
+// enum as: SKIP_AUTHENTICATION, USE_DEFAULT_AUTHENTICATION.
+const (
+	authnActionSkip    = "SKIP_AUTHENTICATION"
+	authnActionDefault = "USE_DEFAULT_AUTHENTICATION"
+)
+
+// adminAuthnRules builds the authn rules for the admin path, shared by the JWT
+// and OAuth SSO policies.
+//
+// It ALWAYS returns exactly one rule. "Do not exempt this path" is expressed by
+// flipping the rule's action to USE_DEFAULT_AUTHENTICATION, never by emitting an
+// empty rule list: an SSO policy with no authn rules is accepted by the
+// controller on its own, but the VS that references it then fails to PUT, and
+// AKO abandons the whole EVH child chain on that failure ("Failure in processing
+// EVH node ... Not processing other child nodes"). The practical effect is that
+// every route on the gateway stops being programmed and the VIP answers nothing
+// — observed live 2026-08-16 on the LLM front door, recovered by reverting the
+// annotation.
+func adminAuthnRules(policy *AIGatewayAuthPolicy) []*avimodels.AuthenticationRule {
+	path, skip := policy.EffectiveAdminSkipPath()
+	action := authnActionSkip
+	if !skip {
+		action = authnActionDefault
+	}
+	// The rule name is stable across both actions so the policy carries one rule
+	// that changes meaning, rather than accumulating orphans.
+	return []*avimodels.AuthenticationRule{{
+		Name:   proto.String("ai-admin-skip"),
+		Index:  proto.Int32(1),
+		Enable: proto.Bool(true),
+		Action: &avimodels.AuthenticationAction{Type: proto.String(action)},
+		Match: &avimodels.AuthenticationMatch{
+			Path: &avimodels.PathMatch{
+				MatchCriteria: proto.String("BEGINS_WITH"),
+				MatchStr:      []string{path},
+			},
+		},
+	}}
+}
+
 // EnsureJWTSSOPolicy creates/updates the SSO_TYPE_JWT policy the VS references.
 // The same admin-skip authn rule as the OAuth path keeps the read-only counters
 // endpoint (GET /v1/admin/...) reachable without a token.
@@ -185,23 +226,7 @@ func EnsureJWTSSOPolicy(key string, policy *AIGatewayAuthPolicy, authProfileName
 	tenant := lib.GetTenantInNamespace(policy.Namespace)
 	client := avicache.SharedAVIClients(tenant).AviClient[0]
 
-	// The exemption prefix is annotation-driven so it can be narrowed (or dropped
-	// entirely, once callers present a token) without rebuilding AKO.
-	var authnRules []*avimodels.AuthenticationRule
-	if skipPath, emit := policy.EffectiveAdminSkipPath(); emit {
-		authnRules = append(authnRules, &avimodels.AuthenticationRule{
-			Name:   proto.String("ai-admin-skip"),
-			Index:  proto.Int32(1),
-			Enable: proto.Bool(true),
-			Action: &avimodels.AuthenticationAction{Type: proto.String("SKIP_AUTHENTICATION")},
-			Match: &avimodels.AuthenticationMatch{
-				Path: &avimodels.PathMatch{
-					MatchCriteria: proto.String("BEGINS_WITH"),
-					MatchStr:      []string{skipPath},
-				},
-			},
-		})
-	}
+	authnRules := adminAuthnRules(policy)
 
 	sso := avimodels.SSOPolicy{
 		Name:      proto.String(name),
