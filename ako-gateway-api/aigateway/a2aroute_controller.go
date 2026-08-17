@@ -210,6 +210,9 @@ func unstructuredToA2ARoutePolicy(obj *unstructured.Unstructured) (*AIA2ARoutePo
 		if v, _, _ := unstructured.NestedString(aa, "targetAgent"); v != "" {
 			a.TargetAgent = v
 		}
+		if v, found, _ := unstructured.NestedBool(aa, "authorizePaths"); found {
+			a.AuthorizePaths = v
+		}
 		if rulesRaw, found, _ := unstructured.NestedSlice(aa, "rules"); found {
 			for _, rr := range rulesRaw {
 				rm, ok := rr.(map[string]interface{})

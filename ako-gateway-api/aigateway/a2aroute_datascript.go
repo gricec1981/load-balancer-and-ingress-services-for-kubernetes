@@ -165,8 +165,16 @@ end`, ReqBodyBufferBytes)
 `)
 		}
 
-		reqData.WriteString(`
-  if method ~= "" then
+		// With path authorization the rules are evaluated for every request, not
+		// just JSON-RPC ones — that is the whole point, since a REST call has no
+		// method to gate on.
+		guard := `
+  if method ~= "" then`
+		if spec.AgentAccess.AuthorizePaths {
+			guard = `
+  do`
+		}
+		reqData.WriteString(guard + `
     local _agent = jwt_claim(AGENT_CLAIM)
     -- The skill the caller says it is invoking, from its per-target token. A
     -- legacy token carries no skill, leaving this empty; the empty string is
@@ -177,15 +185,17 @@ end`, ReqBodyBufferBytes)
       _ok2 = true
     else
       local _ex = ALLOW[_agent]
-      if _ex and _ex[method] then _ok2 = true end
-      if not _ok2 and _skill ~= "" and _ex and _ex[_skill] then _ok2 = true end
+      if _ex and method ~= "" and _ex[method] then _ok2 = true end
+      if not _ok2 and _skill ~= "" and _ex and _ex[_skill] then _ok2 = true end` +
+			pathExactMatch(spec.AgentAccess.AuthorizePaths) + `
       if not _ok2 then
         local _pf = ALLOW_PFX[_agent]
         if _pf then
           for i = 1, #_pf do
             local _p = _pf[i]
-            if string.sub(method, 1, string.len(_p)) == _p then _ok2 = true break end
-            if _skill ~= "" and string.sub(_skill, 1, string.len(_p)) == _p then _ok2 = true break end
+            if method ~= "" and string.sub(method, 1, string.len(_p)) == _p then _ok2 = true break end
+            if _skill ~= "" and string.sub(_skill, 1, string.len(_p)) == _p then _ok2 = true break end` +
+			pathPrefixMatch(spec.AgentAccess.AuthorizePaths) + `
           end
         end
       end
@@ -286,6 +296,26 @@ func a2aRejectStmt(a *UnauthorizedAction) string {
 		`      avi.http.response(%d, {["Content-Type"]="application/json"}, `+
 			`'{"jsonrpc":"2.0","error":{"code":-32001,"message":"method_not_authorized"}}') return`,
 		a.EffectiveStatusCode())
+}
+
+// pathExactMatch / pathPrefixMatch add the request path as a matched dimension
+// when authorizePaths is set. `path` is already in scope — it is read at the top
+// of the request-data block for the agent-card exemption — and is never empty,
+// so unlike method and skill it needs no emptiness guard.
+func pathExactMatch(on bool) string {
+	if !on {
+		return ""
+	}
+	return `
+      if not _ok2 and _ex and _ex[path] then _ok2 = true end`
+}
+
+func pathPrefixMatch(on bool) string {
+	if !on {
+		return ""
+	}
+	return `
+            if string.sub(path, 1, string.len(_p)) == _p then _ok2 = true break end`
 }
 
 // classifyAgentRules splits agent allow-lists into the same three baked tables

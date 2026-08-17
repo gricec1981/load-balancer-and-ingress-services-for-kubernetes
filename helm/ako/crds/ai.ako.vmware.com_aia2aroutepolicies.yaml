@@ -137,6 +137,18 @@ spec:
                       AIGatewayAuthPolicy audience and no estate-wide cutover. A token with no
                       `target` claim is never rejected, so legacy callers are unaffected.
                     type: string
+                  authorizePaths:
+                    description: |-
+                      Match allow-list entries against the request path as well, and evaluate
+                      the rules for every request rather than only JSON-RPC ones. For agents
+                      that serve plain REST on this surface, whose rules can otherwise never
+                      match (a REST call carries neither a JSON-RPC method nor a skill claim)
+                      and which therefore run unauthorized behind a valid token. With this
+                      set, a rule can name endpoints — allow: ["/status", "/last"] — and
+                      anything unlisted is rejected. Off by default: it converts the REST
+                      fail-open into a fail-closed.
+                    type: boolean
+                    default: false
                   requireMethod:
                     description: |-
                       Reject a request from which no JSON-RPC method could be extracted,

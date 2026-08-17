@@ -152,6 +152,39 @@ func TestTargetAgentBinding(t *testing.T) {
 	}
 }
 
+// REST agents: their rules can never match a JSON-RPC method or a skill, so
+// without path authorization they run unauthorized behind a valid token.
+func TestAuthorizePathsGatesRESTEndpoints(t *testing.T) {
+	p := skillPolicy()
+	off := GenerateA2AScripts(p, ClaimModeJWTQuery).ReqDataScript
+	if strings.Contains(off, "_ex[path]") {
+		t.Error("path matching emitted without authorizePaths set")
+	}
+	// Default must keep the JSON-RPC-only guard, or REST agents start being denied.
+	if !strings.Contains(off, `if method ~= "" then`) {
+		t.Error("default no longer gates on method")
+	}
+
+	p.Spec.AgentAccess.AuthorizePaths = true
+	on := GenerateA2AScripts(p, ClaimModeJWTQuery).ReqDataScript
+	if !strings.Contains(on, "_ex[path]") {
+		t.Error("exact path matching not emitted")
+	}
+	if !strings.Contains(on, `string.sub(path, 1, string.len(_p)) == _p`) {
+		t.Error("prefix path matching not emitted")
+	}
+	// The rules must now run for EVERY request, not only JSON-RPC ones.
+	if strings.Contains(on, `if method ~= "" then
+    local _agent`) {
+		t.Error("still gated on method, so REST calls would skip authorization")
+	}
+	// An empty method must not be compared against the allow-list, or a REST call
+	// would match a rule whose entry happens to be the empty string.
+	if !strings.Contains(on, `if _ex and method ~= "" and _ex[method] then`) {
+		t.Error("empty method is not guarded before the exact match")
+	}
+}
+
 func TestEffectiveSkillClaimDefaults(t *testing.T) {
 	var nilAccess *A2AAgentAccess
 	if got := nilAccess.EffectiveSkillClaim(); got != "skill" {

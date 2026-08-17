@@ -142,6 +142,25 @@ type A2AAgentAccess struct {
 	// spent against another, which is the property that matters here.
 	TargetAgent string `json:"targetAgent,omitempty"`
 
+	// AuthorizePaths adds the request path as a third dimension the allow-list is
+	// matched against, and evaluates the rules for EVERY request rather than only
+	// for JSON-RPC ones.
+	//
+	// It exists for agents that serve plain REST on this surface. Their rules can
+	// never match, because the allow-list is compared to a JSON-RPC method and a
+	// skill claim and a REST call carries neither — so they run unauthorized
+	// behind a valid token. requireMethod cannot help: rejecting methodless
+	// requests would reject the agent's entire interface.
+	//
+	// With this set, a rule can name endpoints instead:
+	//
+	//   allow: ["/status", "/last"]
+	//
+	// and anything not listed — /run, /healthz — is rejected. Off by default: it
+	// turns the REST fail-open into a fail-closed, so a policy that lists no
+	// paths would start denying every REST call.
+	AuthorizePaths bool `json:"authorizePaths,omitempty"`
+
 	// RequireMethod rejects a request from which no JSON-RPC method could be
 	// extracted, instead of letting it through unauthorized.
 	//
