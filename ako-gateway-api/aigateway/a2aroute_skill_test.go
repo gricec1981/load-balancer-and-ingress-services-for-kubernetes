@@ -99,6 +99,28 @@ func TestIsMethodAllowedUnchanged(t *testing.T) {
 	}
 }
 
+// A request with no JSON-RPC method skips the allow-list entirely, so any valid
+// token reaches the backend. requireMethod closes that, and must stay opt-in:
+// the digest agents serve plain REST through this same gateway.
+func TestRequireMethodIsOptInAndFailsClosed(t *testing.T) {
+	p := skillPolicy()
+	off := GenerateA2AScripts(p, ClaimModeJWTQuery).ReqDataScript
+	if strings.Contains(off, `if method == "" then`) {
+		t.Error("requireMethod defaulted on — plain REST callers would start being rejected")
+	}
+
+	p.Spec.AgentAccess.RequireMethod = true
+	on := GenerateA2AScripts(p, ClaimModeJWTQuery).ReqDataScript
+	if !strings.Contains(on, `if method == "" then`) {
+		t.Fatal("requireMethod set but no methodless branch emitted")
+	}
+	// The rejection must be the configured one, not a bare return.
+	idx := strings.Index(on, `if method == "" then`)
+	if !strings.Contains(on[idx:], "avi.http.response") {
+		t.Error("methodless branch does not reject the request")
+	}
+}
+
 func TestEffectiveSkillClaimDefaults(t *testing.T) {
 	var nilAccess *A2AAgentAccess
 	if got := nilAccess.EffectiveSkillClaim(); got != "skill" {

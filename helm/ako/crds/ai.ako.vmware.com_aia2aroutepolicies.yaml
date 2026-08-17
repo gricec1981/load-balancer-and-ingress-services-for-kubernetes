@@ -129,6 +129,17 @@ spec:
                       matched and existing policies behave unchanged.
                     type: string
                     default: skill
+                  requireMethod:
+                    description: |-
+                      Reject a request from which no JSON-RPC method could be extracted,
+                      instead of letting it through unauthorized. The allow-list can only be
+                      evaluated against a method or a skill, so a plain REST call (e.g. GET
+                      /healthz) otherwise skips authorization entirely. Defaults to false,
+                      because agents on this surface legitimately serve REST alongside A2A;
+                      enable it per route on agents that speak only JSON-RPC. The agent-card
+                      path is exempted before this check.
+                    type: boolean
+                    default: false
                   rules:
                     description: |-
                       rules lists, per calling-agent identity, the A2A JSON-RPC methods

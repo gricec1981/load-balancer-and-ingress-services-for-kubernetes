@@ -204,6 +204,9 @@ func unstructuredToA2ARoutePolicy(obj *unstructured.Unstructured) (*AIA2ARoutePo
 		if v, _, _ := unstructured.NestedString(aa, "skillClaim"); v != "" {
 			a.SkillClaim = v
 		}
+		if v, found, _ := unstructured.NestedBool(aa, "requireMethod"); found {
+			a.RequireMethod = v
+		}
 		if rulesRaw, found, _ := unstructured.NestedSlice(aa, "rules"); found {
 			for _, rr := range rulesRaw {
 				rm, ok := rr.(map[string]interface{})

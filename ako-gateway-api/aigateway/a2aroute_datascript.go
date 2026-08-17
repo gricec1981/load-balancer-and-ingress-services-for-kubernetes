@@ -176,6 +176,18 @@ end`, ReqBodyBufferBytes)
     end
   end
 `)
+		// Without a method there is nothing to authorize against, so the block
+		// above is skipped entirely — fail-open for any non-JSON-RPC request.
+		// requireMethod closes that for agents that speak only JSON-RPC.
+		if spec.AgentAccess.RequireMethod {
+			reqData.WriteString(`
+  if method == "" then
+`)
+			reqData.WriteString(reject)
+			reqData.WriteString(`
+  end
+`)
+		}
 	}
 	reqData.WriteString("end")
 

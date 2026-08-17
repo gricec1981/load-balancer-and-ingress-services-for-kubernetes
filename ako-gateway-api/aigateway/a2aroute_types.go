@@ -122,6 +122,21 @@ type A2AAgentAccess struct {
 	// working unchanged.
 	SkillClaim string `json:"skillClaim,omitempty"`
 
+	// RequireMethod rejects a request from which no JSON-RPC method could be
+	// extracted, instead of letting it through unauthorized.
+	//
+	// The allow-list can only be evaluated against a method or a skill, so a
+	// request carrying neither — any plain REST call, e.g. GET /healthz — skips
+	// authorization entirely. That is fail-open: a caller holding any valid
+	// token reaches the backend whatever the rules say.
+	//
+	// Defaults to false because agents on this surface legitimately serve plain
+	// REST alongside A2A (the digest agents' /last and /status), and flipping it
+	// globally would break them. Set it per route on agents that speak only
+	// JSON-RPC. The agent-card path is exempted before this check, so
+	// /.well-known/agent.json stays reachable either way.
+	RequireMethod bool `json:"requireMethod,omitempty"`
+
 	// Rules lists, per calling-agent identity, the A2A JSON-RPC methods and/or
 	// agent-card skills that agent may invoke.
 	Rules []AgentAccessRule `json:"rules,omitempty"`
