@@ -121,6 +121,37 @@ func TestRequireMethodIsOptInAndFailsClosed(t *testing.T) {
 	}
 }
 
+// Target binding: a token minted for one agent must not be spendable at another.
+// Opt-in, and an absent claim is never rejected so legacy callers keep working.
+func TestTargetAgentBinding(t *testing.T) {
+	p := skillPolicy()
+	off := GenerateA2AScripts(p, ClaimModeJWTQuery).ReqDataScript
+	if strings.Contains(off, "EXPECTED_TARGET") {
+		t.Error("target binding emitted without targetAgent set")
+	}
+
+	p.Spec.AgentAccess.TargetAgent = "weather-agent"
+	on := GenerateA2AScripts(p, ClaimModeJWTQuery).ReqDataScript
+	for _, want := range []string{
+		`local EXPECTED_TARGET = "weather-agent"`,
+		`local _tgt = jwt_claim("target")`,
+		`if _tgt ~= "" and _tgt ~= EXPECTED_TARGET then`,
+	} {
+		if !strings.Contains(on, want) {
+			t.Errorf("missing %q", want)
+		}
+	}
+	// Must be checked before the allow-list, so a misdirected token is refused
+	// on target rather than on whatever its skill happens to be.
+	if strings.Index(on, "EXPECTED_TARGET") > strings.Index(on, `if method ~= "" then`) {
+		t.Error("target check runs after the allow-list")
+	}
+	// And it must be defined after the claim reader it uses.
+	if h := strings.Index(on, "local function jwt_claim"); h < 0 || h > strings.Index(on, `jwt_claim("target")`) {
+		t.Error("jwt_claim used before it is defined")
+	}
+}
+
 func TestEffectiveSkillClaimDefaults(t *testing.T) {
 	var nilAccess *A2AAgentAccess
 	if got := nilAccess.EffectiveSkillClaim(); got != "skill" {

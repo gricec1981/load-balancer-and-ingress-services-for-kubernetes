@@ -122,6 +122,26 @@ type A2AAgentAccess struct {
 	// working unchanged.
 	SkillClaim string `json:"skillClaim,omitempty"`
 
+	// TargetAgent is this route's own agent name. When set, a caller presenting a
+	// token whose `target` claim names a DIFFERENT agent is rejected.
+	//
+	// This is audience binding done at the authorization layer instead of the
+	// authentication layer. The SE validates a single audience per
+	// AIGatewayAuthPolicy, and one policy is typically shared across every
+	// surface, so binding a token to one agent via `aud` would force an
+	// estate-wide cutover. The DataScript is generated per route and therefore
+	// already knows which agent it fronts, so the same property is available
+	// here for the cost of one string comparison.
+	//
+	// A token with no `target` claim is never rejected, so legacy callers are
+	// unaffected and this can be enabled per route.
+	//
+	// Weaker than a real audience in one respect: the token stays
+	// cryptographically valid elsewhere, and a route with no AIA2ARoutePolicy
+	// performs no check at all. It stops a token minted for one agent being
+	// spent against another, which is the property that matters here.
+	TargetAgent string `json:"targetAgent,omitempty"`
+
 	// RequireMethod rejects a request from which no JSON-RPC method could be
 	// extracted, instead of letting it through unauthorized.
 	//

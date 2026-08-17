@@ -129,6 +129,14 @@ spec:
                       matched and existing policies behave unchanged.
                     type: string
                     default: skill
+                  targetAgent:
+                    description: |-
+                      This route's own agent name. When set, a caller presenting a token whose
+                      `target` claim names a different agent is rejected — audience binding
+                      done at the authorization layer, so it needs no change to the shared
+                      AIGatewayAuthPolicy audience and no estate-wide cutover. A token with no
+                      `target` claim is never rejected, so legacy callers are unaffected.
+                    type: string
                   requireMethod:
                     description: |-
                       Reject a request from which no JSON-RPC method could be extracted,

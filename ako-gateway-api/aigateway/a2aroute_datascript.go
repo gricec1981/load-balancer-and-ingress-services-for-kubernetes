@@ -116,6 +116,9 @@ end`, ReqBodyBufferBytes)
 		reqData.WriteString(luaListMap("ALLOW_PFX", agentPrefix))
 		fmt.Fprintf(&reqData, "  local AGENT_CLAIM = %s\n", luaStr(spec.AgentAccess.EffectiveAgentClaim()))
 		fmt.Fprintf(&reqData, "  local SKILL_CLAIM = %s\n", luaStr(spec.AgentAccess.EffectiveSkillClaim()))
+		if spec.AgentAccess.TargetAgent != "" {
+			fmt.Fprintf(&reqData, "  local EXPECTED_TARGET = %s\n", luaStr(spec.AgentAccess.TargetAgent))
+		}
 		reqData.WriteString(jwtClaimHelper(mode))
 	}
 
@@ -144,6 +147,24 @@ end`, ReqBodyBufferBytes)
 	// Agent RBAC enforcement — only when agentAccess is configured.
 	if spec.AgentAccess != nil && len(spec.AgentAccess.Rules) > 0 {
 		reject := a2aRejectStmt(spec.OnUnauthorized)
+
+		// Target binding: refuse a token minted for a different agent. Checked
+		// before the allow-list, so a misdirected token is rejected on the
+		// strongest available ground rather than on whatever its skill happens
+		// to be. An absent claim is never rejected (legacy callers).
+		if spec.AgentAccess.TargetAgent != "" {
+			reqData.WriteString(`
+  do
+    local _tgt = jwt_claim("target")
+    if _tgt ~= "" and _tgt ~= EXPECTED_TARGET then
+`)
+			reqData.WriteString(reject)
+			reqData.WriteString(`
+    end
+  end
+`)
+		}
+
 		reqData.WriteString(`
   if method ~= "" then
     local _agent = jwt_claim(AGENT_CLAIM)
