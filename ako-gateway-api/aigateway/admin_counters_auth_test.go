@@ -112,6 +112,32 @@ func TestCountersGateAcceptsHeaderOrClaim(t *testing.T) {
 	}
 }
 
+// A read-only request cannot carry a usage object. Without this, HTTP_RESP's own
+// method test fails open on Avi 31.2.x and a plain JSON GET is charged the full
+// fail-closed penalty (measured live: one GET /v1/models moved a counter by 65536).
+func TestReadOnlyMethodsAreNotMetered(t *testing.T) {
+	req := GenerateTokenAccountingScripts(countersPolicy(), ClaimModeJWTQuery).ReqScript
+
+	if !strings.Contains(req, `avi.http.set_reqvar("ai_skip_meter", "1")`) {
+		t.Fatal("request phase never sets ai_skip_meter")
+	}
+	for _, verb := range []string{"GET", "HEAD", "OPTIONS"} {
+		if !strings.Contains(req, `_m == "`+verb+`"`) {
+			t.Errorf("%s is not in the skip-list", verb)
+		}
+	}
+	// Must be an explicit skip-list. A `~= "POST"` test would silently disable
+	// metering whenever the method comes back empty or unexpected.
+	if strings.Contains(req, `_m ~= "POST"`) {
+		t.Error("skip is inverted: an unreadable method would disable metering entirely")
+	}
+	// The flag has to be set before enforcement reads identity, and HTTP_RESP
+	// checks the same reqvar the model-route script uses.
+	if strings.Index(req, "ai_skip_meter") > strings.Index(req, "token-budget enforcement") {
+		t.Error("ai_skip_meter is set after enforcement")
+	}
+}
+
 func TestEffectiveAdminSkipPath(t *testing.T) {
 	cases := []struct {
 		annotation string

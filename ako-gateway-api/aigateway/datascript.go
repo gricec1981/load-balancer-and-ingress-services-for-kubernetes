@@ -132,6 +132,9 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 			policy.AdminToken, policy.AdminClaimName, policy.AdminClaimValue))
 	}
 
+	// Flag methods that cannot carry a usage object, before enforcement runs.
+	reqParts = append(reqParts, buildMethodSkipBlock())
+
 	// ── Request-phase: enforce limits ─────────────────────────────────────
 	reqParts = append(reqParts, "-- AKO AI Gateway: token-budget enforcement")
 	reqParts = append(reqParts, identityBlock)
@@ -589,6 +592,30 @@ func buildReqLimitBlock(limit TokenLimit, epoch string) string {
 //
 // HTTP_RESP_DATA can't read headers, so the ai_meter reqvar is how that phase
 // learns "this response is metered" without re-sniffing the body.
+// buildMethodSkipBlock marks read-only methods as unmeterable in the REQUEST
+// phase, where the method is reliably readable.
+//
+// buildBufferEnableBlock also tests the method, but it runs in HTTP_RESP and was
+// observed on Avi 31.2.x to fail open there: `pcall(avi.http.get_method)` does not
+// yield the method after the proxy, so `is_post` keeps its `true` default. A plain
+// JSON GET (e.g. GET /v1/models) is then buffered, parses no `usage`, and is charged
+// the full FailClosedTokens penalty — measured live: one GET moved a consumer's
+// counter by exactly 65536, which silently exhausts a small budget.
+//
+// Deliberately an explicit skip-list rather than `~= "POST"`: an unexpected or
+// empty method value must leave metering exactly as it is today. This can only
+// ever stop metering a read-only request, never start or stop metering a POST.
+func buildMethodSkipBlock() string {
+	return `-- AKO AI Gateway: read-only methods carry no usage object; never meter them.
+do
+  local _m = ""
+  do local ok, v = pcall(avi.http.get_method); if ok and v then _m = tostring(v) end end
+  if _m == "GET" or _m == "HEAD" or _m == "OPTIONS" then
+    pcall(function() avi.http.set_reqvar("ai_skip_meter", "1") end)
+  end
+end`
+}
+
 func buildBufferEnableBlock() string {
 	return fmt.Sprintf(`-- AKO AI Gateway: decide+flag a metered response, buffer its body for HTTP_RESP_DATA
 do
