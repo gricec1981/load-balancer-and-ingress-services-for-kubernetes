@@ -38,6 +38,17 @@ const DSTableName = "ai_tok"
 // in-flight buffered response).
 const RespBodyBufferKB = 256
 
+// RespBodyBufferBytes is the same size in bytes, and exists because the two units
+// meet in one comparison.
+//
+// avi.http.set_response_body_buffer_size and avi.http.get_response_body both take
+// KILOBYTES — which is why RespBodyBufferKB is passed to them raw. But `#_body` in
+// Lua is a BYTE count, so the truncation test ("did the body fill the buffer?")
+// has to be made against bytes. Getting that comparison wrong in either direction
+// is silent: too high and the fail-closed penalty never fires, so an over-buffer
+// completion goes unmetered; too low and every ordinary response looks truncated.
+const RespBodyBufferBytes = RespBodyBufferKB * 1024
+
 // FailClosedTokens is the conservative token amount charged when a response was
 // demonstrably UNREADABLE rather than merely usage-free: the body filled the
 // buffer (so `usage` sat past RespBodyBufferKB) or it arrived compressed. Charging
@@ -53,7 +64,7 @@ const RespBodyBufferKB = 256
 //
 // It is a BUDGET figure, not a measurement: the ledger records it as
 // meter_quality="penalty" and must never sum it into reported consumption.
-const FailClosedTokens = RespBodyBufferKB * 1024 / 4
+const FailClosedTokens = RespBodyBufferBytes / 4
 
 // DSNameReq / DSNameResp / DSNameRespData are the suffixes appended to the VS
 // name to generate DataScript set names.  One DataScript set is created per
@@ -142,6 +153,17 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 	if (policy.AdminToken != "" || policy.AdminClaimName != "") && len(spec.Limits) > 0 {
 		reqParts = append(reqParts, buildCountersEndpointBlock(spec.Limits[0], policy.CounterEpoch,
 			policy.AdminToken, policy.AdminClaimName, policy.AdminClaimValue))
+
+		// ── Usage-record drain (token ledger collector) ───────────────────
+		// Same admin credentials, same /v1/admin/ prefix, same "the DataScript
+		// is the gate" posture as the counters endpoint above. Where counters
+		// answers "how much is this identity using right now" from a scalar the
+		// budget also reads, this hands over the individual records so an
+		// out-of-band collector can keep the history the SE deliberately does
+		// not — see docs/gateway-api/ai-gateway-token-ledger.md.
+		reqParts = append(reqParts, buildQueryValueHelper())
+		reqParts = append(reqParts, buildUsageDrainBlock(
+			policy.AdminToken, policy.AdminClaimName, policy.AdminClaimValue))
 	}
 
 	// ── Request-phase: enforce limits ─────────────────────────────────────
@@ -198,6 +220,10 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 	for _, limit := range spec.Limits {
 		respDataParts = append(respDataParts, buildRespLimitBlock(limit, policy.CounterEpoch))
 	}
+
+	// The ledger record goes last: the budget counters are what enforcement acts
+	// on, so they are written first and are never delayed by accounting work.
+	respDataParts = append(respDataParts, buildUsageRecordBlock(spec.TargetRef.Name))
 
 	return TokenAccountingScripts{
 		ReqScript:            strings.Join(reqParts, "\n"),
@@ -418,36 +444,13 @@ func buildCountersEndpointBlock(limit TokenLimit, epoch, adminToken, claimName, 
 	if epoch != "" {
 		prefix = epoch + ":" + limit.Name
 	}
-	// The shared-secret gate is emitted ONLY when a secret is configured. Passing
-	// an empty adminToken through would generate `get_header(...) == ""`, which any
-	// caller sending an empty X-Admin-Token header satisfies — turning the gate off
-	// rather than removing it. Omitting the branch is what lets the secret actually
-	// be retired: drop the admin-token Secret annotation, keep the claim, and no
-	// credential is baked into the generated config at all.
-	tokenGate := ""
-	if adminToken != "" {
-		tokenGate = fmt.Sprintf(`
-    if avi.http.get_header("X-Admin-Token", avi.HTTP_REQUEST) == %q then _authed = true end`, adminToken)
-	}
-	// pcall: jwt_claim reads the SE-validated token, which is absent on an
-	// unauthenticated request. A raw error here would abort the whole HTTP_REQ
-	// script, so failure must degrade to "claim did not match".
-	claimGate := ""
-	if claimName != "" && claimValue != "" {
-		claimGate = fmt.Sprintf(`
-    if not _authed then
-      local _okc, _cv = pcall(jwt_claim, %q)
-      if _okc and _cv == %q then _authed = true end
-    end`, claimName, claimValue)
-	}
+	// The gate itself lives in buildAdminAuthGate, shared with the usage drain:
+	// two admin endpoints with the same trust decision must not carry two
+	// hand-copied copies of it.
 	return fmt.Sprintf(`-- AKO AI Gateway: read-only token-counters endpoint (dashboard UI)
 do
   if avi.http.get_path() == "/v1/admin/counters" then
-    local _authed = false%s%s
-    if not _authed then
-      avi.http.response(403, {["Content-Type"]="application/json"}, '{"error":"forbidden"}')
-      return
-    end
+%s
     local q = avi.http.get_query() or ""
     local users = ""
     do
@@ -477,7 +480,8 @@ do
       '{"window":'..wb..',"limit":%q,"counters":['..table.concat(parts, ",")..']}')
     return
   end
-end`, tokenGate, claimGate, windowSec, windowSec, prefix, limit.Name)
+end`, buildAdminAuthGate(adminToken, claimName, claimValue),
+		windowSec, windowSec, prefix, limit.Name)
 }
 
 // counterKeyIdentityExpr returns the Lua expression that evaluates to the key
@@ -651,9 +655,25 @@ func buildUsageParseBlock() string {
 local prompt_tokens     = 0
 local completion_tokens = 0
 local total_tokens      = 0
+local cached_tokens     = 0
+local reasoning_tokens  = 0
+local model_name        = ""
 local meter_quality     = "none"
 if avi.http.get_reqvar("ai_meter") == "1" then
   local _body = avi.http.get_response_body(%d)
+  -- The value of a quoted JSON string key. Used for the model the backend
+  -- actually served, which is not always the one the caller asked for once model
+  -- routing has picked a tier.
+  local function _str_after(key)
+    if not _body then return "" end
+    local s = string.find(_body, key, 1, true)
+    if not s then return "" end
+    local q1 = string.find(_body, '"', s + #key, true)
+    if not q1 then return "" end
+    local q2 = string.find(_body, '"', q1 + 1, true)
+    if not q2 then return "" end
+    return string.sub(_body, q1 + 1, q2 - 1)
+  end
   local function _num_after(key)
     if not _body then return 0 end
     local s = string.find(_body, key, 1, true)
@@ -669,6 +689,13 @@ if avi.http.get_reqvar("ai_meter") == "1" then
   completion_tokens = _num_after('"completion_tokens"')
   total_tokens      = _num_after('"total_tokens"')
   if total_tokens == 0 then total_tokens = prompt_tokens + completion_tokens end
+  -- Kept as separate dimensions, not folded into the totals: a cached prompt
+  -- token and a fresh one cost very different amounts, and reasoning tokens are
+  -- billed as output the caller never sees. A ledger that sums them away cannot
+  -- ever produce a cost.
+  cached_tokens     = _num_after('"cached_tokens"')
+  reasoning_tokens  = _num_after('"reasoning_tokens"')
+  model_name        = _str_after('"model"')
   if total_tokens > 0 then
     meter_quality = "exact"
   elseif (_body and #_body >= %d) or avi.http.get_reqvar("ai_meter_enc") == "1" then
@@ -686,7 +713,7 @@ end
 -- Provenance for the usage ledger: only "exact" is a measurement. The budget may be
 -- charged a penalty; the reported figure must never present one as measured.
 pcall(function() avi.http.set_reqvar("ai_meter_quality", meter_quality) end)`,
-		RespBodyBufferKB, RespBodyBufferKB*1024, FailClosedTokens, FailClosedTokens, FailClosedTokens)
+		RespBodyBufferKB, RespBodyBufferBytes, FailClosedTokens, FailClosedTokens, FailClosedTokens)
 }
 
 // buildRespLimitBlock generates the Lua snippet that increments one counter in
