@@ -38,14 +38,21 @@ const DSTableName = "ai_tok"
 // in-flight buffered response).
 const RespBodyBufferKB = 256
 
-// FailClosedTokens is the conservative token amount charged when a buffered JSON
-// completion has no parseable `usage` — i.e. the body was truncated (larger than
-// RespBodyBufferKB) or compressed. Charging a large penalty (instead of 0) keeps
-// an over-buffer or unparseable response from slipping through the budget
-// unmetered; the response itself already reached the client, so this consumes the
-// consumer's budget so their *next* request is blocked. Derived from the buffer
-// size (~RespBodyBufferKB*1024/4 tokens) — a response that didn't fit must have
-// been at least this large.
+// FailClosedTokens is the conservative token amount charged when a response was
+// demonstrably UNREADABLE rather than merely usage-free: the body filled the
+// buffer (so `usage` sat past RespBodyBufferKB) or it arrived compressed. Charging
+// a large penalty instead of 0 keeps such a response from slipping through the
+// budget unmetered; it already reached the client, so this consumes the consumer's
+// budget and their *next* request is blocked. Derived from the buffer size
+// (~RespBodyBufferKB*1024/4 tokens) — a response that didn't fit was at least this
+// large.
+//
+// It must never be charged on absence of `usage` alone. A short 2xx JSON body with
+// no usage is simply not a completion, and charging it made one GET /v1/models
+// cost 65536 tokens and 429 a 500-token consumer for the rest of the window.
+//
+// It is a BUDGET figure, not a measurement: the ledger records it as
+// meter_quality="penalty" and must never sum it into reported consumption.
 const FailClosedTokens = RespBodyBufferKB * 1024 / 4
 
 // DSNameReq / DSNameResp / DSNameRespData are the suffixes appended to the VS
@@ -595,12 +602,15 @@ func buildReqLimitBlock(limit TokenLimit, epoch string) string {
 // buildBufferEnableBlock generates the HTTP_RESP Lua that decides whether a
 // response should be metered and, if so, enables response-body buffering and
 // records the decision in a request-scoped variable (ai_meter) for HTTP_RESP_DATA
-// to read. A response is metered only when it is a successful (2xx) POST with a
-// JSON content-type — so GET /metrics scrapes, health checks, streaming
-// text/event-stream responses, and error responses are all skipped (the SE never
-// buffers/scans a body that carries no usage, and errors aren't penalized).
-// get_method and status are pcall-guarded, so the gate degrades gracefully if a
-// function is unavailable in this event.
+// to read. A response is scanned when it is a successful (2xx) response with a JSON
+// content-type — so streaming text/event-stream responses and error responses are
+// skipped outright. Read-only JSON responses (GET /v1/models) still get scanned;
+// they simply parse no usage and, being short, are charged nothing. There is no
+// method test because avi.http.get_method does not exist on this SE build.
+//
+// status is called through a deferred closure, not `pcall(avi.http.status)`: this
+// sandbox raises on the *field access* for an unknown avi.http name, and the
+// argument is evaluated before pcall ever runs, so the bare form protects nothing.
 //
 // HTTP_RESP_DATA can't read headers, so the ai_meter reqvar is how that phase
 // learns "this response is metered" without re-sniffing the body.
@@ -609,11 +619,17 @@ func buildBufferEnableBlock() string {
 do
   local ct = avi.http.get_header("Content-Type") or ""
   local is_json = string.find(ct, "application/json", 1, true) ~= nil
-  local is_post = true
-  do local ok, m = pcall(avi.http.get_method); if ok and m then is_post = (m == "POST") end end
+  -- No method test here. avi.http.get_method does not exist on this SE build, and
+  -- the bare pcall(avi.http.get_method) form failed open (is_post kept its 'true'
+  -- default) — which is what charged read-only requests the full penalty. Truncation
+  -- evidence in HTTP_RESP_DATA decides fail-closed instead, so no method is needed.
   local is_ok = true
-  do local ok, s = pcall(avi.http.status); if ok then local n = tonumber(s); if n then is_ok = (n >= 200 and n < 300) end end end
-  if is_json and is_post and is_ok then
+  do local ok, s = pcall(function() return avi.http.status() end); if ok and s then local n = tonumber(s or 0); if n then is_ok = (n >= 200 and n < 300) end end end
+  -- A compressed body can never be parsed for 'usage'. Record that here, because
+  -- HTTP_RESP_DATA cannot read headers, so the penalty stays fail-closed for it.
+  local enc = avi.http.get_header("Content-Encoding") or ""
+  if enc ~= "" and enc ~= "identity" then avi.http.set_reqvar("ai_meter_enc", "1") end
+  if is_json and is_ok then
     avi.http.set_response_body_buffer_size(%d)
     avi.http.set_reqvar("ai_meter", "1")
   end
@@ -635,6 +651,7 @@ func buildUsageParseBlock() string {
 local prompt_tokens     = 0
 local completion_tokens = 0
 local total_tokens      = 0
+local meter_quality     = "none"
 if avi.http.get_reqvar("ai_meter") == "1" then
   local _body = avi.http.get_response_body(%d)
   local function _num_after(key)
@@ -652,15 +669,24 @@ if avi.http.get_reqvar("ai_meter") == "1" then
   completion_tokens = _num_after('"completion_tokens"')
   total_tokens      = _num_after('"total_tokens"')
   if total_tokens == 0 then total_tokens = prompt_tokens + completion_tokens end
-  -- Fail-closed: HTTP_RESP flagged this as a metered (2xx JSON POST) response, so
-  -- if its usage didn't parse the body was truncated (larger than the buffer) or
-  -- compressed. Charge a penalty so it can't slip through the budget unmetered.
-  if total_tokens == 0 then
+  if total_tokens > 0 then
+    meter_quality = "exact"
+  elseif (_body and #_body >= %d) or avi.http.get_reqvar("ai_meter_enc") == "1" then
+    -- Unreadable, not unmetered: the body filled the buffer (so 'usage' sat past its
+    -- end) or arrived compressed. Charge the penalty so a large completion cannot
+    -- slip through the budget. A SHORT body with no 'usage' is simply not a
+    -- completion (GET /v1/models, an error envelope) and now costs nothing — that
+    -- blanket charge was the whole reason a read-only request burned 65536 tokens.
     total_tokens      = %d
     prompt_tokens     = %d
     completion_tokens = %d
+    meter_quality     = "penalty"
   end
-end`, RespBodyBufferKB, FailClosedTokens, FailClosedTokens, FailClosedTokens)
+end
+-- Provenance for the usage ledger: only "exact" is a measurement. The budget may be
+-- charged a penalty; the reported figure must never present one as measured.
+pcall(function() avi.http.set_reqvar("ai_meter_quality", meter_quality) end)`,
+		RespBodyBufferKB, RespBodyBufferKB*1024, FailClosedTokens, FailClosedTokens, FailClosedTokens)
 }
 
 // buildRespLimitBlock generates the Lua snippet that increments one counter in
