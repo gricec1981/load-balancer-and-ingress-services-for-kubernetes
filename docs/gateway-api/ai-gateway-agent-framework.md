@@ -321,8 +321,14 @@ python3.12` is required, and the build pod reaches PyPI directly — verified.)
     verbs: ["get","list","create","update","patch","delete"]   # patch was missing
   ```
 
-  Until that is applied, provisioning any agent needs one manual
-  `oc create sa <name> -n mcp` followed by `oc rollout restart deploy/<name> -n mcp`.
+  `serviceaccounts` was granted on 2026-08-19 and a throwaway agent then provisioned
+  **9/9 green with no manual step**, start to ready. `services: patch` is still missing,
+  which only bites on *re-provisioning* an existing agent (the upsert POSTs, gets 409,
+  and the fallback PATCH 403s) — a first-time create is unaffected.
+
+  The teardown path had the mirror-image bug: it never deleted the ServiceAccount, so
+  every removed agent left an orphaned workload identity behind that the issuer would
+  still happily TokenReview. `DELETE /api/agents` now removes it, after the Deployment.
 
 ---
 
