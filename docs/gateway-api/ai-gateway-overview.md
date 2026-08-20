@@ -9,10 +9,13 @@ reconciled by AKO into native Avi features.
 
 The goal it is built toward is to govern the **whole agent loop under one verified identity** —
 inference calls to LLMs, tool calls to MCP servers, and agent↔agent delegation — all under the
-same authentication, the same policies, and the same usage accounting. Today that model is
-**available** for LLM inference, **implemented** for MCP tool traffic, and **in design** (not yet
-built) for agent↔agent. The capability table below states exactly where each piece stands; the
-sections that follow do not get ahead of it.
+same authentication, the same policies, and the same usage accounting. All three surfaces are
+now built. The capability table below states exactly where each piece stands; the sections that
+follow do not get ahead of it.
+
+> **New to this system?** Start with the **[Handbook](ai-gateway-handbook.md)** — architecture,
+> a console guide with screenshots, how-to guides, and the security posture in one document.
+> **[Release notes](ai-gateway-release-notes.md)** carry the full feature history.
 
 **New to Avi?** Two terms run through this doc. The **Avi Controller** is the control plane
 (configuration, API, analytics). The **Service Engine (SE)** is the data plane — the proxy that
@@ -50,6 +53,7 @@ The following capabilities are built and callable in the gateway today.
 | [Guardrails & DLP](#guardrails--dlp) | WAF-native data-loss prevention and content guardrails |
 | [MCP](#mcp-agenttool) | The same governance for agent↔tool (Model Context Protocol) traffic |
 | [Semantic Guardrails](#semantic-guardrails) | Model-based prompt-injection detection over ICAP, escalating past what WAF signatures catch |
+| [A2A](#a2a-agentagent) | Governance for agent↔agent (Agent2Agent) delegation traffic |
 
 The agent loop has three governance surfaces; the gateway covers the first two today:
 
@@ -57,7 +61,7 @@ The agent loop has three governance surfaces; the gateway covers the first two t
 |---|---|---|---|
 | agent ↔ model | OpenAI-style HTTP | [Authentication](#authentication) + [Model Routing](#model-routing) | **Available** |
 | agent ↔ tool | MCP (JSON-RPC + Streamable HTTP) | [MCP Gateway](#mcp-agenttool) | **Available** |
-| agent ↔ agent | A2A (JSON-RPC over HTTPS) | [A2A Gateway](#a2a-agentagent) | **Planned** |
+| agent ↔ agent | A2A (JSON-RPC over HTTPS) | [A2A Gateway](#a2a-agentagent) | **Available** |
 
 ---
 
@@ -190,6 +194,26 @@ the MCP Gateway is callable today.
 
 → [MCP Gateway & MCP-Specific Routes](ai-gateway-mcp.md)
 
+## A2A (agent↔agent)
+
+A2A governs the third surface: agents calling **other agents** — delegation and task hand-off
+over the Agent2Agent protocol (JSON-RPC over HTTPS). A dedicated **A2A Gateway** authenticates
+against the same identity provider, authorizes **per-skill** (each Agent Card advertises
+`skills[]`), pins long-running stateful tasks via session affinity, and governs
+push-notification egress so agents can only call approved webhooks. Unlike MCP — which Avi
+32.1.1 supports natively — A2A has no native Avi support and is built from generic primitives
+plus DataScripts, making it architecturally closer to model routing. Configured with an
+`AIA2ARoutePolicy`.
+
+**Built and running.** Each minted token is bound to one target agent by its `resource` claim,
+the agent-card skill is enforced at the Service Engine as well as at mint time, and two
+fail-closed switches (`requireMethod`, `authorizePaths`) mean no request reaches a backend
+without having been matched against something. Agents are catalogued in the
+[agent registry](ai-gateway-agent-registry.md) and provisioned by the
+[agent factory](ai-gateway-agent-factory.md).
+
+→ [A2A Gateway & Agent-to-Agent Routes](ai-gateway-a2a.md)
+
 ---
 
 ## Semantic Guardrails
@@ -216,24 +240,10 @@ The following are specified but not yet built. They are included here so the ful
 
 | Capability | What it provides |
 |---|---|
-| [A2A](#a2a-agentagent) | Governance for agent↔agent (Agent2Agent) delegation traffic |
 | [Backend mTLS](#backend-mtls-spiffespire) | SE↔backend mutual TLS with SPIFFE/SPIRE short-lived identity · *spike-gated* |
 | [Multi-Site Delivery](#multi-site-cross-cluster-delivery) | Cross-cluster model routing via AMKO + Avi GSLB · *spike-gated* |
 
 ---
-
-## A2A (agent↔agent)
-
-A2A governs the third surface: agents calling **other agents** — delegation and task hand-off
-over the Agent2Agent protocol (JSON-RPC over HTTPS). A dedicated **A2A Gateway** authenticates
-against the same identity provider, authorizes **per-skill** (each Agent Card advertises
-`skills[]`), pins long-running stateful tasks via session affinity, and governs
-push-notification egress so agents can only call approved webhooks. Unlike MCP — which Avi
-32.1.1 supports natively — A2A has no native Avi support and is built from generic primitives
-plus DataScripts, making it architecturally closer to model routing. Specified by a new
-`AIA2ARoutePolicy`. **In design**, not yet implemented.
-
-→ [A2A Gateway & Agent-to-Agent Routes](ai-gateway-a2a.md)
 
 ## Backend mTLS (SPIFFE/SPIRE)
 
@@ -270,6 +280,8 @@ behavior is *spike-gated*.
 
 ## Related docs
 
+- [Handbook](ai-gateway-handbook.md) — the whole system in one document: architecture, console
+  guide with screenshots, how-tos, security posture
 - [Native Inference Extension](inference-extension.md) — metric-weighted load balancing
 - [AI Gateway Authentication](ai-gateway-auth.md) — `AIGatewayAuthPolicy`, `oauthBrowser` + `jwtQuery`
 - [AI Gateway](ai-gateway.md) — authentication and token counting reference
