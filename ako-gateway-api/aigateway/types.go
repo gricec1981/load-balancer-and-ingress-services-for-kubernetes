@@ -21,6 +21,8 @@
 package aigateway
 
 import (
+	"strings"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -42,13 +44,13 @@ type AIGatewayAuthPolicy struct {
 	Status AIGatewayAuthPolicyStatus `json:"status,omitempty"`
 
 	// AdminSkipPath is read from AdminSkipPathAnnotation and controls the
-	// SKIP_AUTHENTICATION authn rule that keeps the read-only counters endpoint
+	// SKIP_AUTHENTICATION authn rule that keeps the read-only admin endpoints
 	// reachable by a client that cannot complete the IdP flow. Empty (the
-	// default) preserves the historical "/v1/admin/" prefix; a narrower prefix
-	// such as "/v1/admin/counters" shrinks what bypasses authentication; the
-	// literal "none" makes the SE validate the JWT before the DataScript runs
-	// (requires the counters endpoint to accept a claim — see
-	// AdminClaimAnnotation — and the caller to present a token).
+	// default) exempts exactly the endpoints the DataScript implements; a
+	// comma-separated list narrows or widens that; the literal "none" makes the
+	// SE validate the JWT before the DataScript runs (requires the endpoint to
+	// accept a claim — see AdminClaimAnnotation — and the caller to present a
+	// token).
 	//
 	// "none" flips the rule's action rather than removing it; see adminAuthnRules
 	// for why an empty rule list takes the whole gateway down.
@@ -56,33 +58,60 @@ type AIGatewayAuthPolicy struct {
 }
 
 // AdminSkipPathAnnotation, when set on an AIGatewayAuthPolicy, overrides the
-// path prefix exempted from authentication for the read-only admin endpoints.
-// Absent = "/v1/admin/" (historical behaviour). "none" = emit no skip rule.
+// paths exempted from authentication for the read-only admin endpoints. It
+// accepts a COMMA-SEPARATED list. Absent = DefaultAdminSkipPaths.
+// "none" = emit the rule but authenticate the paths.
 //
-// Rollback is an annotation edit: removing it restores the previous rule on the
+// Rollback is an annotation edit: removing it restores the default rule on the
 // next reconcile, with no image change.
 const AdminSkipPathAnnotation = "ai.ako.vmware.com/admin-skip-path"
 
-// DefaultAdminSkipPath is the historical exemption prefix. It is deliberately
-// broader than the single endpoint the DataScript implements, which is why it
-// is worth narrowing: any other path under it reaches the enforcement block
-// with no validated JWT (today it is stopped only by the unknown-group
-// fail-closed, i.e. by a limit whose Budget is 0).
+// DefaultAdminSkipPaths is the exemption set: exactly the admin endpoints the
+// generated DataScript implements, and nothing else.
+//
+// It is deliberately NOT the "/v1/admin/" prefix this once defaulted to. That
+// prefix exempted paths no endpoint serves, and each of them reached the
+// enforcement block with no validated JWT — stopped only by the unknown-group
+// fail-closed, i.e. by a limit whose Budget happens to be 0.
+//
+// This must list EVERY admin endpoint buildable from a token policy. A single
+// prefix could not, which is how /v1/admin/usage came to 401 on a live gateway
+// whose operator had (correctly) narrowed the annotation to the one endpoint
+// that existed at the time: the exemption was pinned to a path list that the
+// code then grew past. Adding an endpoint means adding it here.
+var DefaultAdminSkipPaths = []string{"/v1/admin/counters", "/v1/admin/usage"}
+
+// DefaultAdminSkipPath is retained for callers that want the historical prefix
+// as a single string. Prefer DefaultAdminSkipPaths.
 const DefaultAdminSkipPath = "/v1/admin/"
 
-// EffectiveAdminSkipPath returns the admin path prefix the authn rule matches,
-// and whether that rule should SKIP authentication for it. A false second value
-// means "match the same path, but authenticate it normally" — the rule is still
-// emitted (see adminAuthnRules).
-func (p *AIGatewayAuthPolicy) EffectiveAdminSkipPath() (string, bool) {
+// EffectiveAdminSkipPaths returns the admin paths the authn rule matches, and
+// whether that rule should SKIP authentication for them. A false second value
+// means "match the same paths, but authenticate them normally" — the rule is
+// still emitted (see adminAuthnRules).
+//
+// The Avi authn rule's path match already takes a list of strings, so several
+// exempt endpoints cost one rule, not one rule each. That matters: rule count is
+// exactly what the empty-rule-list failure is sensitive to.
+func (p *AIGatewayAuthPolicy) EffectiveAdminSkipPaths() ([]string, bool) {
 	switch p.AdminSkipPath {
 	case "":
-		return DefaultAdminSkipPath, true
+		return DefaultAdminSkipPaths, true
 	case "none":
-		return DefaultAdminSkipPath, false
-	default:
-		return p.AdminSkipPath, true
+		return DefaultAdminSkipPaths, false
 	}
+	var out []string
+	for _, part := range strings.Split(p.AdminSkipPath, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	// An annotation of only separators would otherwise produce an empty match
+	// list, which is the same class of failure as an empty rule list.
+	if len(out) == 0 {
+		return DefaultAdminSkipPaths, true
+	}
+	return out, true
 }
 
 // AuthClaimMode selects how the Avi SE validates the caller's JWT and how the

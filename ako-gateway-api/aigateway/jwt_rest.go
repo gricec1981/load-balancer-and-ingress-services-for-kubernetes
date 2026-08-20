@@ -197,7 +197,7 @@ const (
 // — observed live 2026-08-16 on the LLM front door, recovered by reverting the
 // annotation.
 func adminAuthnRules(policy *AIGatewayAuthPolicy) []*avimodels.AuthenticationRule {
-	path, skip := policy.EffectiveAdminSkipPath()
+	paths, skip := policy.EffectiveAdminSkipPaths()
 	action := authnActionSkip
 	if !skip {
 		action = authnActionDefault
@@ -212,7 +212,7 @@ func adminAuthnRules(policy *AIGatewayAuthPolicy) []*avimodels.AuthenticationRul
 		Match: &avimodels.AuthenticationMatch{
 			Path: &avimodels.PathMatch{
 				MatchCriteria: proto.String("BEGINS_WITH"),
-				MatchStr:      []string{path},
+				MatchStr:      paths,
 			},
 		},
 	}}

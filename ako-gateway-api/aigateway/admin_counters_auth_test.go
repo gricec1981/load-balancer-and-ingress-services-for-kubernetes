@@ -150,24 +150,64 @@ func TestNoCredentialEmitsNoEndpoint(t *testing.T) {
 	}
 }
 
-func TestEffectiveAdminSkipPath(t *testing.T) {
+func TestEffectiveAdminSkipPaths(t *testing.T) {
 	cases := []struct {
 		annotation string
-		wantPath   string
+		wantPaths  []string
 		wantSkip   bool
 	}{
-		{"", DefaultAdminSkipPath, true},                   // untouched: historical behaviour
-		{"/v1/admin/counters", "/v1/admin/counters", true}, // narrowed
-		{"none", DefaultAdminSkipPath, false},              // same path, authenticated instead
+		// Default: exactly the endpoints the DataScript implements.
+		{"", DefaultAdminSkipPaths, true},
+		// Narrowed to one.
+		{"/v1/admin/counters", []string{"/v1/admin/counters"}, true},
+		// A list — the case a single prefix could not express, and the reason
+		// /v1/admin/usage 401'd on a gateway narrowed before that endpoint existed.
+		{"/v1/admin/counters,/v1/admin/usage",
+			[]string{"/v1/admin/counters", "/v1/admin/usage"}, true},
+		{" /v1/admin/counters , /v1/admin/usage ",
+			[]string{"/v1/admin/counters", "/v1/admin/usage"}, true},
+		// Same paths, authenticated instead of exempted.
+		{"none", DefaultAdminSkipPaths, false},
+		// Separators only: must not yield an empty match list.
+		{",, ,", DefaultAdminSkipPaths, true},
 	}
 	for _, c := range cases {
 		p := &AIGatewayAuthPolicy{AdminSkipPath: c.annotation}
-		got, skip := p.EffectiveAdminSkipPath()
-		if got != c.wantPath || skip != c.wantSkip {
-			t.Errorf("AdminSkipPath=%q: got (%q,%v), want (%q,%v)",
-				c.annotation, got, skip, c.wantPath, c.wantSkip)
+		got, skip := p.EffectiveAdminSkipPaths()
+		if skip != c.wantSkip || !sameStrings(got, c.wantPaths) {
+			t.Errorf("AdminSkipPath=%q: got (%v,%v), want (%v,%v)",
+				c.annotation, got, skip, c.wantPaths, c.wantSkip)
 		}
 	}
+}
+
+// Every admin endpoint the generated DataScript answers must be in the default
+// exemption set, or the SE 401s it before the script ever runs. That is exactly
+// how /v1/admin/usage failed on a live gateway: the code grew a second endpoint
+// past a path list that only named the first.
+func TestDefaultSkipPathsCoverEveryAdminEndpoint(t *testing.T) {
+	req := GenerateTokenAccountingScripts(countersPolicy(), ClaimModeJWTQuery).ReqScript
+	for _, ep := range []string{"/v1/admin/counters", UsageDrainPath} {
+		if !strings.Contains(req, `== "`+ep+`"`) {
+			continue // this build does not serve that endpoint
+		}
+		if !contains(DefaultAdminSkipPaths, ep) {
+			t.Errorf("the DataScript serves %s but DefaultAdminSkipPaths does not exempt it (%v) "+
+				"— the SE will 401 it before the script runs", ep, DefaultAdminSkipPaths)
+		}
+	}
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Regression guard for a live outage: emitting an SSO policy with NO authn rules
@@ -179,14 +219,19 @@ func TestAdminAuthnRulesNeverEmpty(t *testing.T) {
 	cases := []struct {
 		annotation string
 		wantAction string
-		wantPath   string
+		wantPaths  []string
 	}{
-		{"", authnActionSkip, DefaultAdminSkipPath},
-		{"/v1/admin/counters", authnActionSkip, "/v1/admin/counters"},
-		{"none", authnActionDefault, DefaultAdminSkipPath},
+		{"", authnActionSkip, DefaultAdminSkipPaths},
+		{"/v1/admin/counters", authnActionSkip, []string{"/v1/admin/counters"}},
+		{"/v1/admin/counters,/v1/admin/usage", authnActionSkip,
+			[]string{"/v1/admin/counters", "/v1/admin/usage"}},
+		{"none", authnActionDefault, DefaultAdminSkipPaths},
+		{",, ,", authnActionSkip, DefaultAdminSkipPaths},
 	}
 	for _, c := range cases {
 		rules := adminAuthnRules(&AIGatewayAuthPolicy{AdminSkipPath: c.annotation})
+		// Several exempt paths must still cost exactly ONE rule: the Avi path
+		// match takes a list, and rule count is what the outage was sensitive to.
 		if len(rules) != 1 {
 			t.Fatalf("AdminSkipPath=%q: got %d authn rules, want exactly 1 — "+
 				"an empty rule list takes the whole gateway down", c.annotation, len(rules))
@@ -195,9 +240,12 @@ func TestAdminAuthnRulesNeverEmpty(t *testing.T) {
 		if r.Action == nil || r.Action.Type == nil || *r.Action.Type != c.wantAction {
 			t.Errorf("AdminSkipPath=%q: action = %v, want %q", c.annotation, r.Action, c.wantAction)
 		}
-		if r.Match == nil || r.Match.Path == nil || len(r.Match.Path.MatchStr) != 1 ||
-			r.Match.Path.MatchStr[0] != c.wantPath {
-			t.Errorf("AdminSkipPath=%q: match path = %v, want %q", c.annotation, r.Match, c.wantPath)
+		if r.Match == nil || r.Match.Path == nil || !sameStrings(r.Match.Path.MatchStr, c.wantPaths) {
+			t.Errorf("AdminSkipPath=%q: match paths = %v, want %v",
+				c.annotation, r.Match.Path.MatchStr, c.wantPaths)
+		}
+		if len(r.Match.Path.MatchStr) == 0 {
+			t.Errorf("AdminSkipPath=%q: empty match list", c.annotation)
 		}
 		if r.Enable == nil || !*r.Enable {
 			t.Errorf("AdminSkipPath=%q: rule is not enabled", c.annotation)
