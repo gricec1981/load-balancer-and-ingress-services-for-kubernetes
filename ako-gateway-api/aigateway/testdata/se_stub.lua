@@ -133,8 +133,13 @@ avi = strict("avi", { http = http, vs = vs, pool = pool, HTTP_REQUEST = 1 })
 
 -- run loads and executes one generated phase script. A syntax error here is the
 -- failure mode that would 500 the live front door, so it is reported loudly.
+-- loadstring on 5.1, load on 5.2+. The SE runs an older Lua than a dev box, so
+-- the harness has to be runnable on both: a script that only compiles under 5.3
+-- is not evidence about the SE.
+local _compile = loadstring or load
+
 function M.run(name, src)
-  local chunk, err = load(src, name)
+  local chunk, err = _compile(src, name)
   if not chunk then error("SYNTAX ERROR in " .. name .. ": " .. tostring(err), 0) end
   local ok, rerr = pcall(chunk)
   if not ok then error("RUNTIME ERROR in " .. name .. ": " .. tostring(rerr), 0) end
