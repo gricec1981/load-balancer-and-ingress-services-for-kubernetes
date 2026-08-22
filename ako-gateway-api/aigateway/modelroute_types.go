@@ -121,6 +121,52 @@ type ModelTier struct {
 	// SE never proxies for it — it forwards the OpenAI-shaped request unchanged.
 	// +optional
 	Provider *ModelProvider `json:"provider,omitempty"`
+
+	// Remote routes this tier to a peer AI Gateway at another site, reached by its
+	// FQDN over the Service Engine's egress. AKO authors an FQDN pool — the SE
+	// resolves and re-resolves the name itself — so the peer's VIP may change
+	// without an EndpointSlice to maintain and without cross-cluster credentials.
+	// Unlike Provider the peer is not a vendor: the request is forwarded unchanged
+	// apart from the Host header, and its response is metered normally.
+	// +optional
+	Remote *ModelRemote `json:"remote,omitempty"`
+}
+
+// ModelRemote describes a peer AI Gateway at another site.
+//
+// The peer is addressed by name, never by IP. The pool server is that FQDN with
+// resolve_server_by_dns set, so DNS is consulted by the Service Engine as a name
+// lookup at connection time — not as a client-side site-selection mechanism the
+// way GSLB uses it. Which site serves a request is decided here, by tier
+// selection, after the model has been read from the request body.
+type ModelRemote struct {
+	// Host is the peer gateway's FQDN (e.g. llm.siteb.ai.avi.com). It must resolve
+	// on a DNS server the Service Engines query, and should resolve to a single
+	// address — every A record returned becomes a pool server.
+	Host string `json:"host"`
+
+	// Port defaults to 443.
+	// +optional
+	Port int32 `json:"port,omitempty"`
+
+	// TLS enables backend TLS to the peer. SNI is the server hostname, i.e. Host.
+	// Defaults to true.
+	// +optional
+	TLS *bool `json:"tls,omitempty"`
+
+	// PreserveHost keeps the client's original Host header instead of rewriting it
+	// to Host. Set it only when the peer serves the same FQDN as this gateway; by
+	// default the Host is rewritten so the peer's EVH child VS matches. Defaults
+	// to false.
+	// +optional
+	PreserveHost *bool `json:"preserveHost,omitempty"`
+
+	// HealthPath is the path a health monitor requests to decide whether the peer
+	// is up. Defaults to "/v1/models". Set "-" to attach no monitor, in which case
+	// the pool counts as up whenever the name resolves — which makes failover to a
+	// lower-preference tier meaningless.
+	// +optional
+	HealthPath string `json:"healthPath,omitempty"`
 }
 
 // ModelProvider describes an external OpenAI-compatible provider endpoint.
@@ -165,6 +211,33 @@ type ProviderSecretRef struct {
 
 // IsProvider reports whether this tier routes to an external provider.
 func (t *ModelTier) IsProvider() bool { return t.Provider != nil }
+
+// IsRemote reports whether this tier routes to a peer gateway at another site.
+func (t *ModelTier) IsRemote() bool { return t.Remote != nil }
+
+// EffectivePort returns the peer port (default 443).
+func (r *ModelRemote) EffectivePort() int32 {
+	if r.Port > 0 {
+		return r.Port
+	}
+	return 443
+}
+
+// EffectiveTLS reports whether backend TLS to the peer is on (default true).
+func (r *ModelRemote) EffectiveTLS() bool { return r.TLS == nil || *r.TLS }
+
+// EffectivePreserveHost reports whether the client's Host header is kept
+// (default false — the Host is rewritten to the peer's FQDN).
+func (r *ModelRemote) EffectivePreserveHost() bool { return r.PreserveHost != nil && *r.PreserveHost }
+
+// EffectiveHealthPath returns the health-monitor path (default /v1/models);
+// "-" means attach no monitor.
+func (r *ModelRemote) EffectiveHealthPath() string {
+	if r.HealthPath != "" {
+		return r.HealthPath
+	}
+	return "/v1/models"
+}
 
 // EffectivePort returns the provider port (default 443).
 func (p *ModelProvider) EffectivePort() int32 {
@@ -427,15 +500,26 @@ func (s *AIModelRoutePolicySpec) Validate() error {
 		if known[t.Name] {
 			return fmt.Errorf("duplicate tier name %q", t.Name)
 		}
-		if t.IsProvider() {
+		if t.IsProvider() && t.IsRemote() {
+			return fmt.Errorf("tier %q: provider and remote are mutually exclusive", t.Name)
+		}
+		switch {
+		case t.IsProvider():
 			if t.Provider.Host == "" || t.Provider.Path == "" {
 				return fmt.Errorf("tier %q: provider requires host and path", t.Name)
 			}
 			if t.Provider.Auth != nil && t.Provider.Auth.SecretRef.Name == "" {
 				return fmt.Errorf("tier %q: provider.auth requires secretRef.name", t.Name)
 			}
-		} else if t.BackendRef.Name == "" {
-			return fmt.Errorf("tier %q: backendRef.name or provider is required", t.Name)
+		case t.IsRemote():
+			if t.Remote.Host == "" {
+				return fmt.Errorf("tier %q: remote requires host", t.Name)
+			}
+			if strings.ContainsAny(t.Remote.Host, "/: ") {
+				return fmt.Errorf("tier %q: remote.host %q must be a bare FQDN (no scheme, port or path)", t.Name, t.Remote.Host)
+			}
+		case t.BackendRef.Name == "":
+			return fmt.Errorf("tier %q: backendRef.name, provider or remote is required", t.Name)
 		}
 		known[t.Name] = true
 	}

@@ -25,6 +25,10 @@ M.env = {
   now = 1000000, path = "/v1/chat/completions", query = "", clientip = "10.1.2.3",
   status = 200, body = nil, reqheaders = {}, respheaders = {}, reqvars = {},
   resp = nil, buffered = nil,
+  -- What avi.vs.log wrote for this request, in order. This is the client-log
+  -- text an operator reads in Analytics > Logs, so a spec can assert on the
+  -- thing the demo actually shows rather than on the source that produced it.
+  logs = {},
 }
 
 function M.reset_request(over)
@@ -37,7 +41,42 @@ function M.reset_request(over)
   M.env.reqvars = {}
   M.env.resp = nil
   M.env.buffered = nil
+  M.env.logs = {}
   for k, v in pairs(over or {}) do M.env[k] = v end
+end
+
+-- ── Interleaving (concurrency) support ───────────────────────────────────────
+
+-- A DataScript is not the only thing running on its SE. A VS is served by many
+-- dispatcher cores at once and they share this one table, so two responses can
+-- be between the same two table calls at the same instant. Nothing in the API
+-- makes a read-modify-write atomic, and a single-threaded harness can never see
+-- that -- it runs every script to completion before starting the next.
+--
+-- M.interleave_at makes the schedule explicit instead: the named table op yields
+-- the running coroutine, so the spec chooses the interleaving rather than hoping
+-- to observe one. Set to nil for ordinary sequential runs.
+M.interleave_at = nil
+
+function M.trace(op, key)
+  local at = M.interleave_at
+  if at and at.op == op and at.key == key and coroutine.isyieldable ~= nil then
+    if coroutine.isyieldable() then coroutine.yield(op .. " " .. key) end
+  elseif at and at.op == op and at.key == key then
+    -- 5.1 has no coroutine.isyieldable; yielding outside a coroutine raises, so
+    -- ask the running coroutine instead.
+    if coroutine.running() then coroutine.yield(op .. " " .. key) end
+  end
+end
+
+-- chunk compiles a generated script WITHOUT the pcall wrapper M.run uses. Lua
+-- 5.1 cannot yield across a pcall boundary, and the whole point here is to yield
+-- from inside the script, so the concurrency spec runs the bare chunk.
+function M.chunk(name, src)
+  local _c = loadstring or load
+  local fn, err = _c(src, name)
+  if not fn then error("SYNTAX ERROR in " .. name .. ": " .. tostring(err), 0) end
+  return fn
 end
 
 -- ── Sandbox fidelity ─────────────────────────────────────────────────────────
@@ -107,18 +146,27 @@ local http = strict("avi.http", {
 
 local vs = strict("avi.vs", {
   client_ip = function() return env.clientip end,
+  -- Writes a line into this request's client log entry (and marks the entry
+  -- significant, which is why a script must not call it unconditionally on a
+  -- high-volume VS).
+  log = function(msg) env.logs[#env.logs + 1] = tostring(msg) end,
   table_lookup = function(k)
+    M.trace("lookup", k)
     local e = M.T[k]
     if e and e.exp > env.now then return e.v end
     return nil
   end,
   -- A true insert. The generated scripts remove first for exactly this reason.
   table_insert = function(k, v, ttl)
+    M.trace("insert", k)
     local e = M.T[k]
     if e and e.exp > env.now then return end
     M.T[k] = { v = v, exp = env.now + ttl }
   end,
-  table_remove = function(k) M.T[k] = nil end,
+  table_remove = function(k)
+    M.trace("remove", k)
+    M.T[k] = nil
+  end,
 })
 
 local pool = strict("avi.pool", {

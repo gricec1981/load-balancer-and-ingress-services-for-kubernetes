@@ -156,6 +156,47 @@ spec:
                               description: Value prefix. Default "Bearer". Set "" for a raw key.
                               type: string
                               default: Bearer
+                    remote:
+                      description: |-
+                        remote routes this tier to a peer AI Gateway at another site,
+                        reached by its FQDN over the Service Engine's egress. AKO authors
+                        an FQDN pool — the SE resolves and re-resolves the name itself —
+                        so the peer's VIP may change with no EndpointSlice to maintain and
+                        no credentials for the peer's cluster. Unlike provider the peer is
+                        not a vendor: the request is forwarded unchanged apart from the
+                        Host header, and its response is metered normally.
+                        Mutually exclusive with backendRef and provider.
+                      type: object
+                      required:
+                      - host
+                      properties:
+                        host:
+                          description: |-
+                            Peer gateway FQDN, e.g. llm.siteb.ai.avi.com. Must resolve on a DNS
+                            server the Service Engines query, and should resolve to a single
+                            address — every A record returned becomes a pool server.
+                          type: string
+                        port:
+                          type: integer
+                          default: 443
+                        tls:
+                          description: Backend TLS to the peer. SNI is host. Default true.
+                          type: boolean
+                          default: true
+                        preserveHost:
+                          description: |-
+                            Keep the client's Host header instead of rewriting it to host. Set
+                            only when the peer serves the same FQDN as this gateway; by default
+                            the Host is rewritten so the peer's EVH child VS matches.
+                          type: boolean
+                          default: false
+                        healthPath:
+                          description: |-
+                            Path a health monitor requests to decide whether the peer is up.
+                            Set "-" for no monitor, in which case the pool counts as up whenever
+                            the name resolves and failing over to another tier is meaningless.
+                          type: string
+                          default: /v1/models
               modelTiers:
                 description: |-
                   modelTiers maps a requested model name to a tier name. Keys may be an

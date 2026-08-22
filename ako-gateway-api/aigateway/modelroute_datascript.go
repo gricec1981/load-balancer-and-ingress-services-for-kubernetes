@@ -64,7 +64,7 @@ type ModelRouteScripts struct {
 // Every Pool Group named here must also be listed in the DataScriptSet's
 // pool_group_refs, or Avi rejects the script (HTTP 400) — see the model-routing
 // design doc.
-func GenerateModelRouteScripts(policy *AIModelRoutePolicy, tierPG map[string]string, providers map[string]*ProviderRuntime, mode AuthClaimMode) ModelRouteScripts {
+func GenerateModelRouteScripts(policy *AIModelRoutePolicy, tierPG map[string]string, providers map[string]*ProviderRuntime, remotes map[string]*RemoteRuntime, mode AuthClaimMode) ModelRouteScripts {
 	spec := policy.Spec
 
 	reqScript := fmt.Sprintf(
@@ -81,6 +81,7 @@ func GenerateModelRouteScripts(policy *AIModelRoutePolicy, tierPG map[string]str
 	fmt.Fprintf(&b, "local DEFAULT_TIER = %s\n", luaStr(spec.DefaultTier))
 	b.WriteString(luaStringMap("TIER_PG", tierPG))
 	b.WriteString(luaProviders("PROVIDERS", providers))
+	b.WriteString(luaRemotes("REMOTES", remotes))
 	b.WriteString(luaList("PREF", spec.tierNames()))
 
 	entitled := spec.Entitlements != nil && len(spec.Entitlements.Rules) > 0
@@ -116,7 +117,11 @@ if not tier then tier = DEFAULT_TIER end
 `)
 
 	// ── Entitlement (only when configured) ──────────────────────────────────
+	// _rt remembers the tier the caller's model actually asked for, because a
+	// downgrade overwrites `tier` in place. Without it the log below can say
+	// which tier served the request but never that it was not the one requested.
 	if entitled {
+		b.WriteString("\nlocal _rt = tier\n")
 		status := spec.OnUnentitled.EffectiveStatusCode()
 		reject := fmt.Sprintf(
 			`avi.http.response(%d, {["Content-Type"]="application/json"}, '{"error":"tier_not_entitled"}') return`,
@@ -161,6 +166,50 @@ if _pv then
   pcall(function() avi.http.set_reqvar("ai_skip_meter", "1") end)
 end`)
 	}
+
+	// ── Remote-site tier: rewrite Host so the peer's EVH child VS matches ────
+	// That is the whole rewrite. A peer gateway speaks our dialect, so the path,
+	// the body and the caller's Authorization header all pass through untouched,
+	// and the response is metered here exactly as a local tier's would be — a
+	// remote tier must not silently stop counting tokens. Host rewriting is
+	// skipped when the peer serves the same FQDN (remote.preserveHost).
+	if len(remotes) > 0 {
+		b.WriteString(`
+local _rm = REMOTES[tier]
+if _rm and _rm.h ~= "" then avi.http.replace_header("Host", _rm.h) end`)
+	}
+
+	// ── Name the routing decision in the VS client log ──────────────────────
+	// Everything else the client log records about this request is a hash: under
+	// EVH the pool and pool-group names are `<prefix>--<sha1>`, so the log can
+	// show that two requests went to different backends but never that one asked
+	// for qwen3-14b and was served by the GPU tier. This line puts the decision
+	// itself — model, tier, and whether entitlement moved it — in the entry.
+	//
+	// The closure form of pcall is load-bearing, not style: an unknown avi.* field
+	// RAISES on access, and `pcall(avi.vs.log, _l)` evaluates that access before
+	// pcall is entered. Wrapped this way, an SE build without the API costs a
+	// missing log line rather than a 500 on the front door.
+	b.WriteString(`
+do
+  local _l = "ai-gateway: model=" .. (model ~= "" and model or "-") .. " tier=" .. tier`)
+	if entitled {
+		b.WriteString(`
+  if _rt ~= tier then _l = _l .. " requested=" .. _rt .. " downgraded=1" end`)
+	}
+	b.WriteString(`
+  _l = _l .. " pool-group=" .. (pg or "-")`)
+	if len(providers) > 0 {
+		b.WriteString(`
+  if _pv then _l = _l .. " provider=" .. _pv.h end`)
+	}
+	if len(remotes) > 0 {
+		b.WriteString(`
+  if _rm then _l = _l .. " remote=" .. _rm.h end`)
+	}
+	b.WriteString(`
+  pcall(function() avi.vs.log(_l) end)
+end`)
 
 	b.WriteString("\npcall(function() avi.http.set_reqvar(\"ai_tier\", tier) end)")
 
@@ -253,6 +302,24 @@ func luaProviders(name string, providers map[string]*ProviderRuntime) string {
 		p := providers[t]
 		parts = append(parts, fmt.Sprintf("[%s]={p=%s, h=%s, ah=%s, av=%s}",
 			luaStr(t), luaStr(p.Path), luaStr(p.Host), luaStr(p.AuthHeader), luaStr(p.AuthValue)))
+	}
+	return fmt.Sprintf("local %s = { %s }\n", name, strings.Join(parts, ", "))
+}
+
+// luaRemotes renders the per-tier remote-site table:
+//
+//	local <name> = { ["premium-eu"]={h="llm.siteb.ai.avi.com"} }
+//
+// h is the Host header to send to the peer, or "" to preserve the client's.
+func luaRemotes(name string, remotes map[string]*RemoteRuntime) string {
+	tiers := make([]string, 0, len(remotes))
+	for t := range remotes {
+		tiers = append(tiers, t)
+	}
+	sort.Strings(tiers)
+	var parts []string
+	for _, t := range tiers {
+		parts = append(parts, fmt.Sprintf("[%s]={h=%s}", luaStr(t), luaStr(remotes[t].Host)))
 	}
 	return fmt.Sprintf("local %s = { %s }\n", name, strings.Join(parts, ", "))
 }

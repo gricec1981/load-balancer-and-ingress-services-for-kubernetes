@@ -100,23 +100,19 @@ func EnsureProviderTier(key string, policy *AIModelRoutePolicy, tier ModelTier) 
 	poolName := providerPoolName(policy.Namespace, policy.Name, tier.Name)
 	pgName := providerPoolGroupName(policy.Namespace, policy.Name, tier.Name)
 
-	pool := map[string]interface{}{
-		"name":                poolName,
-		"tenant_ref":          tenantRef,
-		"cloud_ref":           cloudRef,
-		"default_server_port": prov.EffectivePort(),
-		// FQDN server: the SE resolves it by DNS and re-resolves on rotation, so a
-		// public API served from many IPs (Google) stays reachable without pinning.
-		"servers": []map[string]interface{}{{
-			"hostname":             prov.Host,
-			"resolve_server_by_dns": true,
-		}},
-	}
-	if prov.EffectiveTLS() {
-		// Backend TLS + SNI to the provider host (System-Standard is a stock profile).
-		pool["ssl_profile_ref"] = "/api/sslprofile/?name=System-Standard"
-	}
-	if err := postOrPut(client, "/api/pool", poolName, pool); err != nil {
+	// A provider pool is an FQDN pool: the SE resolves the vendor's name itself, so
+	// a public API served from many rotating IPs (Google) stays reachable without
+	// pinning. Remote-site tiers use the same builder for the same reason — see
+	// ensureFQDNPool in modelroute_remote_rest.go. No health monitor: a vendor API
+	// is not ours to probe, and there is nowhere to fail over to.
+	if err := ensureFQDNPool(client, fqdnPoolSpec{
+		Name:      poolName,
+		TenantRef: tenantRef,
+		CloudRef:  cloudRef,
+		Host:      prov.Host,
+		Port:      prov.EffectivePort(),
+		TLS:       prov.EffectiveTLS(),
+	}); err != nil {
 		return nil, err
 	}
 
@@ -151,25 +147,11 @@ func EnsureProviderTier(key string, policy *AIModelRoutePolicy, tier ModelTier) 
 func DeleteProviderTiers(key string, policy *AIModelRoutePolicy) {
 	tenant := lib.GetTenantInNamespace(policy.Namespace)
 	client := avicache.SharedAVIClients(tenant).AviClient[0]
-	delByName := func(api, name string) {
-		var check struct {
-			Count   int `json:"count"`
-			Results []struct {
-				UUID string `json:"uuid"`
-			} `json:"results"`
-		}
-		_ = lib.AviGet(client, api+"?name="+name, &check)
-		if check.Count > 0 {
-			if err := lib.AviDelete(client, api+"/"+check.Results[0].UUID); err != nil {
-				utils.AviLog.Warnf("key: %s, msg: delete %s/%s failed: %v", key, api, name, err)
-			}
-		}
-	}
 	for _, t := range policy.Spec.Tiers {
 		if !t.IsProvider() {
 			continue
 		}
-		delByName("/api/poolgroup", providerPoolGroupName(policy.Namespace, policy.Name, t.Name))
-		delByName("/api/pool", providerPoolName(policy.Namespace, policy.Name, t.Name))
+		deleteAviObjectByName(key, client, "/api/poolgroup", providerPoolGroupName(policy.Namespace, policy.Name, t.Name))
+		deleteAviObjectByName(key, client, "/api/pool", providerPoolName(policy.Namespace, policy.Name, t.Name))
 	}
 }

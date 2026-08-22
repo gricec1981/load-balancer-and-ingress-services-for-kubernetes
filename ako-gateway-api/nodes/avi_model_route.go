@@ -67,6 +67,7 @@ func (o *AviObjectGraph) ApplyModelRoutePolicy(key string, policy *akogatewayapi
 	// Build one Pool Group per tier and collect tier→PG-name for the DataScript.
 	tierPG := make(map[string]string, len(policy.Spec.Tiers))
 	providers := make(map[string]*akogatewayapiaigateway.ProviderRuntime)
+	remotes := make(map[string]*akogatewayapiaigateway.RemoteRuntime)
 	var pgRefNames []string
 	for _, tier := range policy.Spec.Tiers {
 		// External-provider tier (e.g. Gemini): AKO authors an FQDN pool + pool
@@ -82,6 +83,21 @@ func (o *AviObjectGraph) ApplyModelRoutePolicy(key string, policy *akogatewayapi
 			tierPG[tier.Name] = rt.PGName
 			pgRefNames = append(pgRefNames, rt.PGName)
 			providers[tier.Name] = rt
+			continue
+		}
+		// Remote-site tier: a peer AI Gateway at another site, addressed by FQDN.
+		// Same shape as a provider tier — an FQDN pool + pool group authored over
+		// REST, selected by the DataScript — but the SE resolves a peer VIP rather
+		// than a vendor's rotating addresses, and nothing is rewritten except Host.
+		if tier.IsRemote() {
+			rt, err := akogatewayapiaigateway.EnsureRemoteTier(key, policy, tier)
+			if err != nil {
+				utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: remote setup failed: %v", key, policy.Namespace, policy.Name, tier.Name, err)
+				continue
+			}
+			tierPG[tier.Name] = rt.PGName
+			pgRefNames = append(pgRefNames, rt.PGName)
+			remotes[tier.Name] = rt
 			continue
 		}
 		if tier.BackendRef.Kind != lib.InferencePool && tier.BackendRef.Kind != utils.Service {
@@ -125,7 +141,7 @@ func (o *AviObjectGraph) ApplyModelRoutePolicy(key string, policy *akogatewayapi
 		return
 	}
 
-	scripts := akogatewayapiaigateway.GenerateModelRouteScripts(policy, tierPG, providers, mode)
+	scripts := akogatewayapiaigateway.GenerateModelRouteScripts(policy, tierPG, providers, remotes, mode)
 	vsName := childVsNode.Name
 	// HTTP_REQ: enable request-body buffering (no pool refs needed).
 	attachModelRouteDS(childVsNode, akogatewayapiaigateway.DSModelRouteReqName(vsName),

@@ -136,8 +136,10 @@ func SetupModelRoutePolicyEventHandlers(
 			if p != nil {
 				// Re-enqueue before deleting so the translator sees the last targetRef.
 				enqueueTargetRoute(ns, p.Spec.TargetRef.Name, lib.AIModelRoutePolicy, workqueues, numWorkers)
-				// Tear down any AKO-authored external-provider pools/pool groups.
+				// Tear down any AKO-authored FQDN pools/pool groups (external providers
+				// and remote-site peers); node-graph tiers are cleaned by the translator.
 				DeleteProviderTiers("AIModelRoutePolicy/"+ns+"/"+name, p)
+				DeleteRemoteTiers("AIModelRoutePolicy/"+ns+"/"+name, p)
 			}
 			ps.deleteModelRoutePolicy(ns, name)
 		},
