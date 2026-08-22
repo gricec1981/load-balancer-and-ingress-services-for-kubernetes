@@ -24,6 +24,19 @@ const (
 	AKOCRDController          = "AKOCRDController"
 	CRDOperatorPrefix         = "ako-crd-operator-"
 	HTTPRouteAcceptedMessage  = "Parent reference is valid"
+
+	// SurfaceLabel on an HTTPRoute declares which AI Gateway surface the route
+	// serves. It leads the object name when readable names are enabled, so that an
+	// LLM route, an MCP tool server and an agent are told apart at a glance in the
+	// Avi UI. The surface is read from the route itself rather than inferred from an
+	// attached AI*RoutePolicy on purpose: the policy store is filled by informer
+	// events with no ordering guarantee against route processing, so inferring it
+	// would rename objects non deterministically on restart.
+	SurfaceLabel = "ai.ako.vmware.com/surface"
+
+	SurfaceLLM   = "llm"
+	SurfaceMCP   = "mcp"
+	SurfaceAgent = "agent"
 )
 
 const (

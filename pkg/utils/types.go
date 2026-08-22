@@ -224,6 +224,10 @@ type AviObjectMarkers struct {
 	HTTPRouteRuleName  string
 	BackendName        string
 	BackendNs          string
+	// Surface is the AI Gateway surface an HTTPRoute serves - llm, mcp or agent. It
+	// is emitted as an Avi marker so the object can be found and filtered in the UI
+	// by what it is, independently of how the object happens to be named.
+	Surface string
 }
 
 /*

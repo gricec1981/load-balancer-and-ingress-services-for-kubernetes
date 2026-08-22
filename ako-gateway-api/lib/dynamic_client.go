@@ -605,5 +605,9 @@ func IsApplicationProfileProcessed(obj interface{}, namespace, name string) bool
 func getPKIProfileName(namespace, objectName string) string {
 	name := namespace + "-" + objectName
 	namePrefix := CRDOperatorPrefix + lib.GetClusterName() + "--"
-	return lib.EncodeWithPrefix(name, lib.EVHVS, namePrefix)
+	// Hashed unconditionally: this name must match what ako-crd-operator generates,
+	// and that is a separate module which does not see this process's readable name
+	// setting. Using EncodeWithPrefix here would break the reference the moment
+	// readable names were enabled.
+	return lib.EncodeHashedWithPrefix(name, lib.EVHVS, namePrefix)
 }

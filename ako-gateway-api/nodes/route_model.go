@@ -33,6 +33,7 @@ type RouteModel interface {
 	GetNamespace() string
 	GetType() string
 	GetSpec() interface{}
+	GetLabels() map[string]string
 	ParseRouteConfig(key string) *RouteConfig
 	Exists() bool
 	GetParents() sets.Set[string]
@@ -147,6 +148,7 @@ type httpRoute struct {
 	namespace   string
 	routeConfig *RouteConfig
 	spec        *gatewayv1.HTTPRouteSpec
+	labels      map[string]string
 }
 
 func GetHTTPRouteModel(key string, name, namespace string) (RouteModel, error) {
@@ -161,7 +163,16 @@ func GetHTTPRouteModel(key string, name, namespace string) (RouteModel, error) {
 		return hr, err
 	}
 	hr.spec = hrObj.Spec.DeepCopy()
+	hr.labels = hrObj.Labels
 	return hr, nil
+}
+
+// GetLabels returns the HTTPRoute's labels, which carry the AI Gateway surface the
+// route serves. Labels live on the route itself, so unlike an attached policy they are
+// always available whenever the route is being processed - which is what makes the
+// object name derived from them stable across restarts.
+func (hr *httpRoute) GetLabels() map[string]string {
+	return hr.labels
 }
 
 func (hr *httpRoute) GetName() string {

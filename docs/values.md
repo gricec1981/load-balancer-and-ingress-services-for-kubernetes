@@ -73,6 +73,36 @@ Use this flag if you want to create Enhanced Virtual Hosting model for Virtual S
 
 Before enabling the flag in the existing deployment make sure to delete the config and enable the flag. This will ensure SNI based VS's are deleted before creating EVH VS's.
 
+### AKOSettings.useReadableObjectNames
+
+Use this flag to make the encoded Avi object names readable. It is disabled by default.
+
+AKO names most EVH and Gateway API objects as `<prefix>--<sha1 of the derived name>`, because the Avi Controller limits object names to 255 characters and the derived name of a pool or a poolgroup can be longer than that. The consequence is that the object name in the Avi UI tells you nothing about the Kubernetes object it came from.
+
+With this flag set to `true`, the same names are built as `<prefix>--<readable-name>-<short hash>` instead:
+
+```
+my-cluster--foo.example.com-e24f911e                              # EVH child VS
+my-cluster--default-foo.example.com_api-web-ing-web-svc-8c7e0d22  # pool
+```
+
+The readable part has non-alphanumeric characters replaced by a hyphen and is truncated so that the whole name fits in 255 characters. The short hash is the first 8 characters of the same SHA1 digest that the default encoding uses in full, and is computed over the untruncated name, so names stay unique regardless of how much of the readable part survived.
+
+For Gateway API objects the flag additionally drops the `ako-gw-` prefix from the name and leads the name with the surface the route serves - `llm`, `mcp` or `agent`, from the `ai.ako.vmware.com/surface` label on the HTTPRoute:
+
+```
+openshift06--mcp-mcp-mcp-web-tools-8c7e0d22
+openshift06--agent-agents-log-collector-a13f9e07
+```
+
+Ownership is unaffected: it is carried by `created_by`, which stays `ako-gw-<cluster-name>`. See [the Gateway API naming conventions](naming-conventions/ako-gateway-api.md#readable-object-names) for the full scheme.
+
+**An Avi object name is that object's identity.** Changing this flag on a cluster that is already in sync makes AKO compute a new name for every encoded object, and the Avi Controller applies a rename as a delete followed by a create. Set this flag at install time. To change it on an existing deployment, set `deleteConfig` to `true` first, wait for AKO to remove its objects, then enable the flag and re-enable the config.
+
+AKO needs to be rebooted for a change to this flag to take effect, since it is passed to the pod as an environment variable. Editing the ConfigMap alone does nothing.
+
+This flag does not apply to `ako-crd-operator`, which names the objects it owns independently.
+
 ### AKOSetttings.namespaceSelector.labelKey and AKOSetttings.namespaceSelector.labelValue
 
 AKO allows ingresses/routes from specific namespace/s to be synced to Avi controller. This key-value pair represent a label that is used by AKO to filter out namespace/s. If one of key/values specified empty, then ingresses/routes from all namespaces will be synched to Avi controller.

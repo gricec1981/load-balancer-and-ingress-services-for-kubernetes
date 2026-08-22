@@ -165,6 +165,14 @@ spec:
               configMapKeyRef:
                 name: avi-k8s-config
                 key: enableEVH
+          # Marked optional so that a ConfigMap left over from an older release does not
+          # stop the pod from starting. An absent key means the legacy hashed names.
+          - name: USE_READABLE_OBJECT_NAMES
+            valueFrom:
+              configMapKeyRef:
+                name: avi-k8s-config
+                key: useReadableObjectNames
+                optional: true
           - name: SERVICES_API
             valueFrom:
               configMapKeyRef:
@@ -380,6 +388,14 @@ spec:
               configMapKeyRef:
                 name: avi-k8s-config
                 key: enableRHI
+          # Must match the value given to the ako container: both processes name Avi
+          # objects through lib.EncodeWithPrefix and have to agree on the format.
+          - name: USE_READABLE_OBJECT_NAMES
+            valueFrom:
+              configMapKeyRef:
+                name: avi-k8s-config
+                key: useReadableObjectNames
+                optional: true
           - name: SEG_NAME
             valueFrom:
               configMapKeyRef:

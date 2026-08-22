@@ -66,11 +66,52 @@ func GetGatewayParentName(namespace, gwName string) string {
 
 // child vs name format - ako-gw-clustername--encoded value of ako-gw-clustername--parentNs-parentName-routeNs-routeName-encodedMatch
 func GetChildName(parentNs, parentName, routeNs, routeName, matchName string) string {
+	return GetChildNameWithHint(parentNs, parentName, routeNs, routeName, matchName, "", "")
+}
+
+// GetChildNameWithHint names a child VS exactly as GetChildName does - the hashed
+// input is identical - but supplies the extra context the translator holds so that a
+// readable name can lead with the AI surface and use the route rule's own name:
+//
+//	openshift06--mcp-mcp-mcp-web-tools-8c7e0d22
+//	openshift06--agent-agents-log-collector-a13f9e07
+//
+// surface is one of SurfaceLLM/SurfaceMCP/SurfaceAgent, or empty for an ordinary
+// route. ruleName is the readable rule identity: the HTTPRoute rule's name when it has
+// one, otherwise the hash of its matches. Neither affects the hashed name, so passing
+// them cannot change what an object is called while readable names are disabled.
+func GetChildNameWithHint(parentNs, parentName, routeNs, routeName, matchName, surface, ruleName string) string {
 	name := parentNs + "-" + parentName + "-" + routeNs + "-" + routeName
 	if matchName != "" {
 		name = fmt.Sprintf("%s-%s", name, utils.Stringify(utils.Hash(matchName)))
 	}
-	return lib.EncodeWithPrefix(name, lib.EVHVS)
+
+	// The gateway is deliberately left out of the readable head: a child VS is always
+	// read underneath its parent, so repeating it only costs characters that the 255
+	// character budget would otherwise spend on the route.
+	hint := routeNs + "-" + routeName
+	if ruleName != "" {
+		hint = fmt.Sprintf("%s-%s", hint, ruleName)
+	}
+	if surface != "" {
+		hint = surface + "-" + hint
+	}
+	return lib.EncodeWithHint(name, hint, lib.EVHVS)
+}
+
+// GetRouteSurface maps the SurfaceLabel on an HTTPRoute to the token that leads its
+// object names. An absent, empty or unrecognised value yields "", which names the
+// route's objects with no surface token, exactly like any non AI route.
+func GetRouteSurface(labels map[string]string) string {
+	switch strings.ToLower(strings.TrimSpace(labels[SurfaceLabel])) {
+	case SurfaceLLM, "inference":
+		return SurfaceLLM
+	case SurfaceMCP:
+		return SurfaceMCP
+	case SurfaceAgent, "a2a":
+		return SurfaceAgent
+	}
+	return ""
 }
 
 func GetPoolName(parentNs, parentName, routeNs, routeName, matchName, backendNs, backendName, backendPort string) string {
@@ -220,7 +261,9 @@ func ProtocolToRoute(proto string) string {
 }
 
 func GetDefaultHTTPPSName() string {
-	return Prefix + lib.GetClusterName() + "--" + lib.DefaultPSName
+	// GetNamePrefix() is Prefix+cluster+"--" normally and cluster+"--" when readable
+	// names drop the prefix, so this stays consistent with every other object name.
+	return lib.GetNamePrefix() + lib.DefaultPSName
 }
 
 func GetTLSKeyCertNodeName(gatewayNameSpace, gatewayName, secretNameSpace, secretName string) string {

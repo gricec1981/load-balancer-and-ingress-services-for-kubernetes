@@ -170,8 +170,18 @@ func Initialize() {
 		lib.AKOControlConfig().SetAKOInstanceFlag(true)
 	}
 
+	// Ownership always stays on created_by, which is what every cache and garbage
+	// collection query filters on (see the created_by= parameter throughout
+	// internal/cache/controller_obj_cache.go). The ako-gw- prefix in the object NAME
+	// carries no ownership meaning, so with readable names it is dropped and objects
+	// read <cluster>--<surface>-... - the same shape the ingress AKO container already
+	// uses, which sets an empty name prefix and keeps ako- only in created_by.
 	lib.SetAKOUser(akogatewaylib.Prefix)
-	lib.SetNamePrefix(akogatewaylib.Prefix)
+	if lib.UseReadableObjectNames() {
+		lib.SetNamePrefix("")
+	} else {
+		lib.SetNamePrefix(akogatewaylib.Prefix)
+	}
 
 	err = k8s.PopulateControllerProperties(kubeClient)
 	if err != nil {

@@ -269,3 +269,30 @@ tests:
       # Check istio-certs volume is not present
       - isNull:
           path: spec.template.spec.volumes
+  # Both containers name Avi objects through lib.EncodeWithPrefix, so both have to be
+  # told which name format to use or they would disagree on every encoded object.
+  - it: StatefulSet should pass useReadableObjectNames to both containers
+    set:
+      featureGates:
+        GatewayAPI: true
+    asserts:
+      - isKind:
+          of: StatefulSet
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: USE_READABLE_OBJECT_NAMES
+            valueFrom:
+              configMapKeyRef:
+                name: avi-k8s-config
+                key: useReadableObjectNames
+                optional: true
+      - contains:
+          path: spec.template.spec.containers[1].env
+          content:
+            name: USE_READABLE_OBJECT_NAMES
+            valueFrom:
+              configMapKeyRef:
+                name: avi-k8s-config
+                key: useReadableObjectNames
+                optional: true

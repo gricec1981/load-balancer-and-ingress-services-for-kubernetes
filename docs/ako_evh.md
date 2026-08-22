@@ -53,3 +53,17 @@ poolName = clusterName + "--" + encoded-value
 ```
 poolgroupname = clusterName + "--" + encoded-value
 ```
+
+##### Readable object names
+
+By default `encoded-value` above is the full SHA1 hex digest, which is unique and length safe but carries no clue about which Kubernetes object produced it. Setting `AKOSettings.useReadableObjectNames` to `true` changes `encoded-value` to:
+
+```
+encoded-value = readable-name + "-" + first 8 characters of the same SHA1 digest
+```
+
+where `readable-name` is the derived name with non-alphanumeric characters replaced by a hyphen, truncated so that the full object name still fits in 255 characters. For example, an EVH child VS for `foo.example.com` in cluster `my-cluster` is named `my-cluster--e24f911e1705eda821eee091cc57d5cc16d685b7` by default and `my-cluster--foo.example.com-e24f911e` with the flag enabled.
+
+This is an install time choice. An Avi object name is that object's identity, so changing the flag on a running cluster renames every encoded object, which the Avi Controller applies as a delete followed by a create. See [AKOSettings.useReadableObjectNames](values.md#akosettingsusereadableobjectnames) for the full caveats.
+
+Independently of this flag, every encoded object carries `markers` describing the Kubernetes object it came from - namespace, host, ingress name, service name and path - which can be used to find an object in the Avi UI without decoding its name.

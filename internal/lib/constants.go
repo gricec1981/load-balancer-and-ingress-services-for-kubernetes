@@ -18,6 +18,7 @@ const (
 	DISABLE_STATIC_ROUTE_SYNC = "DISABLE_STATIC_ROUTE_SYNC"
 	ENABLE_RHI                = "ENABLE_RHI"
 	ENABLE_EVH                = "ENABLE_EVH"
+	USE_READABLE_OBJECT_NAMES = "USE_READABLE_OBJECT_NAMES"
 	CNI_PLUGIN                = "CNI_PLUGIN"
 	CALICO_CNI                = "calico"
 	ANTREA_CNI                = "antrea"
@@ -305,6 +306,9 @@ const (
 	NsFilterDelete                 = "DELETE"
 	PoolNameSuffixForHttpPolToPool = "policy-to-pool"
 	AVI_OBJ_NAME_MAX_LENGTH        = 255
+	// READABLE_NAME_HASH_LENGTH is the number of hex characters of the SHA1 digest
+	// retained as the uniqueness suffix when readable object names are enabled.
+	READABLE_NAME_HASH_LENGTH = 8
 	ACCESS_TOKEN_TYPE_JWT          = "ACCESS_TOKEN_TYPE_JWT"
 	ACCESS_TOKEN_TYPE_OPAQUE       = "ACCESS_TOKEN_TYPE_OPAQUE"
 	SAML_AUTHN_REQ_ACS_TYPE_INDEX  = "SAML_AUTHN_REQ_ACS_TYPE_INDEX"

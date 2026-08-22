@@ -113,12 +113,25 @@ func (o *AviObjectGraph) BuildChildVS(key string, routeModel RouteModel, parentN
 		utils.AviLog.Warnf("key: %s, msg: No hosts mapped to the route %s/%s/%s", key, routeModel.GetType(), routeModel.GetNamespace(), routeModel.GetName())
 		return
 	}
-	var childVSName string
+	// The surface this route serves leads its readable object names, so resolve it
+	// before naming. It comes from a label on the route, never from an attached AI
+	// policy: policies arrive through informer events that are not ordered against
+	// route processing, so inferring the surface would rename objects on restart.
+	surface := akogatewayapilib.GetRouteSurface(routeModel.GetLabels())
+
+	// ruleName is the rule's readable identity, and matchName the string folded into
+	// the hashed name. They differ only for unnamed rules, where the matches are
+	// hashed rather than displayed.
+	var matchName string
+	ruleName := rule.Name
 	if rule.Name == "" {
-		childVSName = akogatewayapilib.GetChildName(parentNs, parentName, routeModel.GetNamespace(), routeModel.GetName(), utils.Stringify(rule.Matches))
+		matchName = utils.Stringify(rule.Matches)
+		ruleName = utils.Stringify(utils.Hash(matchName))
 	} else {
-		childVSName = akogatewayapilib.GetChildName(parentNs, parentName, routeModel.GetNamespace(), routeModel.GetName(), rule.Name)
+		matchName = rule.Name
 	}
+	childVSName := akogatewayapilib.GetChildNameWithHint(parentNs, parentName,
+		routeModel.GetNamespace(), routeModel.GetName(), matchName, surface, ruleName)
 	childVSes[childVSName] = struct{}{}
 
 	childNode := parentNode[0].GetEvhNodeForName(childVSName)
@@ -130,10 +143,6 @@ func (o *AviObjectGraph) BuildChildVS(key string, routeModel RouteModel, parentN
 	childNode.Tenant = parentNode[0].Tenant
 	childNode.EVHParent = false
 
-	ruleName := utils.Stringify(utils.Hash(utils.Stringify(rule.Matches)))
-	if rule.Name != "" {
-		ruleName = rule.Name
-	}
 	childNode.ServiceMetadata = lib.ServiceMetadataObj{
 		Gateway:           parentNsName,
 		HTTPRoute:         routeModel.GetNamespace() + "/" + routeModel.GetName(),
@@ -149,6 +158,9 @@ func (o *AviObjectGraph) BuildChildVS(key string, routeModel RouteModel, parentN
 		HTTPRouteName:      routeModel.GetName(),
 		HTTPRouteNamespace: routeModel.GetNamespace(),
 		Host:               hosts,
+		// Emitted whatever the naming mode, so an LLM, MCP or agent route can be
+		// filtered by what it is even while its objects are still SHA1 named.
+		Surface: surface,
 	}
 	if rule.Name != "" {
 		childNode.AviMarkers.HTTPRouteRuleName = rule.Name

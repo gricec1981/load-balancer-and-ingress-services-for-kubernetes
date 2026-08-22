@@ -242,6 +242,18 @@ func CheckObjectNameLength(objName, objType string) bool {
 
 func SetNamePrefix(prefix string) {
 	NamePrefix = prefix + GetClusterName() + "--"
+	if UseReadableObjectNames() {
+		utils.AviLog.Warnf("useReadableObjectNames is enabled: Avi object names are derived from the Kubernetes objects instead of a full SHA1 digest. Toggling this flag on an existing cluster renames every encoded object, which the Avi controller applies as a delete and recreate.")
+	}
+}
+
+// UseReadableObjectNames returns true when AKO should name encoded Avi objects as
+// "<prefix>--<readable-head>-<short hash>" instead of "<prefix>--<full SHA1 hex>".
+// This flag changes object names, and an Avi object name is its identity, so
+// flipping it on a running cluster recreates every encoded object.
+func UseReadableObjectNames() bool {
+	readable, _ := strconv.ParseBool(os.Getenv(USE_READABLE_OBJECT_NAMES))
+	return readable
 }
 
 func GetNamePrefix() string {
@@ -251,15 +263,85 @@ func GetNamePrefix() string {
 // EncodeWithPrefix encodes the given string with the given prefix
 // if prefix is not provided, it uses the NamePrefix value
 func EncodeWithPrefix(s, objType string, prefix ...string) string {
+	return EncodeWithHint(s, "", objType, prefix...)
+}
+
+// EncodeWithHint is EncodeWithPrefix with an explicit human facing head. The hash is
+// still taken over s alone, so the default name and the collision behaviour are both
+// unchanged; hint only decides what a person reads once readable names are enabled.
+// That lets a caller drop context from the displayed name which the reader already has
+// - a Gateway API child VS need not repeat the gateway it hangs under - without
+// weakening uniqueness. An empty hint falls back to s.
+func EncodeWithHint(s, hint, objType string, prefix ...string) string {
+	namePrefix := GetNamePrefix()
+	if len(prefix) > 0 {
+		namePrefix = prefix[0]
+	}
+	hash := sha1.Sum([]byte(s))
+	var encodedStr string
+	if UseReadableObjectNames() {
+		if hint == "" {
+			hint = s
+		}
+		encodedStr = namePrefix + buildReadableName(hint, namePrefix, hash)
+	} else {
+		encodedStr = namePrefix + hex.EncodeToString(hash[:])
+	}
+	//Added this check to be safe side if encoded name becomes greater than limit set
+	CheckObjectNameLength(encodedStr, objType)
+	return encodedStr
+}
+
+// EncodeHashedWithPrefix always produces the full SHA1 form, whatever
+// UseReadableObjectNames says. Use it only where the name has to match one generated
+// by a component that does not share this process's naming configuration: today that
+// is ako-crd-operator, a separate Go module with its own vendored copy of this file,
+// which would still be hashing while this process had switched to readable names.
+func EncodeHashedWithPrefix(s, objType string, prefix ...string) string {
 	namePrefix := GetNamePrefix()
 	if len(prefix) > 0 {
 		namePrefix = prefix[0]
 	}
 	hash := sha1.Sum([]byte(s))
 	encodedStr := namePrefix + hex.EncodeToString(hash[:])
-	//Added this check to be safe side if encoded name becomes greater than limit set
 	CheckObjectNameLength(encodedStr, objType)
 	return encodedStr
+}
+
+// readableNameSanitizer matches every run of characters that must not appear in the
+// human readable part of an Avi object name. '.' and '_' are deliberately preserved:
+// hostnames carry dots and AKO already encodes path separators as underscores. '-' is
+// treated as a separator to be re-emitted, which collapses runs of hyphens and
+// guarantees the readable part never contains "--" - the delimiter that
+// GetNamePrefix() and IsNameEncoded() rely on.
+var readableNameSanitizer = regexp.MustCompile(`[^a-zA-Z0-9._]+`)
+
+// buildReadableName returns "<readable-head>-<short-hash>" for s, sized so that
+// namePrefix+result never exceeds AVI_OBJ_NAME_MAX_LENGTH.
+//
+// The short hash is taken over the full, unsanitised input, so two distinct inputs
+// collide only if their SHA1 digests share their first READABLE_NAME_HASH_LENGTH hex
+// characters. Only the human facing head is lossy; uniqueness is unaffected by the
+// sanitisation or the truncation.
+func buildReadableName(s, namePrefix string, hash [sha1.Size]byte) string {
+	shortHash := hex.EncodeToString(hash[:])[:READABLE_NAME_HASH_LENGTH]
+
+	// Ingress/EVH callers fold the name prefix into s before calling, Gateway API
+	// callers do not. Strip it so that the prefix is not repeated in the final name.
+	head := readableNameSanitizer.ReplaceAllString(strings.TrimPrefix(s, namePrefix), "-")
+	head = strings.Trim(head, "-")
+
+	// One character is reserved for the separator between the head and the short hash,
+	// plus room for the suffixes that callers append after encoding. EVHSuffix, added
+	// to dedicated mode virtual services, is the only one today and the longest.
+	budget := AVI_OBJ_NAME_MAX_LENGTH - len(namePrefix) - len(shortHash) - 1 - len(EVHSuffix)
+	if budget > 0 && len(head) > budget {
+		head = strings.Trim(head[:budget], "-")
+	}
+	if budget <= 0 || head == "" {
+		return shortHash
+	}
+	return head + "-" + shortHash
 }
 
 func Encode(s, objType string) string {
@@ -270,15 +352,37 @@ func Encode(s, objType string) string {
 	return EncodeWithPrefix(s, objType)
 }
 
+// IsNameEncoded reports whether name was produced by EncodeWithPrefix, in either of
+// the two supported forms. Getting this wrong is dangerous: listEVHChildrenToDelete
+// treats a non-encoded EVH child as a leftover from the pre-encoding release and
+// deletes it, so this must recognise readable names as well as fully hashed ones.
 func IsNameEncoded(name string) bool {
 	split := strings.Split(name, "--")
-	if len(split) == 2 {
-		_, err := hex.DecodeString(split[1])
-		if err == nil {
-			return true
-		}
+	if len(split) != 2 {
+		return false
 	}
-	return false
+	suffix := split[1]
+	// Default form: the whole suffix is the SHA1 hex digest.
+	if _, err := hex.DecodeString(suffix); err == nil {
+		return true
+	}
+	// Readable form: <readable-head>-<short hash>. Only recognised when readable names
+	// are actually in use, so that with the flag off this function stays exactly as
+	// strict as it was: a name whose last hyphenated token happens to be 8 hex
+	// characters, such as a service called "deadbeef", must not be mistaken for an
+	// encoded name by the SNI regex paths in crd_translator.go.
+	//
+	// The head never contains "--" (see readableNameSanitizer), so the split above
+	// still yields two elements.
+	if !UseReadableObjectNames() {
+		return false
+	}
+	idx := strings.LastIndex(suffix, "-")
+	if idx == -1 || len(suffix)-idx-1 != READABLE_NAME_HASH_LENGTH {
+		return false
+	}
+	_, err := hex.DecodeString(suffix[idx+1:])
+	return err == nil
 }
 
 var DisableSync bool
