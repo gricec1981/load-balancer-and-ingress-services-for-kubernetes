@@ -119,8 +119,8 @@ func fqdnPoolBody(spec fqdnPoolSpec) map[string]interface{} {
 // peer site is up. Failure is not fatal: a tier that reaches its peer but cannot
 // prove liveness is still better than a tier that does not exist, so the caller
 // logs and continues with an unmonitored pool.
-func ensureRemoteHealthMonitor(client *clients.AviClient, name, tenantRef, path string, tls bool) error {
-	return postOrPut(client, "/api/healthmonitor", name, remoteHealthMonitorBody(name, tenantRef, path, tls))
+func ensureRemoteHealthMonitor(client *clients.AviClient, name, tenantRef, host, path string, tls bool) error {
+	return postOrPut(client, "/api/healthmonitor", name, remoteHealthMonitorBody(name, tenantRef, host, path, tls))
 }
 
 // remoteHealthMonitorBody builds the monitor payload. An HTTPS peer needs
@@ -128,9 +128,14 @@ func ensureRemoteHealthMonitor(client *clients.AviClient, name, tenantRef, path 
 // send_interval 5s with 2 failed checks puts peer-down detection around 10s —
 // fast enough that failing over to a lower-preference tier is worth doing, which
 // is the whole reason a DNS TTL was the wrong mechanism.
-func remoteHealthMonitorBody(name, tenantRef, path string, tls bool) map[string]interface{} {
+// The Host header is not optional. A peer AI Gateway is an EVH virtual service:
+// the parent picks the child by Host, so a probe without one lands on no child
+// and comes back 404 — which marks a peer that is serving perfectly well as
+// DOWN, and takes its tier with it. Measured against the live peer: 404 without
+// the header, 200 with it.
+func remoteHealthMonitorBody(name, tenantRef, host, path string, tls bool) map[string]interface{} {
 	monitor := map[string]interface{}{
-		"http_request":       "GET " + path + " HTTP/1.0",
+		"http_request":       "GET " + path + " HTTP/1.0\r\nHost: " + host,
 		"http_response_code": []string{"HTTP_2XX"},
 	}
 	hm := map[string]interface{}{
@@ -167,7 +172,7 @@ func EnsureRemoteTier(key string, policy *AIModelRoutePolicy, tier ModelTier) (*
 	var hmRefs []string
 	if path := rem.EffectiveHealthPath(); path != "-" {
 		hmName := remoteHealthMonitorName(policy.Namespace, policy.Name, tier.Name)
-		if err := ensureRemoteHealthMonitor(client, hmName, tenantRef, path, rem.EffectiveTLS()); err != nil {
+		if err := ensureRemoteHealthMonitor(client, hmName, tenantRef, rem.Host, path, rem.EffectiveTLS()); err != nil {
 			utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: health monitor %s failed, pool will be unmonitored: %v",
 				key, policy.Namespace, policy.Name, tier.Name, hmName, err)
 		} else {

@@ -239,7 +239,7 @@ func TestRemoteHealthMonitorBody(t *testing.T) {
 		{true, "HEALTH_MONITOR_HTTPS", "https_monitor", "http_monitor"},
 		{false, "HEALTH_MONITOR_HTTP", "http_monitor", "https_monitor"},
 	} {
-		hm := remoteHealthMonitorBody("hm", "/api/tenant/?name=admin", "/v1/models", tc.tls)
+		hm := remoteHealthMonitorBody("hm", "/api/tenant/?name=admin", "llm.siteb.ai.avi.com", "/v1/models", tc.tls)
 		if hm["type"] != tc.wantType {
 			t.Errorf("tls=%t type = %v, want %s", tc.tls, hm["type"], tc.wantType)
 		}
@@ -250,8 +250,12 @@ func TestRemoteHealthMonitorBody(t *testing.T) {
 		if _, present := hm[tc.notField]; present {
 			t.Errorf("tls=%t should not set %s", tc.tls, tc.notField)
 		}
-		if m["http_request"] != "GET /v1/models HTTP/1.0" {
-			t.Errorf("http_request = %v", m["http_request"])
+		// The Host header is what makes the probe reach the peer's EVH child
+		// instead of 404ing on its parent, so a monitor without one reports a
+		// healthy peer as down.
+		want := "GET /v1/models HTTP/1.0\r\nHost: llm.siteb.ai.avi.com"
+		if m["http_request"] != want {
+			t.Errorf("http_request = %q, want %q", m["http_request"], want)
 		}
 	}
 }
