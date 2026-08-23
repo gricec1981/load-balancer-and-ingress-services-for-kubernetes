@@ -16,6 +16,7 @@ package aigateway
 
 import (
 	"fmt"
+	"net"
 
 	"github.com/vmware/alb-sdk/go/clients"
 
@@ -70,38 +71,66 @@ type fqdnPoolSpec struct {
 	Host      string
 	Port      int32
 	TLS       bool
+	// SeedIP is the address the server object is created with. It is a seed, not
+	// a pin: resolve_server_by_dns hands every later resolution to the SE. Left
+	// empty, ensureFQDNPool resolves Host once to fill it.
+	SeedIP string
 	// HealthMonitorRefs is optional; nil attaches no monitor.
 	HealthMonitorRefs []string
 }
 
-// ensureFQDNPool creates or updates a pool whose only server is an FQDN the SE
-// resolves itself. Shared by provider tiers (a vendor API served from many
-// rotating IPs) and remote tiers (a peer gateway whose VIP may be renumbered) —
-// in both cases the point is that AKO never learns, stores, or refreshes an
-// address.
+// ensureFQDNPool creates or updates a pool whose single server is named, not
+// addressed. Shared by provider tiers (a vendor API served from many rotating
+// IPs) and remote tiers (a peer gateway whose VIP may be renumbered).
+//
+// The Avi Controller will not accept a server without an address — `ip` is
+// required even when `hostname` and `resolve_server_by_dns` are both set, and a
+// DNS-typed IpAddr does not satisfy it either ("Invalid IP address format").
+// So AKO resolves the name ONCE, to seed the object, and hands every subsequent
+// resolution to the Service Engine. That is a weaker claim than "AKO never
+// learns an address" and it is the true one: what matters operationally is that
+// nothing in the cluster tracks or refreshes the peer's address afterwards.
 func ensureFQDNPool(client *clients.AviClient, spec fqdnPoolSpec) error {
+	if spec.SeedIP == "" {
+		ip, err := resolveSeedIP(spec.Host)
+		if err != nil {
+			return fmt.Errorf("pool %s: %w", spec.Name, err)
+		}
+		spec.SeedIP = ip
+	}
 	return postOrPut(client, "/api/pool", spec.Name, fqdnPoolBody(spec))
 }
 
+// resolveSeedIP returns one IPv4 address for host. IPv6 is skipped rather than
+// returned: the pool's SE-side re-resolution will pick up whatever the name
+// holds later, and seeding a V6 address on a V4 cloud fails in a way that is
+// much harder to read than this error.
+func resolveSeedIP(host string) (string, error) {
+	addrs, err := net.LookupHost(host)
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve %q: %w", host, err)
+	}
+	for _, a := range addrs {
+		if ip := net.ParseIP(a); ip != nil && ip.To4() != nil {
+			return a, nil
+		}
+	}
+	return "", fmt.Errorf("%q has no IPv4 address (%v)", host, addrs)
+}
+
 // fqdnPoolBody builds the pool payload. Split out from ensureFQDNPool so the
-// shape can be asserted without an Avi Controller — in particular that it never
-// contains an address.
+// shape can be asserted without an Avi Controller or a resolver.
 func fqdnPoolBody(spec fqdnPoolSpec) map[string]interface{} {
 	pool := map[string]interface{}{
 		"name":                spec.Name,
 		"tenant_ref":          spec.TenantRef,
 		"cloud_ref":           spec.CloudRef,
 		"default_server_port": spec.Port,
-		// FQDN server: the SE resolves it by DNS and re-resolves on rotation, so a
-		// backend whose address changes stays reachable without pinning.
-		//
-		// `ip` is required even here -- Avi 31.2.1 rejects the POST outright with
-		// "Pool is missing required fields: servers[0].ip". A DNS-typed IpAddr is
-		// how a name is carried in that field: `addr` holds the FQDN, not an
-		// address, so nothing is pinned and the SE still does the resolving.
+		// Named server: `hostname` is what the SE re-resolves, `ip` is only the
+		// seed the Controller demands at create time (see ensureFQDNPool).
 		"servers": []map[string]interface{}{{
 			"hostname":              spec.Host,
-			"ip":                    map[string]interface{}{"type": "DNS", "addr": spec.Host},
+			"ip":                    map[string]interface{}{"type": "V4", "addr": spec.SeedIP},
 			"resolve_server_by_dns": true,
 		}},
 	}

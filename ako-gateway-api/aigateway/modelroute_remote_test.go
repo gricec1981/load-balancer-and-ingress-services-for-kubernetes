@@ -175,12 +175,14 @@ func TestRemoteObjectNames(t *testing.T) {
 	}
 }
 
-// The FQDN pool is the whole point: AKO must never write an address into Avi, so
-// that a renumbered peer needs no reconcile.
-func TestFQDNPoolSpecHasNoAddress(t *testing.T) {
+// The FQDN pool is the whole point: a renumbered peer must need no reconcile.
+// The Controller forces AKO to write a seed address, so what makes that true is
+// the hostname and resolve_server_by_dns sitting beside it — assert the seed is
+// accompanied, never that it is absent.
+func TestFQDNPoolServerIsNamedNotPinned(t *testing.T) {
 	pool := fqdnPoolBody(fqdnPoolSpec{
 		Name: "p", TenantRef: "/api/tenant/?name=admin", CloudRef: "/api/cloud/?name=Default-Cloud",
-		Host: "llm.siteb.ai.avi.com", Port: 443, TLS: true,
+		Host: "llm.siteb.ai.avi.com", Port: 443, TLS: true, SeedIP: "192.0.2.24",
 		HealthMonitorRefs: []string{"/api/healthmonitor/?name=hm"},
 	})
 
@@ -196,19 +198,20 @@ func TestFQDNPoolSpecHasNoAddress(t *testing.T) {
 		t.Errorf("server hostname = %v, want the peer FQDN", srv["hostname"])
 	}
 	// Avi 31.2.1 rejects a pool whose server has no `ip` ("Pool is missing
-	// required fields: servers[0].ip"), so the field must be present -- but as a
-	// DNS-typed IpAddr carrying the NAME. That is the distinction worth
-	// asserting: an FQDN pool must never pin a V4/V6 literal, because the whole
-	// point is that the peer can be renumbered without AKO noticing.
+	// required fields: servers[0].ip") and rejects a DNS-typed one too ("Invalid
+	// IP address format"), so the seed has to be a real V4 literal. It is the
+	// hostname beside it, plus resolve_server_by_dns, that keeps the peer
+	// reachable after a renumber -- assert all three together, because the seed
+	// alone would look like a pinned address.
 	ip, ok := srv["ip"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("server must carry an ip field; Avi rejects the POST without it: %#v", srv["ip"])
 	}
-	if ip["type"] != "DNS" {
-		t.Errorf("ip.type = %v, want DNS -- a V4/V6 type would pin the peer's address", ip["type"])
+	if ip["type"] != "V4" {
+		t.Errorf("ip.type = %v, want V4 -- the Controller rejects DNS-typed addrs", ip["type"])
 	}
-	if ip["addr"] != "llm.siteb.ai.avi.com" {
-		t.Errorf("ip.addr = %v, want the peer FQDN", ip["addr"])
+	if ip["addr"] != "192.0.2.24" {
+		t.Errorf("ip.addr = %v, want the seed address", ip["addr"])
 	}
 	if pool["ssl_profile_ref"] == nil {
 		t.Error("TLS true should attach an SSL profile (SNI comes from the server hostname)")
@@ -311,5 +314,23 @@ func TestRemoteScriptsAgainstSEStub(t *testing.T) {
 			t.Fatalf("remote-tier SE-sandbox spec failed under %s: %v\n%s", lua, err, out)
 		}
 		t.Logf("%s:\n%s", lua, out)
+	}
+}
+
+// The seed address has to come from a real lookup, and an unresolvable peer has
+// to fail loudly at authoring time. The alternative — POSTing a placeholder and
+// letting the SE sort it out — produces a pool that exists, shows a member, and
+// blackholes every request routed to its tier.
+func TestResolveSeedIP(t *testing.T) {
+	ip, err := resolveSeedIP("localhost")
+	if err != nil {
+		t.Fatalf("localhost should resolve: %v", err)
+	}
+	if ip != "127.0.0.1" {
+		t.Errorf("resolveSeedIP(localhost) = %q, want an IPv4 literal", ip)
+	}
+
+	if _, err := resolveSeedIP("no-such-peer.invalid"); err == nil {
+		t.Error("an unresolvable peer must be an error, not a pool with a bad member")
 	}
 }
