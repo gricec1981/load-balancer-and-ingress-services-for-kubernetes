@@ -116,8 +116,10 @@ local _, log6, resp = route("llama-3-70b-instruct", NOBODY)
 check("unentitled group rejected", resp and resp.code, 403)
 check("no routing log for a rejected request", log6, nil)
 
--- 7. Exactly one log line per request. avi.vs.log marks the entry significant,
---    so a second call is a second entry and doubles the log volume of the VS.
+-- 7. Exactly one log line per request: a second call is a second entry and
+--    doubles the log volume of the VS. Note the entry avi.vs.log produces is a
+--    UDF log, not a significant one (measured on 31.2.1), so the console hides
+--    successful routing decisions until "Non-Significant" is ticked.
 route("llama-3-8b-instruct", PLATINUM)
 check("one log line per request", #SE.env.logs, 1)
 

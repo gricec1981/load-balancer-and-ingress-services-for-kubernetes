@@ -52,8 +52,15 @@ func TestModelRouteLogsTheDecision(t *testing.T) {
 		t.Error("avi.vs.log must be called inside a closure, not passed to pcall as a function value")
 	}
 
-	// One entry per request. avi.vs.log makes the log entry significant, so a
-	// second call is a second entry and doubles this VS's log volume.
+	// One entry per request, because a second call is a second entry and doubles
+	// this VS's log volume.
+	//
+	// Measured on Avi 31.2.1: the entry avi.vs.log produces is a UDF log, NOT a
+	// significant one -- the API reports significant=0, udf=true. That matters to
+	// anyone reading these decisions in the console: the log viewer hides
+	// non-significant entries by default, so every SUCCESSFUL routing decision is
+	// invisible until "Non-Significant" is ticked. Only the request that also
+	// tripped auth, WAF or the budget shows up on its own.
 	if n := strings.Count(s, "avi.vs.log("); n != 1 {
 		t.Errorf("expected exactly one avi.vs.log call per request, found %d", n)
 	}
