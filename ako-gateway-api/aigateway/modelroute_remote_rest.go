@@ -94,8 +94,14 @@ func fqdnPoolBody(spec fqdnPoolSpec) map[string]interface{} {
 		"default_server_port": spec.Port,
 		// FQDN server: the SE resolves it by DNS and re-resolves on rotation, so a
 		// backend whose address changes stays reachable without pinning.
+		//
+		// `ip` is required even here -- Avi 31.2.1 rejects the POST outright with
+		// "Pool is missing required fields: servers[0].ip". A DNS-typed IpAddr is
+		// how a name is carried in that field: `addr` holds the FQDN, not an
+		// address, so nothing is pinned and the SE still does the resolving.
 		"servers": []map[string]interface{}{{
 			"hostname":              spec.Host,
+			"ip":                    map[string]interface{}{"type": "DNS", "addr": spec.Host},
 			"resolve_server_by_dns": true,
 		}},
 	}

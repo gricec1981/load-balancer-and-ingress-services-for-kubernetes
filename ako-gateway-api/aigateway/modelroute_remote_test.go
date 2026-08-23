@@ -195,10 +195,20 @@ func TestFQDNPoolSpecHasNoAddress(t *testing.T) {
 	if srv["hostname"] != "llm.siteb.ai.avi.com" {
 		t.Errorf("server hostname = %v, want the peer FQDN", srv["hostname"])
 	}
-	for _, addrKey := range []string{"ip", "resolve_server_by_dns_ip", "external_uuid"} {
-		if _, present := srv[addrKey]; present && addrKey == "ip" {
-			t.Errorf("an FQDN pool must carry no address, found %q", addrKey)
-		}
+	// Avi 31.2.1 rejects a pool whose server has no `ip` ("Pool is missing
+	// required fields: servers[0].ip"), so the field must be present -- but as a
+	// DNS-typed IpAddr carrying the NAME. That is the distinction worth
+	// asserting: an FQDN pool must never pin a V4/V6 literal, because the whole
+	// point is that the peer can be renumbered without AKO noticing.
+	ip, ok := srv["ip"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("server must carry an ip field; Avi rejects the POST without it: %#v", srv["ip"])
+	}
+	if ip["type"] != "DNS" {
+		t.Errorf("ip.type = %v, want DNS -- a V4/V6 type would pin the peer's address", ip["type"])
+	}
+	if ip["addr"] != "llm.siteb.ai.avi.com" {
+		t.Errorf("ip.addr = %v, want the peer FQDN", ip["addr"])
 	}
 	if pool["ssl_profile_ref"] == nil {
 		t.Error("TLS true should attach an SSL profile (SNI comes from the server hostname)")
