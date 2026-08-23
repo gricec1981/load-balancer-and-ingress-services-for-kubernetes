@@ -269,6 +269,15 @@ behavior is *spike-gated*.
 
 → [Multi-Site (Cross-Cluster) Model Delivery](ai-gateway-multisite.md)
 
+## One gateway per surface, many clusters
+
+Rather than one AI gateway per cluster, an estate can run **three** — LLM, MCP and agent — each
+owned by a single entry cluster and fronting workloads that stay where they are. The LLM surface
+flattens cleanly; MCP sessions and A2A tasks pin to a backend server, and that pin is exact only
+for single-server pools, which decides the topology. **In design**, on shipped parts.
+
+→ [One Gateway per Surface, Many Clusters](ai-gateway-single-gateway.md) · [One Gateway for a Datacenter](ai-gateway-datacenter.md)
+
 ---
 
 ## Getting started
@@ -292,5 +301,7 @@ behavior is *spike-gated*.
 - [A2A Agent Registry](ai-gateway-agent-registry.md) — ConfigMap catalog, console registry view, `/.well-known/agents` federation
 - [Backend mTLS](ai-gateway-backend-mtls.md) — SE↔backend mutual TLS with SPIFFE/SPIRE
 - [Multi-Site Delivery](ai-gateway-multisite.md) — cross-cluster model routing
+- [One Gateway per Surface, Many Clusters](ai-gateway-single-gateway.md) — a single LLM/MCP/agent gateway for a whole estate: design, benefits, limitations
+- [One Gateway for a Datacenter](ai-gateway-datacenter.md) — the LLM front door sized at fifteen clusters
 - [Provider Failover Design](ai-provider-failover-design.md) — cross-provider failover strategies (design only, not yet implemented)
 - [Release Notes](ai-gateway-release-notes.md) — what shipped, by date
