@@ -150,3 +150,67 @@ func TestPolicyStoreModelRouteUpsertDelete(t *testing.T) {
 		t.Errorf("policy should be removed after delete, got %d", len(got))
 	}
 }
+
+// A remote tier has to survive the unstructured decode, or the policy that
+// carries it fails validation with "backendRef.name, provider or remote is
+// required" — the CR is accepted by the API server and then silently ignored by
+// AKO, which looks exactly like a controller that has not reconciled yet.
+func TestUnstructuredToModelRoutePolicyRemoteTier(t *testing.T) {
+	u := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "ai.ako.vmware.com/v1alpha1",
+		"kind":       "AIModelRoutePolicy",
+		"metadata":   map[string]interface{}{"name": "llm-tiers", "namespace": "inference"},
+		"spec": map[string]interface{}{
+			"targetRef": map[string]interface{}{
+				"group": "gateway.networking.k8s.io", "kind": "HTTPRoute", "name": "llm-route",
+			},
+			"defaultTier": "siteb",
+			"tiers": []interface{}{
+				map[string]interface{}{
+					"name": "siteb",
+					"remote": map[string]interface{}{
+						"host":         "llm.siteb.ai.avi.com",
+						"port":         int64(80),
+						"tls":          false,
+						"preserveHost": true,
+						"healthPath":   "/v1/models",
+					},
+				},
+			},
+			"modelTiers": map[string]interface{}{"qwen-siteb": "siteb"},
+		},
+	}}
+
+	p, err := unstructuredToModelRoutePolicy(u)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if len(p.Spec.Tiers) != 1 {
+		t.Fatalf("tiers not parsed: %+v", p.Spec.Tiers)
+	}
+	tier := p.Spec.Tiers[0]
+	if !tier.IsRemote() {
+		t.Fatal("remote block was dropped by the decoder")
+	}
+	if tier.Remote.Host != "llm.siteb.ai.avi.com" {
+		t.Errorf("host = %q", tier.Remote.Host)
+	}
+	if got := tier.Remote.EffectivePort(); got != 80 {
+		t.Errorf("port = %d, want 80", got)
+	}
+	if tier.Remote.EffectiveTLS() {
+		t.Error("tls false was not decoded")
+	}
+	if !tier.Remote.EffectivePreserveHost() {
+		t.Error("preserveHost true was not decoded")
+	}
+	if got := tier.Remote.EffectiveHealthPath(); got != "/v1/models" {
+		t.Errorf("healthPath = %q", got)
+	}
+	if err := p.Spec.Validate(); err != nil {
+		t.Errorf("policy with a remote tier should validate: %v", err)
+	}
+	if got := p.Spec.ResolveTier("qwen-siteb"); got != "siteb" {
+		t.Errorf("ResolveTier(qwen-siteb) = %q, want siteb", got)
+	}
+}

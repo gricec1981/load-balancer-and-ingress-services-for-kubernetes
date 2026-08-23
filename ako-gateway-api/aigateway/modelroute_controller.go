@@ -241,6 +241,25 @@ func unstructuredToModelRoutePolicy(obj *unstructured.Unstructured) (*AIModelRou
 				}
 				tier.Provider = prov
 			}
+			if rm, found, _ := unstructured.NestedMap(tm, "remote"); found {
+				rem := &ModelRemote{}
+				if v, _, _ := unstructured.NestedString(rm, "host"); v != "" {
+					rem.Host = v
+				}
+				if v, found, _ := unstructured.NestedInt64(rm, "port"); found {
+					rem.Port = int32(v)
+				}
+				if v, found, _ := unstructured.NestedBool(rm, "tls"); found {
+					rem.TLS = &v
+				}
+				if v, found, _ := unstructured.NestedBool(rm, "preserveHost"); found {
+					rem.PreserveHost = &v
+				}
+				if v, _, _ := unstructured.NestedString(rm, "healthPath"); v != "" {
+					rem.HealthPath = v
+				}
+				tier.Remote = rem
+			}
 			p.Spec.Tiers = append(p.Spec.Tiers, tier)
 		}
 	}
