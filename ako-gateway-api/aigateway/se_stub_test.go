@@ -67,7 +67,7 @@ func runSEStubSpec(t *testing.T, spec string) {
 		}
 	}
 
-	scripts := GenerateTokenAccountingScripts(countersPolicy(), ClaimModeJWTQuery)
+	scripts := GenerateTokenAccountingScripts(countersPolicy(), ClaimModeJWTQuery, "vs-test")
 
 	// AIGW_DUMP_DIR keeps the generated scripts and the harness on disk after the
 	// run, which is how you debug a failing assertion against the real Lua.
