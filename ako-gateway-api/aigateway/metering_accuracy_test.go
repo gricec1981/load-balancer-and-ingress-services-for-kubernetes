@@ -24,7 +24,7 @@ import (
 // `usage` is merely absent is what made one GET /v1/models cost 65536 tokens and
 // 429 a consumer for the rest of the window (measured live on Avi 31.2.x).
 func TestPenaltyRequiresTruncationEvidence(t *testing.T) {
-	lua := GenerateTokenAccountingScripts(countersPolicy(), ClaimModeJWTQuery).RespDataScript
+	lua := GenerateTokenAccountingScripts(countersPolicy(), ClaimModeJWTQuery, "vs-test").RespDataScript
 
 	// The unconditional form: "no usage parsed" => charge the penalty.
 	if strings.Contains(lua, "if total_tokens == 0 then\n    total_tokens      =") {
@@ -43,7 +43,7 @@ func TestPenaltyRequiresTruncationEvidence(t *testing.T) {
 // A short 2xx JSON response with no `usage` is not a completion. It must leave
 // every counter untouched rather than being charged as an unparseable one.
 func TestUnmeterableShortResponseCostsNothing(t *testing.T) {
-	lua := GenerateTokenAccountingScripts(countersPolicy(), ClaimModeJWTQuery).RespDataScript
+	lua := GenerateTokenAccountingScripts(countersPolicy(), ClaimModeJWTQuery, "vs-test").RespDataScript
 
 	// total_tokens is initialised to 0 and only the evidence-gated branch may
 	// raise it without a parsed usage block.
@@ -61,7 +61,7 @@ func TestUnmeterableShortResponseCostsNothing(t *testing.T) {
 // penalty, but the ledger must never present one as a measurement. The response
 // phase publishes which of the two it was.
 func TestMeterQualityIsPublishedForTheLedger(t *testing.T) {
-	lua := GenerateTokenAccountingScripts(countersPolicy(), ClaimModeJWTQuery).RespDataScript
+	lua := GenerateTokenAccountingScripts(countersPolicy(), ClaimModeJWTQuery, "vs-test").RespDataScript
 
 	for _, want := range []string{
 		`local meter_quality     = "none"`,
@@ -80,7 +80,7 @@ func TestMeterQualityIsPublishedForTheLedger(t *testing.T) {
 // access before pcall runs) and failed open, so no generated script may call it.
 // Every avi.http probe must go through a deferred closure instead.
 func TestNoBareAviHTTPProbes(t *testing.T) {
-	s := GenerateTokenAccountingScripts(countersPolicy(), ClaimModeJWTQuery)
+	s := GenerateTokenAccountingScripts(countersPolicy(), ClaimModeJWTQuery, "vs-test")
 	for name, lua := range map[string]string{
 		"req": s.ReqScript, "resp": s.RespScript, "respdata": s.RespDataScript,
 		"reqdata": s.ReqDataEnforceScript,
@@ -109,7 +109,7 @@ func TestNoBareAviHTTPProbes(t *testing.T) {
 // headers — so the decision has to be recorded in HTTP_RESP, where they are
 // still available.
 func TestCompressedResponseFlaggedInResponseHeaderPhase(t *testing.T) {
-	lua := GenerateTokenAccountingScripts(countersPolicy(), ClaimModeJWTQuery).RespScript
+	lua := GenerateTokenAccountingScripts(countersPolicy(), ClaimModeJWTQuery, "vs-test").RespScript
 
 	if !strings.Contains(lua, `avi.http.get_header("Content-Encoding")`) {
 		t.Error("RespScript does not inspect Content-Encoding")

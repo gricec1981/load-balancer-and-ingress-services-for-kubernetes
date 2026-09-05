@@ -59,7 +59,7 @@ func TestLivePolicyScriptsAgainstSEStub(t *testing.T) {
 		}
 	}
 
-	scripts := GenerateTokenAccountingScripts(livePolicy(), ClaimModeJWTQuery)
+	scripts := GenerateTokenAccountingScripts(livePolicy(), ClaimModeJWTQuery, "vs-test")
 
 	dir := os.Getenv("AIGW_LIVE_DUMP_DIR")
 	if dir == "" {

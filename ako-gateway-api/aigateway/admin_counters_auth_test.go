@@ -45,7 +45,7 @@ func TestCountersEndpointFollowsJWTClaimHelper(t *testing.T) {
 	for _, mode := range []AuthClaimMode{ClaimModeOAuth, ClaimModeJWTQuery} {
 		p := countersPolicy()
 		p.AdminClaimName, p.AdminClaimValue = "scope", "counters:read"
-		req := GenerateTokenAccountingScripts(p, mode).ReqScript
+		req := GenerateTokenAccountingScripts(p, mode, "vs-test").ReqScript
 
 		helperAt := strings.Index(req, "local function jwt_claim")
 		countersAt := strings.Index(req, "/v1/admin/counters")
@@ -68,7 +68,7 @@ func TestCountersEndpointFollowsJWTClaimHelper(t *testing.T) {
 // Without the annotation the gate must stay exactly as it was: shared header
 // only, no claim check. This is the rollback state, so it is worth pinning.
 func TestCountersGateDefaultsToHeaderOnly(t *testing.T) {
-	req := GenerateTokenAccountingScripts(countersPolicy(), ClaimModeJWTQuery).ReqScript
+	req := GenerateTokenAccountingScripts(countersPolicy(), ClaimModeJWTQuery, "vs-test").ReqScript
 
 	if !strings.Contains(req, `avi.http.get_header("X-Admin-Token", avi.HTTP_REQUEST) == "s3cr3t"`) {
 		t.Error("admin-token header gate missing")
@@ -92,7 +92,7 @@ func TestCountersGateDefaultsToHeaderOnly(t *testing.T) {
 func TestCountersGateAcceptsHeaderOrClaim(t *testing.T) {
 	p := countersPolicy()
 	p.AdminClaimName, p.AdminClaimValue = "scope", "counters:read"
-	req := GenerateTokenAccountingScripts(p, ClaimModeJWTQuery).ReqScript
+	req := GenerateTokenAccountingScripts(p, ClaimModeJWTQuery, "vs-test").ReqScript
 
 	block := req[strings.Index(req, "/v1/admin/counters"):]
 	for _, want := range []string{
@@ -118,7 +118,7 @@ func TestClaimOnlyKeepsEndpointAndBakesNoSecret(t *testing.T) {
 	p := countersPolicy()
 	p.AdminToken = "" // Secret annotation removed
 	p.AdminClaimName, p.AdminClaimValue = "scope", "counters:read"
-	req := GenerateTokenAccountingScripts(p, ClaimModeJWTQuery).ReqScript
+	req := GenerateTokenAccountingScripts(p, ClaimModeJWTQuery, "vs-test").ReqScript
 
 	if !strings.Contains(req, "/v1/admin/counters") {
 		t.Fatal("endpoint disappeared when the admin token was removed — " +
@@ -145,7 +145,7 @@ func TestClaimOnlyKeepsEndpointAndBakesNoSecret(t *testing.T) {
 func TestNoCredentialEmitsNoEndpoint(t *testing.T) {
 	p := countersPolicy()
 	p.AdminToken, p.AdminClaimName, p.AdminClaimValue = "", "", ""
-	if req := GenerateTokenAccountingScripts(p, ClaimModeJWTQuery).ReqScript; strings.Contains(req, "/v1/admin/counters") {
+	if req := GenerateTokenAccountingScripts(p, ClaimModeJWTQuery, "vs-test").ReqScript; strings.Contains(req, "/v1/admin/counters") {
 		t.Error("counters endpoint emitted with no credential configured")
 	}
 }
@@ -186,7 +186,7 @@ func TestEffectiveAdminSkipPaths(t *testing.T) {
 // how /v1/admin/usage failed on a live gateway: the code grew a second endpoint
 // past a path list that only named the first.
 func TestDefaultSkipPathsCoverEveryAdminEndpoint(t *testing.T) {
-	req := GenerateTokenAccountingScripts(countersPolicy(), ClaimModeJWTQuery).ReqScript
+	req := GenerateTokenAccountingScripts(countersPolicy(), ClaimModeJWTQuery, "vs-test").ReqScript
 	for _, ep := range []string{"/v1/admin/counters", UsageDrainPath} {
 		if !strings.Contains(req, `== "`+ep+`"`) {
 			continue // this build does not serve that endpoint

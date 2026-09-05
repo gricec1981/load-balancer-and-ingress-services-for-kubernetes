@@ -218,8 +218,37 @@ spec:
 - Enforces per-consumer (or per-IP) **token budgets** over rolling time windows.
 - Supports **per-group budgets** (e.g. engineering = 500 tokens/hr, product-management = 1000 tokens/hr) keyed on
   a JWT claim.
-- Optionally enforces a **classic requests-per-second** soft rate limit.
+- Optionally enforces a **classic requests-per-second** rate limit using the **native Avi rate
+  limiter** (see below).
 - All enforcement runs as Lua DataScripts on the Avi Service Engine — no extra infrastructure.
+
+### Request rate limiting — native Avi rate limiter (`requestRateLimit`)
+
+`requestRateLimit` is enforced by the **native Avi dynamic rate limiter**, not a hand-rolled
+counter. AKO publishes a `RateLimiter` (count / period / burst) on the request-phase
+`VSDataScriptSet` and the `HTTP_REQ` DataScript calls:
+
+```lua
+avi.vs.ratelimit.exceed("<vs>-ai-rps", rk)   -- rk = consumer identity, else client IP
+```
+
+The Service Engine owns the per-`request_key` token bucket and keeps it **consistent across
+Virtual Service scale-out** (distributed; patent US10182057B1) — so a `requestsPerSecond` of 10 is
+~10 RPS for the whole VS, not 10× the number of SEs. `key: consumer` buckets per resolved
+identity (the `x-ai-consumer` header set by `AIGatewayAuthPolicy`, falling back to the client IP);
+`key: clientIP` (default) buckets per source IP. `burst` maps to the limiter's burst size and
+defaults to `requestsPerSecond`.
+
+> This replaces the earlier per-SE soft token bucket (a `table_lookup` + remove-then-insert in
+> Lua), which counted independently on each SE and so over-admitted under VS scale-out. The CRD
+> fields are unchanged. **Upgrade note:** on a scaled-out VS the *effective* limit tightens from
+> roughly `requestsPerSecond × number-of-SEs` to `requestsPerSecond`; size the value for the whole
+> VS. Verify behavior on your target SE build (32.x) before relying on it in production.
+
+> **Token budgets stay in DataScript.** Only the request-rate path is native. Per-group/per-tier
+> budgets, post-response token accounting, fixed-window resets and the admin counters endpoint
+> don't map onto the native limiter, so token budgets remain SE shared-state counters (next
+> section).
 
 ### Token usage source — the response body (`HTTP_RESP_DATA`)
 
@@ -277,10 +306,11 @@ Two safeguards keep the body-parse path honest:
 | Policy field | Avi mechanism |
 |---|---|
 | `limits[]` | Three **DataScript** nodes per VS: `<vsname>-ai-tok-req` (HTTP_REQ — enforce budget), `<vsname>-ai-tok-resp` (HTTP_RESP — enable response-body buffering), and `<vsname>-ai-tok-respdata` (HTTP_RESP_DATA — parse `usage` from the body and update counters). |
-| `requestRateLimit` | Soft token-bucket logic prepended to the `HTTP_REQ` DataScript. |
+| `requestRateLimit` | A native Avi `RateLimiter` (count/period/burst) on the `<vsname>-ai-tok-req` `VSDataScriptSet` (`rate_limiters`), referenced from the `HTTP_REQ` DataScript via `avi.vs.ratelimit.exceed("<vsname>-ai-rps", request_key)`. The SE owns the per-`request_key` token bucket. |
 
-Counters are stored in the Avi VS string table (`avi.vs.table_lookup` / `table_remove` /
-`table_insert`), which Avi replicates across all SEs hosting the VS.
+Token-budget counters are stored in the Avi VS string table (`avi.vs.table_lookup` /
+`table_remove` / `table_insert`), which Avi replicates across all SEs hosting the VS. The
+`requestRateLimit` bucket, by contrast, is owned by the native rate limiter.
 
 > **Consistency model:** counters are **eventually consistent** across scaled-out SEs — a
 > consumer can briefly overshoot a budget by about one request-window before replication
