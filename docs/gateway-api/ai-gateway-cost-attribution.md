@@ -1,6 +1,6 @@
 # AI Gateway — cost attribution across user, agent and tool
 
-Status: designed 2026-09-05; phase 1 in progress. Companion to
+Status: designed 2026-09-05; **phase 1 LIVE and verified the same day** (chain id on the record, console → hub → agent propagation, Chains view; a coordinator turn as `alice` joined as 4 hops across agent-hub and load-controller). Phases 2-4 open. Companion to
 [ai-gateway-token-ledger.md](ai-gateway-token-ledger.md) (the record and the collector) and
 [ai-gateway-agentminder-pdp.md](ai-gateway-agentminder-pdp.md) §9 (the audit join).
 
