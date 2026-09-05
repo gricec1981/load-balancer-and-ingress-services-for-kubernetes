@@ -220,7 +220,11 @@ end`
 // builds this string per response, and _safe has already guaranteed every field
 // is free of the delimiter. The collector splits it.
 //
-//	ts | identity | model | tier | prompt | completion | cached | reasoning | quality | route
+//	ts | identity | model | tier | prompt | completion | cached | reasoning | quality | route | chain
+//
+// `chain` is the W3C trace id carried in by the request (see buildChainIDBlock);
+// empty when the caller sent none. Appended last so a collector that knows only
+// ten fields still parses the first ten.
 //
 // Only responses the meter actually saw are recorded (`meter_quality ~= "none"`),
 // so a health check or a non-JSON response costs nothing here. Penalty rows ARE
@@ -258,6 +262,7 @@ do
       .. "|" .. tostring(reasoning_tokens)
       .. "|" .. meter_quality
       .. "|" .. %q
+      .. "|" .. _safe(avi.http.get_reqvar("ai_chain") or "", 32)
     avi.vs.table_remove(%q .. seq)
     avi.vs.table_insert(%q .. seq, rec, %d)
   end
@@ -289,4 +294,33 @@ func safeRouteName(route string) string {
 		return "-"
 	}
 	return string(out)
+}
+
+// ChainHeader is the request header carrying the chain id: W3C traceparent,
+// "00-<32 hex trace-id>-<16 hex span-id>-<flags>". The trace id is the chain.
+const ChainHeader = "traceparent"
+
+// buildChainIDBlock returns HTTP_REQ Lua that keeps the caller's chain id in the
+// `ai_chain` reqvar for the response phases to record. Only the 32-hex trace id
+// is kept — it is what every hop of one user request shares — and only when the
+// header has the standard shape; anything else records as no chain rather than
+// as a made-up one. The SE does not mint an id: a request that arrives without
+// one is a chain of its own, and saying so is more honest than inventing a root.
+func buildChainIDBlock() string {
+	return fmt.Sprintf(`-- AKO AI Gateway: chain id (W3C traceparent trace-id → reqvar ai_chain)
+do
+  local _tp = nil
+  pcall(function() _tp = avi.http.get_header(%q, avi.HTTP_REQUEST) end)
+  if _tp ~= nil and type(_tp) == "string" and #_tp >= 55 and string.sub(_tp, 3, 3) == "-" and string.sub(_tp, 36, 36) == "-" then
+    local _tid = string.lower(string.sub(_tp, 4, 35))
+    local _ok = true
+    for _i = 1, 32 do
+      local _b = string.byte(_tid, _i)
+      if not ((_b >= 48 and _b <= 57) or (_b >= 97 and _b <= 102)) then _ok = false break end
+    end
+    if _ok and _tid ~= "00000000000000000000000000000000" then
+      pcall(function() avi.http.set_reqvar("ai_chain", _tid) end)
+    end
+  end
+end`, ChainHeader)
 }

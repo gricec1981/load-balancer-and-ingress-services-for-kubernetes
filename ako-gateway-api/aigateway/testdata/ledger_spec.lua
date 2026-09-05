@@ -98,7 +98,7 @@ do
   check(r ~= nil, "a completion appends one usage record")
   if r then
     local f = split(r)
-    eq(#f, 10, "record has all ten fields")
+    eq(#f, 11, "record has all eleven fields")
     eq(f[2], "alice", "record carries the JWT sub as identity")
     eq(f[3], "qwen3-14b-awq", "record carries the model the backend served")
     eq(f[5], "31", "record carries prompt tokens")
@@ -107,6 +107,7 @@ do
     eq(f[8], "5", "record carries reasoning tokens as their own dimension")
     eq(f[9], "exact", "a parsed usage block is provenance 'exact'")
     eq(f[10], "llm-route", "record carries the HTTPRoute it was measured on")
+    eq(f[11], "-", "a request with no traceparent records no chain (the placeholder, as for any absent field) — the SE never invents one")
   end
 end
 
@@ -245,3 +246,32 @@ if failures > 0 then
   os.exit(1)
 end
 io.write("all SE-stub assertions passed\n")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 8. The chain id. A W3C traceparent on the request is recorded as its 32-hex
+--    trace id, so every hop of one user request — persona, hub, agent, tool —
+--    lands in the ledger under the same id. A malformed header records nothing.
+-- ─────────────────────────────────────────────────────────────────────────────
+do
+  local function last_record()
+    local best, rec = -1, nil
+    for k, e in pairs(SE.T) do
+      if string.sub(k, 1, 8) == "ai_urec:" and e.exp > SE.env.now then
+        local n = tonumber(string.sub(k, 9))
+        if n > best then best, rec = n, e.v end
+      end
+    end
+    return rec
+  end
+
+  request({ body = COMPLETION, respheaders = { ["Content-Type"] = "application/json" },
+            reqheaders = { traceparent = "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01" } })
+  local f = split(last_record() or "")
+  eq(#f, 11, "chained record has eleven fields")
+  eq(f[11], "4bf92f3577b34da6a3ce929d0e0e4736", "record carries the traceparent trace id, lower-cased")
+
+  request({ body = COMPLETION, respheaders = { ["Content-Type"] = "application/json" },
+            reqheaders = { traceparent = "not-a-traceparent" } })
+  f = split(last_record() or "")
+  eq(f[11], "-", "a malformed traceparent records no chain rather than a made-up one")
+end

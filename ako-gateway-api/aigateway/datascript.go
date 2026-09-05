@@ -191,6 +191,7 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 	reqParts = append(reqParts, "-- AKO AI Gateway: token-budget enforcement")
 	reqParts = append(reqParts, identityBlock)
 	reqParts = append(reqParts, "local now = os.time()")
+	reqParts = append(reqParts, buildChainIDBlock())
 
 	// Limits whose budget depends on the tier (groupHeader "reqvar:ai_tier") are
 	// enforced in HTTP_REQ_DATA instead, because the tier is only set there (by the
