@@ -254,6 +254,15 @@ Recommend **B**, with the existing CRD tables demoted to the backstop described 
 deployed, but a correctly-minted token should never be denied by them. If one is, the catalog and
 the CRD have drifted — alert on it rather than relying on it.
 
+**What runs today (2026-09-05) is C, and it is not a fallback.** On `authMode: jwtHeader` the SE
+exposes only the validated `sub` (`avi.http.get_userid()`), so neither an intent claim (A) nor a
+resolved-tools claim (B) is readable at the front door; both stay tied to `jwtQuery` and its
+`orig_uri` leak. `ako-inference-demo/am-sync-bindings.sh` resolves the AgentMinder chain
+(`AgentAuthzSurface` × `AgentToolBindingsHelper`) per MCP server and replaces `toolAccess.rules`
+keyed on the agent client id. Measured: grant widened in the console → CRD patched → AKO re-baked
+the DataScript in 4 s → the SE's `ALLOW` table carried the new tools. The two-sources-of-truth
+objection is answered by making the sync the only writer of those rules.
+
 ### 7.4 Free server-level authorization, via the audience
 
 `primaryAudience` is per resource-server app, and the SE already validates `aud` in crypto before
