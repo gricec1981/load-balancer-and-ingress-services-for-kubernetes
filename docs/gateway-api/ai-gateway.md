@@ -205,7 +205,7 @@ spec:
 ### What it does
 
 - Enforces per-consumer (or per-IP) **token budgets** over rolling time windows.
-- Supports **per-group budgets** (e.g. group1 = 500 tokens/hr, group2 = 1000 tokens/hr) keyed on
+- Supports **per-group budgets** (e.g. engineering = 500 tokens/hr, product-management = 1000 tokens/hr) keyed on
   a JWT claim.
 - Optionally enforces a **classic requests-per-second** soft rate limit.
 - All enforcement runs as Lua DataScripts on the Avi Service Engine — no extra infrastructure.
@@ -327,8 +327,8 @@ spec:
 ### Per-group budget example
 
 The counter stays **per-consumer** (each user gets their own running total), but the *budget
-ceiling* is looked up from the user's group claim. Users in `group1` get 500 tokens/hour; users
-in `group2` get 1000. Requests whose group is not listed are rejected with HTTP 403 (set a
+ceiling* is looked up from the user's group claim. Users in `engineering` get 500 tokens/hour; users
+in `product-management` get 1000. Requests whose group is not listed are rejected with HTTP 403 (set a
 positive `budget` to instead use it as the fallback ceiling for unknown groups).
 
 ```yaml
@@ -338,8 +338,8 @@ spec:
       key: consumer            # per-user counter
       groupHeader: group       # JWT claim (decoded from the token) that selects the budget
       groupBudgets:
-        group1: 500
-        group2: 1000
+        engineering: 500
+        product-management: 1000
       budget: 0                # 0 = reject unknown groups (403); >0 = fallback ceiling
       tokens: total
       window: 1h
@@ -429,7 +429,7 @@ spec:
     - name: hourly-group-budget
       key: consumer
       groupHeader: group
-      groupBudgets: { group1: 500, group2: 1000 }
+      groupBudgets: { engineering: 500, product-management: 1000 }
       budget: 0
       tokens: total
       window: 1h
@@ -470,7 +470,7 @@ AKO applies both policies during the same `BuildChildVS` reconcile cycle.
 | `spec.limits[].budget` | int64 | yes | Max token count in the window. With `groupBudgets`, `0` rejects unknown groups; `>0` is the fallback ceiling |
 | `spec.limits[].window` | string | yes | Time window: `30s`, `1m`, `1h`, `24h`, etc. |
 | `spec.limits[].groupHeader` | string | no | Selector whose value picks a per-group budget. A verified JWT claim name (e.g. `group`), or `reqvar:<name>` to read a request-scoped variable — e.g. `reqvar:ai_tier` for **per-tier budgets** set by an [`AIModelRoutePolicy`](model-routing.md). A `reqvar:` limit is enforced in `HTTP_REQ_DATA` (after the variable is set), not `HTTP_REQ`. |
-| `spec.limits[].groupBudgets` | map[string]int64 | no | Group/tier value → budget (e.g. `{group1: 500, group2: 1000}` or `{premium: 500, economy: 100000}`). Requires `groupHeader` |
+| `spec.limits[].groupBudgets` | map[string]int64 | no | Group/tier value → budget (e.g. `{engineering: 500, product-management: 1000}` or `{premium: 500, economy: 100000}`). Requires `groupHeader` |
 | `spec.limits[].action.type` | string | no | `Reject` (default) or `Log` |
 | `spec.limits[].action.statusCode` | int | no | HTTP status on rejection. Default: `429` |
 | `spec.limits[].action.retryAfter` | bool | no | Add `Retry-After` header on rejection |

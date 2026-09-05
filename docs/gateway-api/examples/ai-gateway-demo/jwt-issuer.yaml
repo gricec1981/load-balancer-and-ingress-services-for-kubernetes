@@ -20,7 +20,7 @@
 # Which user /authorize logs in is selected by the "demo_user" cookie (default
 # alice) so the flow can be driven non-interactively with curl:
 #   curl -c jar -b "demo_user=bob" ...
-# User -> group mapping: alice/carol -> group1, bob -> group2, dave -> admin.
+# User -> group mapping: alice/carol -> engineering, bob -> product-management, dave -> admin.
 
 apiVersion: v1
 kind: ConfigMap
@@ -42,7 +42,7 @@ data:
     KID      = "demo-key-1"
 
     # demo identities -> group claim
-    USERS = {"alice": "group1", "carol": "group1", "bob": "group2", "dave": "admin"}
+    USERS = {"alice": "engineering", "carol": "engineering", "bob": "product-management", "dave": "admin"}
 
     with open(KEY_PATH, "rb") as f:
         private_key = serialization.load_pem_private_key(f.read(), password=None)
@@ -134,7 +134,7 @@ data:
                 self._send(302, extra={"Location": redirect_uri + sep + urlencode(params)})
             elif path == "/token":  # legacy direct mint (claim tests)
                 sub   = qs.get("sub", ["alice"])[0]
-                group = qs.get("group", [USERS.get(sub, "group1")])[0]
+                group = qs.get("group", [USERS.get(sub, "engineering")])[0]
                 # Any extra query param becomes an extra JWT claim (e.g. agent_id=orchestrator).
                 reserved = {"sub", "group"}
                 extra = {k: v[0] for k, v in qs.items() if k not in reserved}

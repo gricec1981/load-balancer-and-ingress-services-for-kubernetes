@@ -73,8 +73,9 @@ spec:
     key: consumer          # per-user counter (verified sub claim)
     groupHeader: group     # budget ceiling looked up from this verified claim
     groupBudgets:
-      group1: 500          # 5 x 100-token requests / hr
-      group2: 1000         # 10 x 100-token requests / hr
+      engineering:        500    # 5 x 100-token requests / hr
+      product-management: 1000   # 10 x 100-token requests / hr
+      agents:             10000  # the agent fleet: many small calls, one ceiling
     budget: 0              # 0 = reject unknown groups (403); >0 = fallback ceiling
     tokens: total
     window: 1h

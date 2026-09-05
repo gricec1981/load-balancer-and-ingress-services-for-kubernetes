@@ -488,7 +488,7 @@ kubectl get gateway avi-gateway -n inference \
 `jwt-issuer.yaml` exposes `GET /jwks` (SE — actually AKO — fetches the public keyset) and a
 legacy direct-mint endpoint `GET /token?sub=&group=` for claim tests. `jwtQuery` clients use
 **only** the direct mint — no `/authorize` OAuth dance needed. User → group:
-**alice/carol → group1, bob → group2, dave → admin.** Any extra query param on `/token` becomes
+**alice/carol → engineering, bob → product-management, dave → admin.** Any extra query param on `/token` becomes
 an extra JWT claim (e.g. `&agent_id=orchestrator`, used later for A2A).
 
 ```bash
@@ -641,13 +641,13 @@ EOF
 identity claim — it names a **JWT claim**, not an HTTP header, despite the field's name. That
 means the group-budget policy below is **byte-for-byte identical** whether `llm-auth` uses
 `oauthBrowser` or `jwtQuery` — only the auth policy's `authMode` and how the client presents the
-token change. Verified group1 users get 500 tokens/hr, group2 get 1000; unknown groups → 403.
+token change. Verified engineering users get 500 tokens/hr, product-management get 1000; unknown groups → 403.
 
 Create the policy from the UI:
 
 1. Open **Governance → Token Rate Limits** and click **+ Create**.
 2. Name `llm-limits`, Namespace `inference`, Target HTTPRoute `llm-route`.
-3. Per-group budgets: **+ Add group** `group1` / `500`, then **+ Add group** `group2` / `1000`.
+3. Per-group budgets: **+ Add group** `engineering` / `500`, then **+ Add group** `product-management` / `1000`.
 4. Limit settings: Window `1h`, Token dimension `total`, Fallback budget (unknown group) `0`
    (0 = reject unknown groups, HTTP 403), Reject status code `429`, check **Send Retry-After
    header**.
@@ -659,8 +659,8 @@ Run it — mint tokens for two users and drive each to their group's ceiling:
 kubectl port-forward -n inference svc/jwt-issuer 8080:8080 &
 PF_PID=$!
 mint() { curl -s "http://localhost:8080/token?sub=$1" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])'; }
-TOKEN_ALICE=$(mint alice)   # group1 -> budget 500 (5 requests)
-TOKEN_BOB=$(mint bob)       # group2 -> budget 1000 (10 requests)
+TOKEN_ALICE=$(mint alice)   # engineering -> budget 500 (5 requests)
+TOKEN_BOB=$(mint bob)       # product-management -> budget 1000 (10 requests)
 TOKEN_DAVE=$(mint dave)     # admin  -> not in groupBudgets -> 403
 kill $PF_PID
 
@@ -669,8 +669,8 @@ hit() { curl -sk -o /dev/null -w "%{http_code} " -X POST "https://llm.demo.local
   --resolve "llm.demo.local:443:${VIP}" -H "Content-Type: application/json" \
   -d '{"model":"mock-llm-v1","messages":[{"role":"user","content":"hi"}]}'; }
 
-echo "alice (group1):"; for i in $(seq 1 6); do hit "$TOKEN_ALICE"; done; echo
-echo "bob (group2):";   for i in $(seq 1 11); do hit "$TOKEN_BOB"; done; echo
+echo "alice (engineering):"; for i in $(seq 1 6); do hit "$TOKEN_ALICE"; done; echo
+echo "bob (product-management):";   for i in $(seq 1 11); do hit "$TOKEN_BOB"; done; echo
 echo "dave (admin):";   hit "$TOKEN_DAVE"; echo
 ```
 

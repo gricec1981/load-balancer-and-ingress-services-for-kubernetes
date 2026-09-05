@@ -411,7 +411,7 @@ curl -sX POST http://<ui>/api/agents -H 'Content-Type: application/json' -d '{
   "name": "incident-analyst",
   "description": "Triages an AKO/Avi incident by gathering live log, source-code and public evidence in parallel.",
   "systemPrompt": "You are incident-analyst … name the exact pod, log line, file or URL you relied on.",
-  "model": "qwen3-14b", "group": "group2", "maxSteps": 4,
+  "model": "qwen3-14b", "group": "agents", "maxSteps": 4,
   "runtime": "adk",
   "mcpServers": ["k8s-logs", "rag", "web-search"],
   "skills": [{"id": "incident.triage", "name": "incident-triage", "description": "…"}],
