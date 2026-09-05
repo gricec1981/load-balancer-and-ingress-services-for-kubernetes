@@ -244,10 +244,13 @@ defaults to `requestsPerSecond`.
 > fields are unchanged. **Upgrade note:** on a scaled-out VS the *effective* limit tightens from
 > roughly `requestsPerSecond × number-of-SEs` to `requestsPerSecond`; size the value for the whole
 > VS. Verify behavior on your target SE build (32.x) before relying on it in production.
-
-> **Token budgets stay in DataScript.** Only the request-rate path is native. Per-group/per-tier
-> budgets, post-response token accounting, fixed-window resets and the admin counters endpoint
-> don't map onto the native limiter, so token budgets remain SE shared-state counters (next
+> **Token budgets can be native too.** Each `limits[]` entry takes `backend: datascript`
+> (default — per-SE shared-state counter, fixed calendar window, feeds the admin counters
+> endpoint) or `backend: native` — the Avi rate limiter (`avi.vs.ratelimit.exceed`), exact
+> across SEs, enforced by a *deferred carry* charged at the gate, with the DataScript table
+> kept for display only. `llm-limits` on the lab front door runs `native`. Limits keyed on a
+> reqvar (`groupHeader: reqvar:ai_tier`) stay on the DataScript path. Design and the live
+> findings that shaped it: [native-token-budget-design.md](native-token-budget-design.md).
 > section).
 
 ### Token usage source — the response body (`HTTP_RESP_DATA`)
@@ -312,11 +315,13 @@ Token-budget counters are stored in the Avi VS string table (`avi.vs.table_looku
 `table_remove` / `table_insert`), which Avi replicates across all SEs hosting the VS. The
 `requestRateLimit` bucket, by contrast, is owned by the native rate limiter.
 
-> **Consistency model:** counters are **eventually consistent** across scaled-out SEs — a
-> consumer can briefly overshoot a budget by about one request-window before replication
-> catches up. RPS limiting is also soft (per-window token bucket). Both are intentional
-> trade-offs; the Phase 1.5 roadmap item is Avi's native distributed rate limiter for exact
-> cross-SE enforcement.
+> **Consistency model:** with `backend: native` (the LLM front door today) a budget is
+> enforced by the Avi rate limiter — **exact across scaled-out SEs**, on a rolling
+> token-bucket window rather than a calendar reset. With the default `backend: datascript`
+> the counter is per-SE and eventually consistent: a consumer can briefly overshoot by about
+> one request-window. In both modes the number the console *displays* is the per-SE table,
+> so it is approximate even where enforcement is exact. RPS limiting (`requestRateLimit`) is
+> native in both modes.
 
 ### Identity resolution
 
@@ -573,12 +578,12 @@ Install the CRDs and restart the `ako-gateway-api` pod.
 | Phase | Feature | Status |
 |---|---|---|
 | 1 | `AITokenRateLimitPolicy` — DataScript token accounting | ✅ Done |
-| 1 | Soft RPS rate limiting (DataScript token bucket) | ✅ Done |
+| 1 | RPS rate limiting — now on the **native Avi rate limiter** (`avi.vs.ratelimit.exceed`), replacing the per-SE DataScript token bucket (2026-06-16) | ✅ Done |
 | 1.5 | Per-group token budgets (`groupHeader` / `groupBudgets`) | ✅ Done |
 | 2 | `AIGatewayAuthPolicy` — OAuth/OIDC auth, AKO-managed `Pool` + `AuthProfile` + `SSOPolicy` lifecycle | ✅ Done |
 | 2 | Verified claims in the DataScript via `oauth_get_claim` | ✅ Done |
 | 2.x | [`AIModelRoutePolicy`](model-routing.md) — route by request-body `model` to per-tier `InferencePool` backends (`avi.poolgroup.select`), group entitlement, per-tier token budgets | ✅ Done |
-| 2.5 | Native distributed rate limiter (`avi.vs.rate_limiter()`) for exact cross-SE limits | Planned — filed as an RFE |
+| 2.5 | **Native token budgets** — `limits[].backend: native`: Avi RateLimiter objects + deferred carry, exact across SEs; DataScript table kept for display (2026-06-17, live on `llm-limits`) | ✅ Done |
 | 2.5 | `AIObservabilityPolicy` — per-request token usage logging | ✅ Superseded and delivered as the [token ledger](ai-gateway-token-ledger.md): one immutable usage record per metered response, drained into a durable store |
 | 3 | MCP tool governance | ✅ Done — shipped as [`AIMCPRoutePolicy`](ai-gateway-mcp.md), not the `AIMCPPolicy` sketched below |
 | 3 | MCP registry integration — the gateway brokers only servers on an approved list | ✅ Done — `mcp-registry` ConfigMap, enforced by the factory and the console |

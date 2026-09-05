@@ -48,10 +48,10 @@ core — and they cluster in **guardrails (semantic)** and **metering (streaming
 | **Inference load balancing** (metric-weighted pools) | SE-native Inference Extension (KV-cache/queue-weighted) | — (already native) | ✅ on SE |
 | **Model-tier routing** (quality/cost, entitlement-gated) | DataScript parses `model` from body → pool-group select | Native model-aware routing (read `model` without scripting) | ✅ works → native |
 | **Signature guardrails / DLP** (secrets, PII, known injection) | SE-native WAF (ModSecurity SecRules) | — (already native) | ✅ on SE |
-| **Request rate limiting** | DataScript soft token bucket | Native distributed rate limiter | ✅ works → native |
-| **Token metering — non-streaming** | DataScript counters in SE shared state | Native per-response token accounting | ✅ works → native |
+| **Request rate limiting** | Native Avi rate limiter (`avi.vs.ratelimit.exceed`) since 2026-06-16 | — (already native) | ✅ on SE |
+| **Token metering — non-streaming** | DataScript reads the `usage` block; on `backend: native` the budget is enforced by native RateLimiter objects via a deferred carry (exact across SEs), the DataScript table kept for display | Native per-response token accounting, so the displayed and enforced numbers are one | ✅ works → native |
 | **Token metering — streaming** | **Not possible** — `RESP_DATA` is buffer-complete; metering a stream collapses it | **Native per-chunk metering** that taps the live stream | ⚠️ **move to SE** |
-| **Multi-cluster / global budgets** | Per-SE eventually-consistent string table | **Native distributed token counter** (global budget across the fabric) | ⚠️ **move to SE** |
+| **Multi-cluster / global budgets** | Native limiter is exact within one VS on one fabric; across gateways/sites there is still no shared counter | **Native distributed token counter** (global budget across the fabric) | ⚠️ **move to SE** |
 | **Semantic prompt-injection** (novel/paraphrase) | **ICAP callout** to an external classifier — request-only, block-only | **Native streaming-aware AI callout** (request + response) | ⚠️ **move to SE** |
 | **Response-side guardrails** (output DLP, indirect injection, system-prompt leak) | **Not feasible** — response inspection breaks streaming | **Native per-chunk response inspection** | ⚠️ **move to SE** |
 | **Redaction / masking** (vs. blunt block) | Block-only (WAF/ICAP reject the whole request) | **Native modify** — strip/mask and continue | ⚠️ **move to SE** |

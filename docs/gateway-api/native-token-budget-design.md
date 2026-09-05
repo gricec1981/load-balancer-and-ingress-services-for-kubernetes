@@ -1,6 +1,6 @@
 # Design: token budgets on the native Avi rate limiter
 
-**Status:** proposal — for sign-off before implementation.
+**Status:** BUILT and live — `limits[].backend: native` (deferred carry gated on the charge, §6d); running on `llm-limits` and `ledger-stress-limits` on vks-ai-01, verified on the controller 2026-09-05 (4 RateLimiter objects on the `-ai-tok-native` set, `avi.vs.ratelimit.exceed` in HTTP_REQ; the old sets only count). Kept as the design record.
 **Goal:** enforce AITokenRateLimitPolicy **token budgets** with the native Avi
 rate limiter (`avi.vs.ratelimit.exceed`) instead of the per-SE DataScript counter,
 so budgets are **consistent across SEs / VS scale-out**. Request-rate is out of

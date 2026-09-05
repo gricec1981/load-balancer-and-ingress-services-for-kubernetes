@@ -125,7 +125,7 @@ which survives to the policy layer. Both modes require the listener to terminate
 
 The gateway meters **token usage**, not just request count. It reads token counts from model
 responses and maintains running counters per consumer and per group in Service Engine shared
-state, enforcing **token budgets** over a time window alongside classic request-rate limits.
+state, enforcing **token budgets** over a time window alongside classic request-rate limits. Per limit, enforcement is either the DataScript counter (per-SE, default) or — with `backend: native`, which the LLM front door runs — the Avi rate limiter, exact across Service Engines.
 Budgets vary by group, so different tiers of users get different ceilings. Usage is also exposed
 through a read-only counters endpoint that the [console](#console--the-ai-gateway-ui) polls.
 Token counting is configured with an `AITokenRateLimitPolicy` and keys its accounting on the

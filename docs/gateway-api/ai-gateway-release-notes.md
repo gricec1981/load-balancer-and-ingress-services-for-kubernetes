@@ -12,7 +12,7 @@ For the whole system in one place — architecture, console guide, how-tos, secu
 |---|---|---|---|
 | Metric-weighted inference load balancing | 2026-05-08 | Built · p90 TTFT ~125 s → ~10 s under load | [inference-extension.md](inference-extension.md) |
 | `AIGatewayAuthPolicy` — OIDC / JWT at the SE | 2026-05-28 | Built · two modes (`oauthBrowser`, `jwtQuery`) | [ai-gateway-auth.md](ai-gateway-auth.md) |
-| `AITokenRateLimitPolicy` — token budgets | 2026-05-28 | Built · per-group budgets, counters endpoint, epoch reset | [ai-gateway.md](ai-gateway.md) |
+| `AITokenRateLimitPolicy` — token budgets | 2026-05-28 | Built · per-group budgets, counters endpoint; `backend: native` (Avi rate limiter, cross-SE exact) since 2026-06-17, live on the LLM front door | [ai-gateway.md](ai-gateway.md) |
 | Real OIDC SSO + per-group budgets | 2026-05-31 | Built | [ai-gateway.md](ai-gateway.md) |
 | Token counters endpoint + console reset | 2026-06-06 | Built · claim-gated since 2026-08-16 | [ai-gateway.md](ai-gateway.md) |
 | `AIModelRoutePolicy` — quality/cost tier routing | 2026-06-07 | Built · four tier kinds: InferencePool, Service, Provider, Remote | [model-routing.md](model-routing.md) |
@@ -688,7 +688,7 @@ the tier is known only after the body is read, such limits enforce in `HTTP_REQ_
   *Resolved 2026-08-08* (`dc2c768d`), which also added Provider tiers on 2026-08-09.
 - **32 KB request-body buffer** — `model` is at the JSON start so the head suffices; larger bodies are not
   validated.
-- Inherits the token policy's eventually-consistent counters and soft RPS.
+- Inherits the token policy's consistency model: exact on `backend: native`, per-SE on `datascript`; RPS is native.
 
 ### Upgrade notes
 
@@ -746,7 +746,7 @@ to query without hardcoding them.
 - **Streaming responses are not token-metered.** With `stream: true` the DataScript cannot read the body
   without buffering, and buffering collapses streaming, so streamed requests bypass the budget (count 0).
   Use non-streaming where budgets must hold. The proper fix is a native SE capability — tracked as an RFE.
-- **Counters are per-SE and eventually consistent.** With multiple SEs a budget can overshoot by roughly the
+- **Enforcement is exact only on `backend: native`.** On the default `datascript` backend counters are per-SE and eventually consistent, so with multiple SEs a budget can overshoot by roughly the
   SE count. Exact fabric-wide budgets need a native distributed counter — RFE.
 - **The OAuth issuer is a single pod.** Restarts re-IP and break the pinned OAuth pool until reconciled.
 

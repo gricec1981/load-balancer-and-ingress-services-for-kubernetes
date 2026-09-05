@@ -60,7 +60,7 @@ Three claims define the design:
 |---|---|---|---|---|
 | **Inference load balancing** | Metric-weighted LB across model-server pods — KV-cache use, queue depth, running slots | `InferencePool` | Models · Gateways ▸ Inference | Built |
 | **Authentication** | JWT/OIDC validation at the SE; verified claims exposed to every downstream policy | `AIGatewayAuthPolicy` | Governance | Built |
-| **Token budgets** | Per-consumer / per-group token ceilings over a window, plus request rate limits | `AITokenRateLimitPolicy` | Governance ▸ Token Rate Limits | Built |
+| **Token budgets** | Per-consumer / per-group token ceilings over a window, plus request rate limits. Per limit, `backend: native` enforces on the Avi rate limiter (exact across SEs — the LLM front door runs this) or `datascript` (per-SE counter, default) | `AITokenRateLimitPolicy` | Governance ▸ Token Rate Limits | Built |
 | **Model routing** | Requested `model` → quality/cost tier; group entitlement with downgrade or reject | `AIModelRoutePolicy` | Governance ▸ Model Routing Policies | Built |
 | **External provider tiers** | A tier whose backend is a public API (e.g. Gemini) reached SE-native over egress | `AIModelRoutePolicy.tiers[].provider` | Governance ▸ Model Routing Policies | Built |
 | **Remote-site tiers** | A tier whose backend is a **peer AI Gateway in another cluster**, reached by FQDN over SE egress with a Host-bearing health monitor. Verified cross-cluster | `AIModelRoutePolicy.tiers[].remote` | Governance ▸ Model Routing Policies | Built |
@@ -788,7 +788,7 @@ Stated plainly, because several of them change what the numbers mean.
 | Limit | Detail |
 |---|---|
 | **Streaming is not metered** | With `stream: true` the SE cannot read the response body without buffering, and buffering collapses streaming. Streamed requests currently bypass the budget (count 0). Use non-streaming where budgets must hold. The fix is a native SE per-chunk event — filed as an RFE. |
-| **Enforcement counters are per-SE and per-VS** | Each SE enforces against its local table, so a budget can overshoot by roughly the SE count, and the LLM / MCP / A2A virtual services keep separate tables. Exact fabric-wide budgets need a native distributed counter — RFE. |
+| **Enforcement is exact only on `backend: native`** | With `native` (the LLM front door) the Avi rate limiter enforces, exact across SEs, on a rolling window. With the default `datascript` each SE enforces against its local table and a budget can overshoot by roughly the SE count. In both modes the **displayed** counter is the per-SE table, so the console figure is approximate even where enforcement is exact; and the LLM / MCP / A2A virtual services keep separate limiters and tables. |
 | **Counters have no history** | The enforcement key is window-scoped with a TTL; at the boundary it drops to zero and the bucket is gone. History lives in the ledger, not the counter. |
 | **Ledger vs counters differ by design** | The counter is fast, local and pessimistic; the ledger is exact, durable and attributable. Treat a gap as expected, not as a bug. |
 | **`jwtQuery` forwards the token upstream** | The query string reaches the backend, so the token can land in *its* logs. Query-strip before the pool is the open hardening step (§6.5). |

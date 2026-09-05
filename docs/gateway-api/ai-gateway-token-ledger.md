@@ -45,7 +45,7 @@ and adds a ledger beside it.
 | 1 | Penalty charged whenever `usage` was absent → one `GET /v1/models` = 65 536 tokens | `datascript.go` — **fixed**, `711e8293` |
 | 2 | Streaming counts **zero** (`text/event-stream` never buffered) → silent budget bypass | `buildBufferEnableBlock` |
 | 3 | No history — key is `floor(now/window)*window` with a TTL; at the boundary the number drops to 0 and the bucket is gone | `counterKeyExpr` |
-| 4 | Per-SE **and** per-VS — two SEs hold two half-counts; LLM / mcp-gateway / a2a VSes keep separate tables, so there is no estate total | `avi.vs.table_*` |
+| 4 | The *display* counter is per-SE **and** per-VS — two SEs hold two half-counts and LLM / mcp-gateway / a2a VSes keep separate tables, so there is no estate total. (Enforcement on `backend: native` is exact across SEs; this row is about the number the console shows.) | `avi.vs.table_*` |
 | 5 | No enumeration — `?users=a,b,c` only shows identities you already guessed | `buildCountersEndpointBlock` |
 | 6 | Lost increments — `lookup → remove → insert` is not atomic | `buildRespLimitBlock` |
 | 7 | One dimension (`sub` × limit) — no model, tier, surface, or cached/reasoning split, so no cost and no "which model burned it" | schema |
