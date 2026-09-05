@@ -328,11 +328,18 @@ func groupReadExpr(groupHeader string) string {
 //     safe ONLY because the SE already verified the signature/aud/exp — never
 //     emit this variant on a VS that isn't enforcing jwt_config validation.
 //
-// Both variants are sandbox-safe (no string.match, tonumber guarded) and yield ""
+//   - ClaimModeJWTHeader: the SE validated a bearer in the Authorization header
+//     and stripped it. Only the subject survives to Lua (avi.http.get_userid),
+//     so jwt_claim("sub") works and any other claim is "".
+//
+// All variants are sandbox-safe (no string.match, tonumber guarded) and yield ""
 // rather than raising on a missing claim or unauthenticated request.
 func jwtClaimHelper(mode AuthClaimMode) string {
-	if mode == ClaimModeJWTQuery {
+	switch mode {
+	case ClaimModeJWTQuery:
 		return jwtQueryClaimHelper()
+	case ClaimModeJWTHeader:
+		return jwtHeaderClaimHelper()
 	}
 	return `-- AKO AI Gateway: read a claim from the OAuth-validated access token.
 -- avi.http.oauth_get_claim(provider_index, claim) returns the claim value; for
@@ -415,6 +422,38 @@ local function jwt_claim(claim)
   local payload = d2 and string.sub(tok, d1 + 1, d2 - 1) or string.sub(tok, d1 + 1)
   return _json_scalar(_b64url_decode(payload), claim)
 end`, JwtQueryParamName, len(JwtQueryParamName)+1)
+}
+
+// jwtHeaderClaimHelper returns the ClaimModeJWTHeader variant of jwt_claim. With
+// jwt_location=AUTHORIZATION_HEADER the SE validates the bearer and strips the
+// Authorization header before any DataScript runs; the one validated value it
+// exposes to Lua is the subject, via avi.http.get_userid() — nil before
+// authentication, the token's `sub` after it (measured on Avi 31.2.1,
+// 2026-09-05; the header APIs are disabled outright in HTTP_AUTH/POST_AUTH, so
+// there is no earlier point at which the token could be copied). Therefore
+// "sub" is answered from get_userid() and every other claim is "" — on header
+// routes, budgets, entitlements and allow-lists must key on sub.
+//
+// get_userid() is documented for HTTP_REQ/HTTP_RESP only, while the metering
+// scripts also resolve identity in HTTP_RESP_DATA, so the value is cached in a
+// reqvar the first time it is seen and later phases fall back to that.
+func jwtHeaderClaimHelper() string {
+	return `-- AKO AI Gateway: header mode. The SE validated the bearer in the
+-- Authorization header and stripped it; the only validated value it exposes
+-- is the subject (avi.http.get_userid). Every other claim is "" here.
+local function jwt_claim(claim)
+  if claim ~= "sub" then return "" end
+  local u = nil
+  pcall(function() u = avi.http.get_userid() end)
+  if u == nil or u == "" then
+    u = nil
+    pcall(function() u = avi.http.get_reqvar("ai_sub") end)
+    if u == nil or u == "" then return "" end
+  else
+    pcall(function() avi.http.set_reqvar("ai_sub", u) end)
+  end
+  return tostring(u)
+end`
 }
 
 // buildIdentityBlock returns the Lua snippet that resolves the consumer identity

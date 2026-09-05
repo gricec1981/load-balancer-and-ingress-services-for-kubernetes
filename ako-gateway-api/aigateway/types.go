@@ -115,8 +115,8 @@ func (p *AIGatewayAuthPolicy) EffectiveAdminSkipPaths() ([]string, bool) {
 }
 
 // AuthClaimMode selects how the Avi SE validates the caller's JWT and how the
-// AKO DataScripts read its (validated) claims. The two modes are mutually
-// exclusive on the current Avi build — see docs/gateway-api/ai-gateway-auth.md.
+// AKO DataScripts read its (validated) claims. The modes are mutually exclusive
+// per VS (one jwt_location) — see docs/gateway-api/ai-gateway-auth.md.
 //
 // The zero value is ClaimModeOAuth, so any path that does not explicitly thread a
 // mode falls back to the OAuth flow and never decode-and-trusts a query token.
@@ -137,6 +137,18 @@ const (
 	// the token to the request URL. Cost: token-in-URL (mitigate with TLS,
 	// short-lived tokens, SE query-log redaction, and strip-before-backend).
 	ClaimModeJWTQuery
+
+	// ClaimModeJWTHeader is the standard bearer flow: the SE validates a JWT
+	// presented as `Authorization: Bearer <token>`
+	// (jwt_location=JWT_LOCATION_AUTHORIZATION_HEADER), 200/401, no redirect.
+	// The SE strips the header before any DataScript runs and exposes exactly
+	// one validated value to Lua — the subject, via avi.http.get_userid()
+	// (measured on 31.2.1, 2026-09-05). So jwt_claim("sub") works and every
+	// other claim reads as "": policies on header routes must key on sub.
+	// What it buys: no token in the URL (no orig_uri log leak, no request-line
+	// size limit) and conformance with the MCP spec / RFC 9728 metadata, which
+	// mandate the header — the only presentation a standard MCP client sends.
+	ClaimModeJWTHeader
 )
 
 // AIGatewayAuthPolicySpec is the desired state of an AIGatewayAuthPolicy.
@@ -145,8 +157,9 @@ type AIGatewayAuthPolicySpec struct {
 	TargetRef PolicyTargetRef `json:"targetRef"`
 
 	// AuthMode selects the SE validation + claim-access model: "oauthBrowser"
-	// (default — OAuth session, browser clients) or "jwtQuery" (stateless bearer
-	// JWT in a query param, machine clients). See AuthClaimMode.
+	// (default — OAuth session, browser clients), "jwtQuery" (stateless bearer
+	// JWT in a query param; every claim readable) or "jwtHeader" (standard
+	// Authorization: Bearer; only the subject readable). See AuthClaimMode.
 	// +optional
 	AuthMode string `json:"authMode,omitempty"`
 
@@ -201,13 +214,27 @@ type AIGatewayAuthPolicyStatus struct {
 // AuthModeJWTQuery is the spec.authMode string that selects ClaimModeJWTQuery.
 const AuthModeJWTQuery = "jwtQuery"
 
+// AuthModeJWTHeader is the spec.authMode string that selects ClaimModeJWTHeader.
+const AuthModeJWTHeader = "jwtHeader"
+
 // EffectiveAuthMode maps the spec.authMode string to an AuthClaimMode. Anything
-// other than "jwtQuery" (including empty) is the default OAuth browser flow.
+// other than "jwtQuery" / "jwtHeader" (including empty) is the default OAuth
+// browser flow.
 func (s AIGatewayAuthPolicySpec) EffectiveAuthMode() AuthClaimMode {
-	if s.AuthMode == AuthModeJWTQuery {
+	switch s.AuthMode {
+	case AuthModeJWTQuery:
 		return ClaimModeJWTQuery
+	case AuthModeJWTHeader:
+		return ClaimModeJWTHeader
 	}
 	return ClaimModeOAuth
+}
+
+// IsJWTMode reports whether the mode uses the SSO_TYPE_JWT object graph
+// (JWTServerProfile + AUTH_PROFILE_JWT + SSO policy + VS jwt_config) rather than
+// the OAuth graph — i.e. either of the two stateless bearer modes.
+func (m AuthClaimMode) IsJWTMode() bool {
+	return m == ClaimModeJWTQuery || m == ClaimModeJWTHeader
 }
 
 // ─── AITokenRateLimitPolicy ──────────────────────────────────────────────────

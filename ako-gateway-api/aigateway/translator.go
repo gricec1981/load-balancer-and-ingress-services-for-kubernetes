@@ -51,12 +51,11 @@ func ApplyAuthPolicy(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVs
 	}
 	spec := policy.Spec
 
-	// jwtQuery mode validates a stateless bearer JWT presented as a query param
-	// (machine clients) instead of running the OAuth browser flow. The claim
-	// helper decodes the SE-validated token from the query string — see
-	// applyJWTQueryAuth / jwtClaimHelper(ClaimModeJWTQuery).
-	if spec.EffectiveAuthMode() == ClaimModeJWTQuery {
-		applyJWTQueryAuth(key, policy, vsNode)
+	// The two stateless bearer modes (query param / Authorization header) share
+	// the SSO_TYPE_JWT object graph and differ only in jwt_location — see
+	// applyJWTAuth and jwtClaimHelper for how each exposes claims to Lua.
+	if mode := spec.EffectiveAuthMode(); mode.IsJWTMode() {
+		applyJWTAuth(key, policy, vsNode, mode)
 		return
 	}
 
@@ -136,18 +135,22 @@ func ApplyAuthPolicy(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVs
 		key, policy.Namespace, policy.Name, ssoPolicyName, audience, host)
 }
 
-// applyJWTQueryAuth wires the SSO_TYPE_JWT object graph and the VS jwt_config for
-// stateless bearer auth via a query parameter (ClaimModeJWTQuery). The SE
-// validates the JWT found at ?<jwt>=<token>; the claim helper in the AKO
-// DataScripts base64url-decodes the same (validated) token to read claims —
-// avi.http.oauth_get_claim is not available in this mode.
+// applyJWTAuth wires the SSO_TYPE_JWT object graph and the VS jwt_config for the
+// two stateless bearer modes. The object graph (JWTServerProfile with the
+// in-cluster-fetched JWKS, AUTH_PROFILE_JWT, SSO_TYPE_JWT policy) is identical;
+// only where the SE looks for the token differs:
 //
-// Security note (token-in-URL): unlike the Authorization header, the query param
-// is not stripped, which is what makes the claims readable — but it also means
-// the token can land in access/proxy logs and is forwarded to the backend. Run
-// this only over TLS, with short-lived tokens, SE query-param log redaction, and
-// (where supported) a query-strip before the pool. See docs/gateway-api.
-func applyJWTQueryAuth(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVsEvhSniModel) {
+//   - ClaimModeJWTQuery:  jwt_location=QUERY_PARAM, jwt_name=<JwtQueryParamName>.
+//     The param is not stripped, so the claim helper base64url-decodes the
+//     validated token and every claim is readable. Cost: token-in-URL — the
+//     token lands in access logs (orig_uri cannot be masked) and is forwarded to
+//     the backend. Run only over TLS with short-lived tokens.
+//   - ClaimModeJWTHeader: jwt_location=AUTHORIZATION_HEADER. Standard bearer;
+//     the SE strips the header and exposes only the subject to Lua
+//     (avi.http.get_userid). Nothing in the URL, nothing forwarded.
+//
+// avi.http.oauth_get_claim is unavailable in both. See docs/gateway-api.
+func applyJWTAuth(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVsEvhSniModel, mode AuthClaimMode) {
 	spec := policy.Spec
 
 	serverProfileName, err := EnsureJWTServerProfile(key, policy)
@@ -179,6 +182,15 @@ func applyJWTQueryAuth(key string, policy *AIGatewayAuthPolicy, vsNode nodes.Avi
 	// existing policy cleanly replaces the config.
 	gf.OauthVsConfig = nil
 	gf.SsoPolicyRef = proto.String(fmt.Sprintf("/api/ssopolicy?name=%s", ssoPolicyName))
+	if mode == ClaimModeJWTHeader {
+		gf.JwtConfig = &avimodels.JWTValidationVsConfig{
+			Audience:    proto.String(audience),
+			JwtLocation: proto.String("JWT_LOCATION_AUTHORIZATION_HEADER"),
+		}
+		utils.AviLog.Infof("key: %s, msg: AIGatewayAuthPolicy %s/%s: set JWT-header auth (sso=%s, audience=%s)",
+			key, policy.Namespace, policy.Name, ssoPolicyName, audience)
+		return
+	}
 	gf.JwtConfig = &avimodels.JWTValidationVsConfig{
 		Audience:    proto.String(audience),
 		JwtLocation: proto.String("JWT_LOCATION_QUERY_PARAM"),

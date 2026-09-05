@@ -59,7 +59,7 @@ Three claims define the design:
 | Capability | What it does | Configured by | Console tab | Status |
 |---|---|---|---|---|
 | **Inference load balancing** | Metric-weighted LB across model-server pods — KV-cache use, queue depth, running slots | `InferencePool` | Models · Gateways ▸ Inference | Built |
-| **Authentication** | JWT/OIDC validation at the SE; verified claims exposed to every downstream policy | `AIGatewayAuthPolicy` | Governance | Built |
+| **Authentication** | JWT/OIDC validation at the SE; verified claims exposed to every downstream policy. Three modes per route: `oauthBrowser` (browser session, all claims), `jwtQuery` (token in the URL, all claims), `jwtHeader` (standard bearer, `sub` only — what MCP clients send) | `AIGatewayAuthPolicy` | Governance | Built |
 | **Token budgets** | Per-consumer / per-group token ceilings over a window, plus request rate limits. Per limit, `backend: native` enforces on the Avi rate limiter (exact across SEs — the LLM front door runs this) or `datascript` (per-SE counter, default) | `AITokenRateLimitPolicy` | Governance ▸ Token Rate Limits | Built |
 | **Model routing** | Requested `model` → quality/cost tier; group entitlement with downgrade or reject | `AIModelRoutePolicy` | Governance ▸ Model Routing Policies | Built |
 | **External provider tiers** | A tier whose backend is a public API (e.g. Gemini) reached SE-native over egress | `AIModelRoutePolicy.tiers[].provider` | Governance ▸ Model Routing Policies | Built |

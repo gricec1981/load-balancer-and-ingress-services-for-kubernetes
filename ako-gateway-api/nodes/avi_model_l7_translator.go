@@ -201,15 +201,15 @@ func (o *AviObjectGraph) BuildChildVS(key string, routeModel RouteModel, parentN
 				break
 			}
 		}
-		// The auth mode (OAuth browser vs stateless JWT-in-query) is set by the
+		// The auth mode (OAuth browser vs stateless JWT in query or header) is set by the
 		// route's AIGatewayAuthPolicy and dictates how every claim-reading
 		// DataScript (model entitlements, MCP tool-RBAC, token budgets) decodes
 		// claims, so resolve it before applying the claim-consuming policies.
 		claimMode := aigateway.ClaimModeOAuth
 		for _, authPolicy := range ps.GetAuthPoliciesForRoute(routeNsName) {
 			aigateway.ApplyAuthPolicy(key, authPolicy, childNode, authHost, routePrefix)
-			if authPolicy.Spec.EffectiveAuthMode() == aigateway.ClaimModeJWTQuery {
-				claimMode = aigateway.ClaimModeJWTQuery
+			if m := authPolicy.Spec.EffectiveAuthMode(); m != aigateway.ClaimModeOAuth {
+				claimMode = m
 			}
 		}
 		// Model routing must run before token rate limiting: it sets the ai_tier

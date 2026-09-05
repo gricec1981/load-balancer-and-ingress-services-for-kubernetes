@@ -11,7 +11,7 @@ For the whole system in one place — architecture, console guide, how-tos, secu
 | Capability | First shipped | State today | Reference |
 |---|---|---|---|
 | Metric-weighted inference load balancing | 2026-05-08 | Built · p90 TTFT ~125 s → ~10 s under load | [inference-extension.md](inference-extension.md) |
-| `AIGatewayAuthPolicy` — OIDC / JWT at the SE | 2026-05-28 | Built · two modes (`oauthBrowser`, `jwtQuery`) | [ai-gateway-auth.md](ai-gateway-auth.md) |
+| `AIGatewayAuthPolicy` — OIDC / JWT at the SE | 2026-05-28 | Built · three modes (`oauthBrowser`, `jwtQuery`, `jwtHeader`) | [ai-gateway-auth.md](ai-gateway-auth.md) |
 | `AITokenRateLimitPolicy` — token budgets | 2026-05-28 | Built · per-group budgets, counters endpoint; `backend: native` (Avi rate limiter, cross-SE exact) since 2026-06-17, live on the LLM front door | [ai-gateway.md](ai-gateway.md) |
 | Real OIDC SSO + per-group budgets | 2026-05-31 | Built | [ai-gateway.md](ai-gateway.md) |
 | Token counters endpoint + console reset | 2026-06-06 | Built · claim-gated since 2026-08-16 | [ai-gateway.md](ai-gateway.md) |
@@ -19,6 +19,7 @@ For the whole system in one place — architecture, console guide, how-tos, secu
 | `AIMCPRoutePolicy` — MCP gateway | 2026-06-07 | Built · dedicated VIP, session affinity (AKO-authored, not the system script), role-based tool auth | [ai-gateway-mcp.md](ai-gateway-mcp.md) |
 | `AIGuardrailPolicy` — WAF DLP & content guardrails | 2026-06-07 | Built · verified blocking on live Avi | [ai-gateway-guardrails.md](ai-gateway-guardrails.md) |
 | `jwtQuery` auth mode for machine clients | 2026-06-08 | Built | [ai-gateway-auth.md](ai-gateway-auth.md) |
+| `jwtHeader` auth mode — standard `Authorization: Bearer` | 2026-09-05 | Built · `sub` via `get_userid()`; unblocks MCP-spec clients and AgentMinder discovery | [ai-gateway-auth.md](ai-gateway-auth.md) |
 | `AIA2ARoutePolicy` — A2A gateway | 2026-06-17 | Built · resource binding + fail-closed switches since 2026-08-16 | [ai-gateway-a2a.md](ai-gateway-a2a.md) |
 | Agent registry + `/.well-known/agents` | 2026-07-02 | Built | [ai-gateway-agent-registry.md](ai-gateway-agent-registry.md) |
 | Pod-label model alias discovery | 2026-08-08 | Built | [model-routing.md](model-routing.md) |
@@ -41,6 +42,33 @@ For the whole system in one place — architecture, console guide, how-tos, secu
 | AgentMinder as the workload identity broker | — | Design | [ai-gateway-agentminder-pdp.md](ai-gateway-agentminder-pdp.md) |
 | A2A push-notification egress allow-list | — | Design only — never carried into the CRD | [ai-gateway-a2a.md §8](ai-gateway-a2a.md) |
 | Cross-provider failover | — | Design only | [ai-provider-failover-design.md](ai-provider-failover-design.md) |
+---
+
+## `jwtHeader` — a standard bearer at the front door — 2026-09-05
+
+A third `AIGatewayAuthPolicy.authMode`. The SE validates `Authorization: Bearer <token>`
+(`jwt_location: JWT_LOCATION_AUTHORIZATION_HEADER`) with the same JWKS/auth-profile/SSO object
+graph as `jwtQuery`; the DataScripts read the caller's identity from `avi.http.get_userid()`.
+
+**What made it possible.** The June verdict — "bearer mode leaves nothing usable in a
+DataScript" — was too absolute. Measured on 31.2.1: the SE strips the header and disables every
+header API in `HTTP_AUTH`/`HTTP_POST_AUTH`, but after validation `get_userid()` holds the token's
+`sub`, in `HTTP_POST_AUTH` and `HTTP_REQ`. Identity is reachable; only the other claims are hidden.
+
+**What it buys.** The token leaves the URL (the `orig_uri` log leak and the 12 KB request-line
+ceiling go with it), and any standard client works unchanged — the MCP specification and RFC 9728
+mandate the header, so this is the only mode a compliant MCP client, or AgentMinder's tool
+discovery, can use.
+
+**What it costs.** Only `sub` reaches policy. Per-tool rules become per-caller
+(`toolAccess.roleClaim: sub`); group budgets and A2A skill/target binding need the issuer to
+encode what they need into `sub` — possible with the in-cluster broker, not with an IdP whose
+`sub` is fixed (IDSP pins it to the client id). Per route, not global.
+
+Files: `types.go` (`ClaimModeJWTHeader`), `translator.go` (`applyJWTAuth`), `datascript.go`
+(`jwtHeaderClaimHelper`, cached in a reqvar for `HTTP_RESP_DATA`), the CRD enum, and a sandbox
+test that runs the helper under the SE stub.
+
 ---
 
 ## Remote-site tiers — a tier served by another cluster — 2026-08-23

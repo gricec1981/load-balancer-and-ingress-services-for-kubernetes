@@ -15,6 +15,9 @@
 package aigateway
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -25,6 +28,7 @@ func TestEffectiveAuthMode(t *testing.T) {
 		"oauthBrowser": ClaimModeOAuth,
 		"anything":     ClaimModeOAuth,
 		"jwtQuery":     ClaimModeJWTQuery,
+		"jwtHeader":    ClaimModeJWTHeader,
 	}
 	for in, want := range cases {
 		got := AIGatewayAuthPolicySpec{AuthMode: in}.EffectiveAuthMode()
@@ -87,4 +91,93 @@ func TestGeneratorsThreadJWTQueryMode(t *testing.T) {
 	if !strings.Contains(tok, "_b64url_decode") || strings.Contains(tok, "oauth_get_claim") {
 		t.Errorf("token-accounting script did not switch to query-decode helper:\n%s", tok)
 	}
+}
+
+func TestJwtClaimHelperHeaderMode(t *testing.T) {
+	h := jwtClaimHelper(ClaimModeJWTHeader)
+	mustContain := []string{
+		"local function jwt_claim(claim)", // the shared entrypoint name
+		"avi.http.get_userid()",           // the only validated value the SE exposes
+		`if claim ~= "sub" then return "" end`,
+		`get_reqvar("ai_sub")`, // cached for HTTP_RESP_DATA, where get_userid is undocumented
+	}
+	for _, sub := range mustContain {
+		if !strings.Contains(h, sub) {
+			t.Errorf("header helper missing %q\n---\n%s", sub, h)
+		}
+	}
+	for _, banned := range []string{"oauth_get_claim", "get_query", "_b64url_decode", "get_header"} {
+		if strings.Contains(h, banned) {
+			t.Errorf("header helper must not use %s (the header is stripped and no claim can be decoded):\n%s", banned, h)
+		}
+	}
+}
+
+// The claim-consuming generators must thread the header mode too.
+func TestGeneratorsThreadJWTHeaderMode(t *testing.T) {
+	model := GenerateModelRouteScripts(&AIModelRoutePolicy{Spec: sampleSpec()}, tierPGForTest(), nil, nil, ClaimModeJWTHeader).ReqDataScript
+	mcp := GenerateMCPToolAuthScripts(&AIMCPRoutePolicy{Spec: sampleMCPSpec()}, ClaimModeJWTHeader).ReqDataScript
+	tok := GenerateTokenAccountingScripts(tierBudgetPolicy(), ClaimModeJWTHeader, "vs-test").ReqScript
+	for name, src := range map[string]string{"model-route": model, "mcp-tool-authz": mcp, "token-accounting": tok} {
+		if !strings.Contains(src, "avi.http.get_userid()") || strings.Contains(src, "oauth_get_claim") || strings.Contains(src, "_b64url_decode") {
+			t.Errorf("%s script did not switch to the header (get_userid) helper:\n%s", name, src)
+		}
+	}
+}
+
+// Run the header helper under the SE sandbox stub: sub comes from get_userid,
+// any other claim is "", and once seen the subject survives into a phase where
+// get_userid returns nothing (the HTTP_RESP_DATA case) via the cached reqvar.
+func TestJwtHeaderClaimHelperAgainstSEStub(t *testing.T) {
+	lua, err := exec.LookPath("lua5.3")
+	if err != nil {
+		if lua, err = exec.LookPath("lua"); err != nil {
+			t.Skip("no lua interpreter on PATH; skipping SE-sandbox execution test")
+		}
+	}
+	dir := t.TempDir()
+	stub, err := os.ReadFile(filepath.Join("testdata", "se_stub.lua"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "se_stub.lua"), stub, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	helper := jwtClaimHelper(ClaimModeJWTHeader)
+	write := func(name, src string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("req.lua", helper+`
+local s = jwt_claim("sub"); if s ~= "time-agent" then error("sub: got [" .. tostring(s) .. "]") end
+local g = jwt_claim("group"); if g ~= "" then error("group must be empty in header mode, got [" .. tostring(g) .. "]") end
+`)
+	write("respdata.lua", helper+`
+local s = jwt_claim("sub"); if s ~= "time-agent" then error("cached sub: got [" .. tostring(s) .. "]") end
+`)
+	write("unauth.lua", helper+`
+local s = jwt_claim("sub"); if s ~= "" then error("unauthenticated must be empty, got [" .. tostring(s) .. "]") end
+`)
+	write("drive.lua", `
+local dir = arg[1]
+local SE = dofile(dir .. "/se_stub.lua")
+local function slurp(n) local f = assert(io.open(dir .. "/" .. n, "rb")); local s = f:read("a"); f:close(); return s end
+SE.reset_request({})
+SE.env.userid = "time-agent"
+SE.run("req", slurp("req.lua"))
+-- a later phase where the SE no longer answers get_userid: the reqvar must carry it
+SE.env.userid = nil
+SE.run("respdata", slurp("respdata.lua"))
+-- a request that never authenticated yields "" rather than raising
+SE.reset_request({})
+SE.env.userid = nil
+SE.run("req", slurp("unauth.lua"))
+io.write("header helper ok\n")
+`)
+	out, err := exec.Command(lua, filepath.Join(dir, "drive.lua"), dir).CombinedOutput()
+	if err != nil {
+		t.Fatalf("header helper failed in the SE sandbox: %v\n%s", err, out)
+	}
+	t.Log(string(out))
 }

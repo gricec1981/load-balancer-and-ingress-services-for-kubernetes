@@ -51,13 +51,23 @@ spec:
                     - "jwtQuery": stateless bearer-style flow for machine clients. The SE
                       validates a JWT presented as the `?jwt=<token>` query parameter
                       (200/401, no redirect); the param is not stripped, so DataScripts
-                      base64url-decode the SE-validated token to read claims. Cost:
-                      token-in-URL — use only over TLS, with short-lived tokens and SE
-                      query-param log redaction.
+                      base64url-decode the SE-validated token and EVERY claim is readable.
+                      Cost: token-in-URL — it lands in access logs (orig_uri cannot be
+                      masked) and is forwarded to the backend; the request line is capped
+                      at 12 KB. Use only over TLS with short-lived tokens.
+                    - "jwtHeader": standard `Authorization: Bearer <token>` (200/401, no
+                      redirect) — what the MCP specification and RFC 9728 metadata
+                      mandate, and the only presentation a standard MCP client sends.
+                      The SE strips the header and exposes ONLY the subject to
+                      DataScripts (avi.http.get_userid), so budgets, entitlements and
+                      tool/agent allow-lists on this route must key on `sub`; any other
+                      claim reads as empty. Nothing in the URL, nothing forwarded.
+                  A route is exactly one of these; choose per route.
                 type: string
                 enum:
                 - oauthBrowser
                 - jwtQuery
+                - jwtHeader
                 default: oauthBrowser
               targetRef:
                 description: |-

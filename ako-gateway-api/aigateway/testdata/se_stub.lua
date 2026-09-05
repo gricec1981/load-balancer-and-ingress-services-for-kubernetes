@@ -127,6 +127,10 @@ local http = strict("avi.http", {
   end,
   get_reqvar = function(n) return env.reqvars[n] end,
   set_reqvar = function(n, v) env.reqvars[n] = v end,
+  -- Populated by the SE after JWT validation in header mode (the token's sub);
+  -- nil before authentication. Measured on 31.2.1: works in HTTP_POST_AUTH and
+  -- HTTP_REQ; the generated helper caches it in a reqvar for later phases.
+  get_userid = function() return env.userid end,
   -- Both of these take KILOBYTES, not bytes. That asymmetry against Lua's `#s`
   -- byte count is the whole reason RespBodyBufferBytes exists, and modelling it
   -- correctly here is what makes the truncation assertions mean anything.

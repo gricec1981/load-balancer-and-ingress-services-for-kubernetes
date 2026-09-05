@@ -6,17 +6,17 @@ DataScripts read the **validated** claims to drive per-user token budgets,
 identity counters, model entitlements, and MCP per-tool RBAC.
 
 On the current Avi build, *how* the SE validates the token determines whether
-claims are readable by DataScripts. There are two modes, selected by
-`spec.authMode`.
+claims are readable by DataScripts. There are three modes, selected by
+`spec.authMode`. A route is exactly one of them.
 
-| | `oauthBrowser` (default) | `jwtQuery` |
-|---|---|---|
-| Client | Browser / interactive | Machine (SDK, agent, curl) |
-| Token presentation | OAuth auth-code → session cookie | `?jwt=<token>` query param |
-| Unauthenticated response | `302` → `/authorize` | `401` (no redirect) |
-| Claims in DataScripts | `oauth_get_claim()` | base64url-decode the query token |
-| Avi objects | Pool + `AUTH_PROFILE_OAUTH` + `SSO_TYPE_OAUTH` + `oauth_vs_config` | `JWTServerProfile` + `AUTH_PROFILE_JWT` + `SSO_TYPE_JWT` + `jwt_config` |
-| Main tradeoff | No machine clients | Token in the URL |
+| | `oauthBrowser` (default) | `jwtQuery` | `jwtHeader` |
+|---|---|---|---|
+| Client | Browser / interactive | Machine client that can put the token in the URL (our agents, the hub) | Any standard bearer client — MCP clients, AgentMinder discovery, SDKs |
+| Token presentation | OAuth auth-code → session cookie | `?jwt=<token>` query param | `Authorization: Bearer <token>` |
+| Unauthenticated response | `302` → `/authorize` | `401` (no redirect) | `401` (no redirect) |
+| Claims in DataScripts | `oauth_get_claim()` — all | base64url-decode the query token — all | `avi.http.get_userid()` — **`sub` only** |
+| Avi objects | Pool + `AUTH_PROFILE_OAUTH` + `SSO_TYPE_OAUTH` + `oauth_vs_config` | `JWTServerProfile` + `AUTH_PROFILE_JWT` + `SSO_TYPE_JWT` + `jwt_config` (query) | same as `jwtQuery`, `jwt_config` location = header |
+| Main tradeoff | No machine clients | Token in the URL (unmaskable in logs, 12 KB line limit) | Only `sub` reaches policy |
 
 Both modes require the Gateway listener to terminate **TLS** (HTTPS).
 
@@ -162,6 +162,72 @@ is an estate-wide `401` until AKO re-reconciles. See
 [ai-gateway-agentminder-pdp.md](ai-gateway-agentminder-pdp.md) for the
 broker-shaped way out, and [Handbook §6.2](ai-gateway-handbook.md#62-principals)
 for the full identity model.
+
+## `jwtHeader` (standard bearer — MCP clients)
+
+```yaml
+apiVersion: ai.ako.vmware.com/v1alpha1
+kind: AIGatewayAuthPolicy
+metadata:
+  name: load-control-am-auth
+  namespace: inference
+spec:
+  authMode: jwtHeader
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: load-control-am
+  jwt:
+    issuer: https://default.idsp.ai.avi.com/common/
+    jwksUri: https://default.idsp.ai.avi.com/common/oauth2/v1/jwks
+    audiences: ["https://default.idsp.ai.avi.com/common/"]
+```
+
+Same object graph as `jwtQuery` — `JWTServerProfile` (JWKS fetched in-cluster and
+embedded), `AUTH_PROFILE_JWT`, `SSO_TYPE_JWT` — with `jwt_config.jwt_location:
+JWT_LOCATION_AUTHORIZATION_HEADER` and no `jwt_name`. The client sends the token
+the way every OAuth client already does:
+
+```bash
+curl https://load-control-am.ai.avi.com/mcp \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+### What a DataScript can see in this mode
+
+The SE strips `Authorization` before any DataScript runs, and the header APIs are
+disabled outright in the `HTTP_AUTH` / `HTTP_POST_AUTH` events, so there is no
+point at which the token itself can be read. What the SE *does* expose, after
+validation, is the subject: `avi.http.get_userid()` returns the token's `sub`
+(nil before authentication). Measured on Avi 31.2.1, 2026-09-05, with two tokens
+of different subjects; see the spike result below.
+
+So on a `jwtHeader` route the claim helper answers `jwt_claim("sub")` from
+`get_userid()` and returns `""` for **every other claim**. Consequences, per
+policy:
+
+| Policy | On a `jwtHeader` route |
+|---|---|
+| `AITokenRateLimitPolicy` | Per-identity budgets work unchanged (identity = `sub`). `groupBudgets` keyed on a `group` claim see `""` — key them on `sub`, or leave the group map to the issuer that decides it from `sub` anyway. |
+| `AIModelRoutePolicy.entitlements` | `groupClaim: sub` — rules per subject. |
+| `AIMCPRoutePolicy.toolAccess` | `roleClaim: sub` — **per-tool rules per caller**. With an external IdP whose `sub` is a client id (IDSP: `sub == azp == client id`, not overridable), that is per-tool, per-agent. |
+| `AIA2ARoutePolicy.agentAccess` | `agentClaim: sub` works; `skill` / `target` claims read `""`, so skill- and target-binding need the issuer to pack them into `sub` — possible with the in-cluster broker, not with an IdP you don't control. |
+| Token ledger / counters | Identity = `sub`; unchanged. |
+
+A route is exactly one mode. Choose `jwtHeader` where the caller is a standard
+client (an MCP client, AgentMinder's tool discovery, an SDK) or where the token
+must stay out of the URL; keep `jwtQuery` where a policy needs a claim other than
+`sub` from a token whose `sub` you cannot shape.
+
+### Why this is conformance, not a workaround
+
+The MCP specification mandates `Authorization: Bearer`, and RFC 9728 protected-
+resource metadata — which IDSP publishes for its own resources with
+`bearer_methods_supported: ["header"]` — declares the header as the only
+presentation. No compliant MCP client will ever send `?jwt=`. `jwtHeader` is what
+lets such a client reach a governed route at all; the query mode remains the
+richer one only because of what the SE chooses to expose to Lua.
 
 ## The clean long-term fix (RFE)
 

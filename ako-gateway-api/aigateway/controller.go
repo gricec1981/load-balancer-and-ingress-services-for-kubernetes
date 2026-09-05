@@ -251,10 +251,10 @@ func SetupAuthPolicyEventHandlers(
 			if p != nil {
 				enqueueTargetRoute(ns, p.Spec.TargetRef.Name, lib.AIGatewayAuthPolicy, workqueues, numWorkers)
 				// Clean up AKO-managed Avi objects for whichever auth mode was used:
-				// OAuth (SSOPolicy, AuthProfile, issuer Pool) or JWT-query
+				// OAuth (SSOPolicy, AuthProfile, issuer Pool) or JWT query/header
 				// (SSOPolicy, AuthProfile, JWTServerProfile).
 				delKey := "AIGatewayAuthPolicy/" + ns + "/" + name
-				if p.Spec.EffectiveAuthMode() == ClaimModeJWTQuery {
+				if p.Spec.EffectiveAuthMode().IsJWTMode() {
 					DeleteJWTObjects(delKey, p)
 				} else {
 					DeleteOAuthObjects(delKey, p)
