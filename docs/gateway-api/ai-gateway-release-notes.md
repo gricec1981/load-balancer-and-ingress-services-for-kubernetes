@@ -15,23 +15,116 @@ For the whole system in one place — architecture, console guide, how-tos, secu
 | `AITokenRateLimitPolicy` — token budgets | 2026-05-28 | Built · per-group budgets, counters endpoint, epoch reset | [ai-gateway.md](ai-gateway.md) |
 | Real OIDC SSO + per-group budgets | 2026-05-31 | Built | [ai-gateway.md](ai-gateway.md) |
 | Token counters endpoint + console reset | 2026-06-06 | Built · claim-gated since 2026-08-16 | [ai-gateway.md](ai-gateway.md) |
-| `AIModelRoutePolicy` — quality/cost tier routing | 2026-06-07 | Built · InferencePool, Service and Provider tiers | [model-routing.md](model-routing.md) |
-| `AIMCPRoutePolicy` — MCP gateway | 2026-06-07 | Built · dedicated VIP, session affinity, role-based tool auth | [ai-gateway-mcp.md](ai-gateway-mcp.md) |
+| `AIModelRoutePolicy` — quality/cost tier routing | 2026-06-07 | Built · four tier kinds: InferencePool, Service, Provider, Remote | [model-routing.md](model-routing.md) |
+| `AIMCPRoutePolicy` — MCP gateway | 2026-06-07 | Built · dedicated VIP, session affinity (AKO-authored, not the system script), role-based tool auth | [ai-gateway-mcp.md](ai-gateway-mcp.md) |
 | `AIGuardrailPolicy` — WAF DLP & content guardrails | 2026-06-07 | Built · verified blocking on live Avi | [ai-gateway-guardrails.md](ai-gateway-guardrails.md) |
 | `jwtQuery` auth mode for machine clients | 2026-06-08 | Built | [ai-gateway-auth.md](ai-gateway-auth.md) |
 | `AIA2ARoutePolicy` — A2A gateway | 2026-06-17 | Built · resource binding + fail-closed switches since 2026-08-16 | [ai-gateway-a2a.md](ai-gateway-a2a.md) |
 | Agent registry + `/.well-known/agents` | 2026-07-02 | Built | [ai-gateway-agent-registry.md](ai-gateway-agent-registry.md) |
+| Pod-label model alias discovery | 2026-08-08 | Built | [model-routing.md](model-routing.md) |
 | Semantic guardrails over ICAP | 2026-08-09 | Built · FP-hardened v2 | [ai-gateway-guardrails-semantic.md](ai-gateway-guardrails-semantic.md) |
 | External provider tiers (Gemini) | 2026-08-09 | Built · verified live | [model-routing.md](model-routing.md) |
-| Agent factory — NL description → provisioned agent | 2026-08-15 | Built | [ai-gateway-agent-factory.md](ai-gateway-agent-factory.md) |
+| Agent factory — NL description → provisioned agent | 2026-08-15 | Built · one manual `oc create sa` still required | [ai-gateway-agent-factory.md](ai-gateway-agent-factory.md) |
+| Dedicated MCP gateway on its own VIP, `jwtQuery`-authenticated | 2026-08-15 | Built · 4 MCP servers migrated, agents followed via DNS | [ai-gateway-mcp.md](ai-gateway-mcp.md) |
 | Per-agent ServiceAccounts + `POST /exchange` | 2026-08-16 | Built | [ai-gateway-agent-registry.md](ai-gateway-agent-registry.md) |
+| A2A fail-closed switches (`requireMethod`, `authorizePaths`, `targetAgent`) | 2026-08-16 | Built | [ai-gateway-a2a.md §4](ai-gateway-a2a.md) |
+| RAG over the estate's own source (`code_search`) | 2026-08-15 | Built · SE-metered embeddings | [ai-gateway-rag.md](ai-gateway-rag.md) |
 | Framework agent runtimes (Go + ADK) | 2026-08-18 | Built | [ai-gateway-agent-framework.md](ai-gateway-agent-framework.md) |
 | Forgeable `GET /token` retired | 2026-08-19 | Built · returns `410 Gone` | [Handbook §6.2](ai-gateway-handbook.md#62-principals) |
-| Token ledger — true per-user / per-agent consumption | 2026-08-19 | Built | [ai-gateway-token-ledger.md](ai-gateway-token-ledger.md) |
+| Token ledger — true per-user / per-agent consumption | 2026-08-19 | Built · measured 2026-08-22 (§ below) | [ai-gateway-token-ledger.md](ai-gateway-token-ledger.md) |
+| Readable Avi object names | 2026-08-22 | Built · `<cluster>--<surface>-<route>-<hash>` | [Release note below](#readable-avi-object-names--2026-08-22) |
+| Remote-site tiers — a tier served by a peer gateway in another cluster | 2026-08-23 | Built · verified cross-cluster | [model-routing.md](model-routing.md) |
 | Backend mTLS with SPIFFE/SPIRE | — | Design, spike-gated | [ai-gateway-backend-mtls.md](ai-gateway-backend-mtls.md) |
-| Multi-site delivery via AMKO + GSLB | — | Design, spike-gated | [ai-gateway-multisite.md](ai-gateway-multisite.md) |
+| A tier that names a *set* of sites | — | Design | [ai-gateway-datacenter.md §6](ai-gateway-datacenter.md) |
+| Multi-site delivery via AMKO + GSLB | — | Design, spike-gated · superseded for the single-peer case | [ai-gateway-multisite.md](ai-gateway-multisite.md) |
+| Cross-cluster agent authorization | — | Design | [ai-gateway-cross-cluster-auth.md](ai-gateway-cross-cluster-auth.md) |
+| AgentMinder as the workload identity broker | — | Design | [ai-gateway-agentminder-pdp.md](ai-gateway-agentminder-pdp.md) |
+| A2A push-notification egress allow-list | — | Design only — never carried into the CRD | [ai-gateway-a2a.md §8](ai-gateway-a2a.md) |
 | Cross-provider failover | — | Design only | [ai-provider-failover-design.md](ai-provider-failover-design.md) |
+---
 
+## Remote-site tiers — a tier served by another cluster — 2026-08-23
+
+An `AIModelRoutePolicy` tier can now name a **peer AI Gateway** instead of a Kubernetes backend:
+
+```yaml
+tiers:
+  - name: qwen-antrea
+    remote: {host: llm.siteb.ai.avi.com, healthPath: /v1/models}
+```
+
+AKO authors an FQDN pool + pool group over REST, the SE resolves and re-resolves the peer's name
+itself, and a health monitor decides whether the peer is up. Which site serves a request is decided
+by **tier selection** — after the model is read from the body — not by DNS answering a client.
+Nothing is rewritten except the `Host` header, and because the peer is ours, its response is metered
+normally (unlike a provider tier).
+
+**Verified cross-cluster.** `qwen-antrea` on the `vks-ai-01` front door is served by the
+`k8s-antrea` cluster. Both sites run the same small model, so the GGUF path is identical and the
+proof is the serving pod's own fingerprint rather than a difference in output.
+
+Commits `801a2dd7`, `bb182312`, `8e9e956c`, `e13e9791`, `a03d81d3`.
+Reference: [model-routing.md](model-routing.md), estate shape in
+[ai-gateway-datacenter.md](ai-gateway-datacenter.md).
+
+### Three real bugs found on the way
+
+**The remote block never decoded.** The tier existed in the CR and nowhere else — the unstructured
+decoder dropped it silently, so the policy reconciled "successfully" with one fewer tier.
+
+**An FQDN pool still needs `servers[0].ip`, DNS-typed.** Avi rejects a pool whose only server is a
+name unless the address is present and typed as DNS. The peer's address is seeded once at authoring
+time; every resolution after that is the SE's.
+
+**The health monitor sent no `Host` header,** so the peer's EVH parent answered 404 and a perfectly
+healthy peer was marked down — with the failure surfacing as an unexplained tier outage rather than
+a monitor error.
+
+### Not in this release
+
+A `remote` tier names exactly **one** peer, so its pool group has one member and peer-down means
+tier-down. Naming a set of peers is designed in [ai-gateway-datacenter.md §6](ai-gateway-datacenter.md).
+
+---
+
+## Readable Avi object names — 2026-08-22
+
+Avi objects created by AKO were named with a SHA-1 of their inputs, so an Avi log's Pool column named
+nothing a human could act on. With `useReadableObjectNames`, encoded objects are named
+`<cluster>--<surface>-<route>-<hash>` — the surface (`llm`, `mcp`, `agent`) coming from the
+`ai.ako.vmware.com/surface` label — so a pool reads as
+`…-inference-vllm-gpu-8000-<8hex>` and the log names its own backend.
+
+Commit `e69af885`.
+
+> ⚠️ **Flipping the flag renames and therefore re-creates every encoded object.** VIPs survive;
+> **per-VS settings do not.** Every child VS is new, so `full_client_logs` (which is per-VS) reverts
+> to off across the estate, and any log-visibility backfill must be re-run. This has now caught the
+> lab twice.
+
+---
+
+## Token ledger measured on the live estate — 2026-08-22
+
+The ledger shipped on 2026-08-19 unexercised. A stress harness (`ako-inference-demo/ledger-stress`)
+fired traffic whose token cost was fixed in advance and compared it with what the ledger reported.
+
+**The SE's recording is exact** — 7,500 metered responses at up to 333 rps and concurrency 128, ring
+head +1 per response, budget counter matching ground truth to the token. That is a stronger result
+than the code earns: both counters are read-modify-writes with no atomic primitive, and
+`concurrency_spec.lua` proves that shape loses updates. DataScript execution for a VS is evidently
+serialized, so **the code is not concurrency-safe; today's SE is what makes it correct** — and
+nothing in the ledger would report it if that changed.
+
+**The collector is the lossy half**, with a sharp ceiling of ~200 rps sustained at the default poll:
+at 333 rps, 34 % of records aged past the drain's reach and were reported `lost`.
+
+**The ring is per-VS**, so every metered route needs its own collector target — and a route that
+meters perfectly but has no drain looks *identical* to one that never metered at all.
+
+Full method and numbers: [ai-gateway-token-ledger.md §9](ai-gateway-token-ledger.md).
+
+---
 ---
 
 ## Token Ledger — true per-user and per-agent consumption — 2026-08-19

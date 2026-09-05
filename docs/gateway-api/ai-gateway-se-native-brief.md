@@ -55,8 +55,9 @@ core — and they cluster in **guardrails (semantic)** and **metering (streaming
 | **Semantic prompt-injection** (novel/paraphrase) | **ICAP callout** to an external classifier — request-only, block-only | **Native streaming-aware AI callout** (request + response) | ⚠️ **move to SE** |
 | **Response-side guardrails** (output DLP, indirect injection, system-prompt leak) | **Not feasible** — response inspection breaks streaming | **Native per-chunk response inspection** | ⚠️ **move to SE** |
 | **Redaction / masking** (vs. blunt block) | Block-only (WAF/ICAP reject the whole request) | **Native modify** — strip/mask and continue | ⚠️ **move to SE** |
-| **MCP governance** (session pinning, tool authz) | Native MCP profile (32.1.1) + DataScripts | Native MCP session + per-role tool authz | ✅ partial → native |
-| **A2A** (agent↔agent, body-derived affinity) | DataScript session affinity (design) | Native body-derived session affinity | ⚠️ **move to SE** |
+| **Token ledger — accounting** | DataScript writes one usage record per metered response into an SE table; an out-of-band collector drains it. Recording is exact; the drain caps out near 200 rps | **Native usage export** (an event per metered response, pushed) | ✅ works → native |
+| **MCP governance** (session pinning, tool authz) | Native MCP application profile (32.1.1) + AKO DataScripts. ⚠️ Avi's own `System-Standard-MCP` session script **raises on an EVH child VS behind a PoolGroup**, so AKO writes its own equivalent | Native MCP session pinning that works on the EVH topology AKO builds + per-role tool authz | ⚠️ partial → native |
+| **A2A** (agent↔agent, body-derived affinity) | DataScript captures the task id from the response and keys Avi persistence on it — **built and verified**, not design | Native body-derived session affinity | ✅ works → native |
 | **Semantic caching** | Not built (needs response synthesis) | Native response serve/capture at the callout | ⚠️ **future, on SE** |
 | **Usage observability** (live counters) | Admin counters endpoint + DataScript | Native usage telemetry | ✅ works → native |
 

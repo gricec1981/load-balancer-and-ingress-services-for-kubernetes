@@ -1,19 +1,32 @@
 # AKO AI Gateway — Model-Based (Quality/Cost Tier) Routing
 
-> **Status: Implemented (Phase 2.x) — verified end-to-end on a live cluster
-> (Avi 31.2.2).** The `AIModelRoutePolicy` CRD routes inference requests to
-> different backends based on the requested **model**, organised into
-> **quality/cost tiers**. It builds on the [AI Gateway](ai-gateway.md) and
+> **Status: Built — verified end-to-end on live clusters (Avi 31.2.2, then
+> 31.2.1).** The `AIModelRoutePolicy` CRD routes inference requests to different
+> backends based on the requested **model**, organised into **quality/cost
+> tiers**. It builds on the [AI Gateway](ai-gateway.md) and
 > [Inference Extension](inference-extension.md) and reuses their existing
 > machinery (request-body DataScript parsing, OAuth claim access, scraper-weighted
 > InferencePool Pool Groups).
 >
+> A tier can be served by any of **four** backend kinds, all shipped:
+>
+> | Tier kind | Field | Backend | Shipped |
+> |---|---|---|---|
+> | Inference pool | `backendRef` (`kind: InferencePool`) | scraper-weighted per-pod members | 2026-06-07 |
+> | Core Service | `backendRef` (`kind: Service`) | Service endpoints — including a selectorless Service + hand-written EndpointSlice fronting a GPU VM or bare metal | 2026-06-07 |
+> | External provider | `provider` | an OpenAI-compatible vendor API (Gemini) over SE egress | 2026-08-09 |
+> | Remote site | `remote` | a **peer AI Gateway in another cluster**, addressed by FQDN | 2026-08-23 |
+>
+> `spec.discovery` (2026-08-08) additionally lets a labelled model pod register its
+> own alias into the model→tier table, so deploying a model and publishing it
+> through the gateway become one action.
+>
 > The control-plane path (CR → AKO → per-tier Avi Pool Groups + model-route
 > DataScripts) is verified live; the data-plane primitive
 > (`avi.http.get_req_body` + `avi.poolgroup.select` keyed on the body `model`) was
-> confirmed by spike on the same build. Current limitations: tier backends must be
-> **InferencePools** (Service backends are not built yet) and the request-body
-> buffer is **32 KB** — see [Limitations](#limitations).
+> confirmed by spike on the same build. The standing constraints are the **32 KB**
+> request-body buffer and the fact that **tier pools are baked at policy-reconcile
+> time** — see [Limitations](#limitations).
 
 ---
 
@@ -251,21 +264,90 @@ spec:
     statusCode: 403
 ```
 
+### Tiers that are not local pods
+
+Three of the four tier kinds do not name a Kubernetes backend at all. They are
+declared on the same `tiers[]` entry, in place of `backendRef`:
+
+```yaml
+spec:
+  tiers:
+    # 1. External provider — an OpenAI-compatible vendor API over SE egress.
+    #    AKO authors an FQDN pool (backend TLS + SNI); the HTTP_REQ_DATA script
+    #    rewrites the path and Host and injects the key from a Secret.
+    - name: frontier
+      provider:
+        host: generativelanguage.googleapis.com
+        path: /v1beta/openai/chat/completions
+        auth:
+          secretRef: {name: gemini-key, key: apiKey}
+          header: x-goog-api-key
+          scheme: ""             # raw key, no "Bearer " prefix
+
+    # 2. Remote site — a PEER AI Gateway in another cluster. Same pool shape as a
+    #    provider tier, but nothing is rewritten except Host, and the peer's
+    #    response is metered normally because it is ours.
+    - name: qwen-antrea
+      remote:
+        host: llm.siteb.ai.avi.com
+        port: 443
+        tls: true
+        preserveHost: false      # rewrite Host so the peer's EVH child VS matches
+        healthPath: /v1/models   # "-" attaches no monitor (and disables failover)
+
+    # 3. Core Service — endpoints, not pods. A selectorless Service plus a
+    #    hand-written EndpointSlice fronts serving infrastructure outside the
+    #    cluster (a GPU VM, bare metal) as a first-class tier.
+    - name: gpu-vm
+      backendRef:
+        kind: Service
+        name: vllm-gpu
+```
+
+### Discovery — a model pod registers its own alias
+
+With `spec.discovery.enabled`, AKO merges aliases found on running pods into
+`modelTiers` at translation time. A pod carrying the alias **annotation** and a
+tier **label** naming a declared tier joins the table; deleting the pods
+un-registers the alias and its requests fall back to `defaultTier`. Static
+`modelTiers` entries always win over discovered ones, and `namespaces` is the
+governance gate — only pods in those namespaces may register.
+
+```yaml
+spec:
+  discovery:
+    enabled: true
+    aliasAnnotation: ai.ako.vmware.com/model-alias   # default
+    tierLabel:       ai.ako.vmware.com/tier          # default
+    namespaces: [inference]                          # default: the policy's own
+```
+
+With discovery off (or absent) behaviour is byte-identical to a static-only
+policy — see [`modelroute_discovery.go`](../../ako-gateway-api/aigateway/modelroute_discovery.go).
+
 ### Field reference
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `spec.targetRef.*` | PolicyTargetRef | yes | Same shape as the other AI Gateway policies; `HTTPRoute` (or `Gateway`). |
 | `spec.modelField` | string | no | JSON body key to read. Default `model`. |
-| `spec.tiers[].name` | string | yes | Tier identifier; becomes the `X-AI-Tier` value and part of the Pool Group name. |
-| `spec.tiers[].backendRef` | BackendRef | yes | `InferencePool` (preferred) or `Service` that serves this tier. |
+| `spec.tiers[].name` | string | yes | Tier identifier; becomes the `ai_tier` reqvar value and part of the Pool Group name. |
+| `spec.tiers[].backendRef` | BackendRef | no† | `InferencePool` (keeps per-pod metric weighting) or `Service` that serves this tier. |
+| `spec.tiers[].provider` | ModelProvider | no† | External OpenAI-compatible API. `host`, `path` required; `port` 443, `tls` true, `auth.header` `Authorization`, `auth.scheme` `Bearer` by default. |
+| `spec.tiers[].remote` | ModelRemote | no† | Peer AI Gateway at another site. `host` required; `port` 443, `tls` true, `preserveHost` false, `healthPath` `/v1/models` by default. |
 | `spec.modelTiers` | map[string]string | yes | `model name (or "prefix*")` → tier name. |
 | `spec.defaultTier` | string | yes | Tier for models not in `modelTiers`. |
+| `spec.discovery.enabled` | bool | no | Merge pod-published aliases into `modelTiers`. Default off. |
+| `spec.discovery.aliasAnnotation` | string | no | Pod annotation carrying the alias. Default `ai.ako.vmware.com/model-alias`. |
+| `spec.discovery.tierLabel` | string | no | Pod label carrying the tier. Default `ai.ako.vmware.com/tier`. |
+| `spec.discovery.namespaces` | []string | no | Namespaces allowed to register aliases. Default: the policy's namespace. |
 | `spec.entitlements.groupClaim` | string | no | Claim/header carrying the caller's group. Default `group`. |
 | `spec.entitlements.rules[].group` | string | yes* | A group value (required when `entitlements` is present). |
 | `spec.entitlements.rules[].allow` | []string | yes* | Tiers this group may reach. |
 | `spec.onUnentitled.type` | string | no | `Downgrade` (default) or `Reject`. |
 | `spec.onUnentitled.statusCode` | int | no | HTTP status when `type: Reject`. Default `403`. |
+
+† Exactly one of `backendRef`, `provider` or `remote` per tier.
 
 ---
 
@@ -273,7 +355,8 @@ spec:
 
 | Policy element | Avi mechanism |
 |---|---|
-| Each `tiers[]` entry | One **Pool Group** (`<vsname>-tier-<name>-pg`), built from the tier's `backendRef`. An `InferencePool` backend keeps its scraper-weighted per-pod members; a `Service` backend produces a single pool. |
+| Each `tiers[]` entry with a `backendRef` | One **Pool Group** (`<vsname>-tier-<name>-pg`) built through the node graph. An `InferencePool` backend keeps its scraper-weighted per-pod members; a `Service` backend produces a single pool from the Service's endpoints. |
+| Each `tiers[]` entry with a `provider` or `remote` | One **FQDN pool + pool group authored directly over the Avi REST API** (`EnsureProviderTier` / `EnsureRemoteTier`), not through the node graph. Backend TLS + SNI; `resolve_server_by_dns` so the SE owns every re-resolution. A `remote` tier also gets an HTTP health monitor on `healthPath` — which **must send a `Host` header**, or the peer answers 404 and a healthy peer is marked down. |
 | `modelTiers` + `defaultTier` + `entitlements` | One **DataScriptSet** (`<vsname>-ai-model-route`) with a `HTTP_REQ` script (enable request-body buffering) and a `HTTP_REQ_DATA` script (read the body, resolve the tier, apply entitlement, **select the tier's Pool Group**). |
 | Tier selection | The `HTTP_REQ_DATA` script calls **`avi.poolgroup.select("<vsname>-tier-<name>-pg")`** directly. Every selectable Pool Group must be listed in the DataScriptSet's **`pool_group_refs`** (Avi rejects the script otherwise). |
 
@@ -434,6 +517,17 @@ spec:
 
 ## Implementation outline — `ApplyModelRoutePolicy`
 
+> **Shipped as described.** The entry point is
+> [`ApplyModelRoutePolicy`](../../ako-gateway-api/nodes/avi_model_route.go) in
+> `ako-gateway-api/nodes/avi_model_route.go`, called from
+> [`avi_model_l7_translator.go`](../../ako-gateway-api/nodes/avi_model_l7_translator.go)
+> alongside `ApplyAuthPolicy` / `ApplyTokenRateLimitPolicy`. Two details differ
+> from the sketch below: pod-discovered aliases are merged in first
+> (`WithDiscoveredModels`), and `provider` / `remote` tiers bypass the node graph
+> entirely — `EnsureProviderTier` / `EnsureRemoteTier` author their FQDN pool and
+> pool group directly over the Avi REST API, and the DataScript selects that pool
+> group by name.
+
 Following the pattern of the existing two AI Gateway policies, model routing
 plugs into the same per-child-VS hook in
 [`avi_model_l7_translator.go`](../../ako-gateway-api/nodes/avi_model_l7_translator.go#L175)
@@ -539,10 +633,20 @@ groups, since torn down. Results:
 
 ## Limitations
 
-- **InferencePool tier backends only.** The schema accepts a `Service` backend,
-  but `ApplyModelRoutePolicy` currently builds Pool Groups only for
-  `kind: InferencePool` tiers (others are logged and skipped). Service-tier
-  support is a follow-up.
+- **Tier pools are baked at policy-reconcile time.** A tier's pool members are
+  resolved when the `AIModelRoutePolicy` is translated, not when its backend's
+  endpoints change. Editing an `EndpointSlice` behind a `Service` tier — even
+  deleting and recreating it — does **not** push new members, and neither does
+  annotating the policy. The only reliable way to force a re-resolve is to patch
+  the policy **spec** (adding then removing a throwaway `modelTiers` key is
+  enough). The failure mode is a **hang, not a 4xx**: the SE keeps sending to a
+  stale member. Read the pool's real members through the console's
+  `/api/aimetrics?tier=` rather than trusting the CR.
+- **A tier that resolves to nothing is skipped, not failed.** If a tier's pool
+  group ends up with no members, `ApplyModelRoutePolicy` logs a warning, drops
+  the tier and carries on. A `modelTiers` entry pointing at a dropped tier
+  therefore falls through to `defaultTier` — which is how a mis-set
+  `defaultTier` silently sends every unmapped model to a dangling backend.
 - **32 KB request-body buffer.** `avi.http.set_request_body_buffer_size` caps at
   32768 on this Avi build. `model` sits at the JSON start so the buffered head is
   enough; behaviour for a request body larger than 32 KB (does `get_req_body`
@@ -551,6 +655,13 @@ groups, since torn down. Results:
   `HTTP_REQ`-phase token check cannot see `ai_tier` (set later), so tier-keyed
   limits use `groupHeader: "reqvar:ai_tier"` and enforce in the body phase. See
   [Composition](#composition-with-auth-and-token-budgets).
+- **A `remote` tier names exactly one peer.** Its pool group has one member, so
+  peer down means tier down. Naming a *set* of sites is designed but not built —
+  see [ai-gateway-datacenter.md §6](ai-gateway-datacenter.md).
+- **Provider-tier responses are not metered.** External providers answer
+  chunked/streamed, which the metering DataScript cannot read. Remote-site tiers
+  *are* metered normally — the peer is ours, and its response is buffered like
+  any local one.
 - **Eventually-consistent counters / soft RPS** — inherited from the token policy.
 
 ---
@@ -562,8 +673,12 @@ groups, since torn down. Results:
 | 2.x | `AIModelRoutePolicy` — model→tier routing via request-body DataScript + `avi.poolgroup.select` | ✅ Done — verified end-to-end on a live cluster |
 | 2.x | Group-based tier entitlement (reuse verified `group` claim) | ✅ Done |
 | 2.x | Per-tier token budgets (`groupHeader: "reqvar:ai_tier"`, enforced in `HTTP_REQ_DATA`) | ✅ Done |
-| 2.x | Service (non-InferencePool) tier backends | ✅ Done |
-| 2.x | External-provider tiers (`tier.provider`) — route to an OpenAI-compatible API (Gemini) over SE egress; AKO authors an FQDN pool (backend TLS/SNI) + the DataScript rewrites path/Host and injects the key from a Secret; token metering skipped (chunked responses). **Verified live on Avi 31.2.1 — real Gemini answers through the governed front door, injection still 403.** | ✅ Done |
+| 2.x | Service (non-InferencePool) tier backends — endpoints, so a selectorless Service + hand-written EndpointSlice fronts out-of-cluster serving infrastructure | ✅ Done |
+| 2.x | Pod-label model **discovery** (`spec.discovery`) — a labelled model pod publishes its own alias into the model→tier table; deleting the pods un-registers it | ✅ Done — 2026-08-08 |
+| 2.x | External-provider tiers (`tier.provider`) — route to an OpenAI-compatible API (Gemini) over SE egress; AKO authors an FQDN pool (backend TLS/SNI) + the DataScript rewrites path/Host and injects the key from a Secret; token metering skipped (chunked responses). **Verified live on Avi 31.2.1 — real Gemini answers through the governed front door, injection still 403.** | ✅ Done — 2026-08-09 |
+| 2.x | **Remote-site tiers** (`tier.remote`) — a tier whose backend is a peer AI Gateway in another cluster, reached by FQDN over SE egress with a Host-bearing health monitor. **Verified cross-cluster 2026-08-23**: `qwen-antrea` on the `vks-ai-01` front door is served by the `k8s-antrea` cluster, proven by the server fingerprint. | ✅ Done — 2026-08-23 |
+| 3 | A tier that names a **set** of sites, not one peer (`tiers[].sites[]` with priority/weight/drain) | Designed — [datacenter §6](ai-gateway-datacenter.md) |
+| 3 | Re-resolve a tier's pool on endpoint change, without a spec patch (see Limitations) | Open bug |
 | 3 | Budget-aware downgrade (over-budget premium → economy instead of 429) | Idea |
 | 3 | LoRA-adapter-aware routing (route to pods with a matching adapter) | Idea |
 | 3 | Weighted canary within a tier (split a model name across two versions) | Idea |

@@ -1,33 +1,49 @@
 <!--
-  DESIGN DRAFT. Mirrors model-routing.md / ai-gateway-mcp.md / ai-gateway-a2a.md conventions.
   Guardrails/DLP via the Avi WAF (NOT DataScripts — the SE Lua sandbox has no regex).
-  Request-body DLP blocking was SPIKE-VERIFIED on the demo Avi 31.2.2 (2026-06-07).
-  Sections marked ⚠️ are spike-gated. Re-verify on 32.1.1 (demo controller upgrading).
+  Mirrors model-routing.md / ai-gateway-mcp.md / ai-gateway-a2a.md conventions.
+  Status: BUILT. AKO authors + attaches the WafPolicy (guardrail_*.go); blocking is
+  verified live on Avi 31.2.2 and 31.2.1, and the WAF layer is demo beat UC3.
+  The SEMANTIC layer that composes with it has its own doc:
+  ai-gateway-guardrails-semantic.md (also built, FP-hardened v2 2026-08-14).
+  Sections marked ⚠️ remain spike-gated — RESPONSE-body DLP above all.
+  UPDATED 2026-09-05.
 -->
 
 # AKO AI Gateway — Guardrails & DLP
 
-> **Status: Design draft (Phase 3).** This document specifies an **`AIGuardrailPolicy`**
-> CRD that enforces **data-loss prevention (DLP)** and **content guardrails** on AI traffic —
-> blocking secrets/PII in prompts, tool arguments, and agent messages, and (optionally)
-> generic web-attack protection — **using the Avi Service Engine's native WAF**, with **no
+> **Status: Built and verified live.** The **`AIGuardrailPolicy`** CRD enforces
+> **data-loss prevention (DLP)** and **content guardrails** on AI traffic — blocking
+> secrets/PII in prompts, tool arguments, and agent messages, and (optionally) generic
+> web-attack protection — **using the Avi Service Engine's native WAF**, with **no
 > proxy, no sidecar, no model in the hot path**. It composes with the rest of the AI Gateway
 > ([ai-gateway.md](ai-gateway.md), [model-routing.md](model-routing.md),
 > [ai-gateway-mcp.md](ai-gateway-mcp.md), [ai-gateway-a2a.md](ai-gateway-a2a.md)) and applies
 > **once, fleet-wide, across all three surfaces** (inference, MCP, A2A).
 >
-> **Request-body DLP enforcement is spike-verified** on the demo Avi 31.2.2 (§8): a prompt
-> containing an AWS key / SSN / API secret was blocked (403) while a clean prompt passed
-> (200). Semantic guardrails and response/streaming DLP are honestly out of scope for the
-> signature core — see [Limitations](#11-the-honest-ceiling).
+> **What is built.** `ako-gateway-api/aigateway/guardrail_*.go`: AKO **authors** the Avi
+> WafPolicy from this spec over REST (`guardrail_rest.go`, mirroring the OAuth object graph
+> in `oauth_rest.go`) and **attaches** it to the route VS via `waf_policy_ref`
+> (`ApplyGuardrailPolicy`). Pre-canned **profiles** ship per surface — **`BlockLLM`**
+> (DLP + prompt-injection), **`BlockMCP`** (DLP + tool-abuse: command-injection /
+> path-traversal / SSRF) and **`BlockLLMAndMCP`** (both) — so an operator drops one CR per
+> route. `spec.semantic` additionally turns on the ICAP classifier layer, and AKO authors
+> both the `icapprofile` and the security-policy rule that makes ICAP fire
+> ([ai-gateway-guardrails-semantic.md](ai-gateway-guardrails-semantic.md)). L7Rule already
+> *attached* a WafPolicy by name; nothing *authored* one — that authoring is what this added.
 >
-> **Implementation: the AKO side is built** (`ako-gateway-api/aigateway/guardrail_*.go`).
-> AKO **authors** the Avi WafPolicy from this spec over REST (`guardrail_rest.go`, mirroring
-> the OAuth object graph in `oauth_rest.go`) and **attaches** it to the route VS via
-> `waf_policy_ref` (`ApplyGuardrailPolicy`). Pre-canned **profiles** ship for each surface —
-> **`BlockLLM`** (DLP + prompt-injection), **`BlockMCP`** (DLP + tool-abuse: command-injection /
-> path-traversal / SSRF), and **`BlockLLMAndMCP`** (both) — so an operator drops one CR per route.
-> The CRD is namespaced and Kubernetes-native,
+> **Verified.** Request-body DLP blocking on Avi 31.2.2 (§8) — an AWS key / SSN / API secret
+> in a prompt is `403`, a clean prompt is `200` — and again on 31.2.1, where it is demo beat
+> UC3. Signature matching is ~36 ms, against ~782 ms for the semantic layer's
+> classifier-plus-judge, so the two layers are told apart by latency alone.
+>
+> **Still out of scope for the signature core:** semantic/paraphrased injection (that is the
+> ICAP layer's job, and the paraphrase bypass is *proven* — §Spike-4) and response/streaming
+> DLP. See [the honest ceiling](#11-the-honest-ceiling).
+>
+> ⚠️ **Do not read a 4xx as a guardrail block.** A transient `403` from a route with no WAF
+> policy has been misread as an ingestion block before. Confirm the VS actually carries
+> `waf_policy_ref` (or an ICAP profile) *and* that the Avi log shows `response_code: 403`
+> with `waf_log: REJECTED`, before claiming the WAF stopped anything.
 > so the AI Gateway console can create it through the same authenticated k8s path it uses for
 > the other policies (UI work lives in the external `ai-gateway-ui` repo). Note: L7Rule already
 > *attaches* a WafPolicy by name, but nothing *authors* one — that authoring is what this adds.
@@ -499,4 +515,4 @@ Mirrors how `AIModelRoutePolicy` was wired (`c05fc5bc` → `a2e7b995` → `40477
 - [AI Gateway](ai-gateway.md) — the policy family this joins; DataScript composition
 - [Model-Based Routing](model-routing.md) — reads the same request body the WAF screens
 - [MCP Gateway](ai-gateway-mcp.md) / [A2A Gateway](ai-gateway-a2a.md) — the other two surfaces the fleet baseline covers
-- [Streaming token limit](ai-token-streaming-limit.md) — the response-buffering limit output DLP inherits
+- [Token ledger §4 — Streaming](ai-gateway-token-ledger.md) — the response-buffering limit output DLP inherits

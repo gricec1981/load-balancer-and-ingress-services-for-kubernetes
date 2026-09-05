@@ -1,22 +1,35 @@
 <!--
-  Designed 2026-08-14 on feature/ai-mixed-estate. Companion to ai-gateway-a2a.md and
-  ai-gateway-agent-registry.md. Status: DESIGN — nothing built yet. The console work
-  lands in the external ai-gateway-ui repo; the object recipe it automates is the one
-  proven by hand on openshift06 (mcp-web-tools, jobs-agent).
+  Designed 2026-08-14 on feature/ai-mixed-estate. Companion to ai-gateway-a2a.md,
+  ai-gateway-agent-registry.md and ai-gateway-agent-framework.md.
+  Status: BUILT — phases 0-2 shipped 2026-08-15, the ADK second body 2026-08-18.
+  The console/provisioner code lives in the external ai-gateway-ui repo (agents.go);
+  the runtime images are ako-inference-demo/agent-runtime and agent-runtime-adk.
+  UPDATED 2026-09-05 against agents.go: §3 and §5 now describe the SHIPPED contract
+  and object set, which differ from the 2026-08-14 sketch. §8 records the one gap
+  that is still open.
 -->
 
 # AKO AI Gateway — Agent Factory (natural-language agent creation)
 
-> **Status: Design.** This document specifies the **Agent Factory**: a console chat
-> experience where an operator describes an agent in plain language — *"create an agent
-> called weather-agent that can search the web and summarise forecasts; only the
-> orchestrator may call it"* — and the platform creates everything else: a running agent
-> on OpenShift, protected by the shared-IdP auth policy, routed through the Avi A2A
-> Gateway on its own `<name>.ai.avi.com` hostname, and catalogued in the Agent Registry
-> behind the register → approve → route governance gate.
+> **Status: Built (phases 0-2), 2026-08-15.** An operator describes an agent in plain
+> language — *"create an agent called weather-agent that can search the web and summarise
+> forecasts; only the orchestrator may call it"* — and the platform creates everything
+> else: a running agent on OpenShift, holding its own ServiceAccount identity, protected
+> by the shared-IdP auth policy, routed through the Avi A2A Gateway on its own
+> `<name>.ai.avi.com` hostname, and catalogued in the Agent Registry behind the
+> register → approve → route governance gate.
 >
-> Nothing here invents new gateway machinery. The factory automates the exact object
-> recipe already proven by hand for `mcp-web-tools` and `jobs-agent` on openshift06.
+> **First factory-provisioned agent live 2026-08-15:** `log-collector` (ns `mcp`), which
+> reads real AKO logs through the `k8s-logs` MCP server and is callable only by
+> `avi-controller-agent`. A [second runtime body](ai-gateway-agent-framework.md) (Google
+> ADK) landed 2026-08-18 — same ConfigMap, same route, same policy, same registry entry;
+> only the image changes.
+>
+> Nothing here invented new gateway machinery. The factory automates the exact object
+> recipe already proven by hand for `mcp-web-tools` and `jobs-agent`.
+>
+> **One gap is still open** — the provisioner's ClusterRole cannot create the agent's
+> ServiceAccount, so a new agent needs one manual `oc create sa`. See §8.
 
 ---
 
@@ -27,7 +40,7 @@ verified live:
 
 | Layer | What exists today | Where |
 |---|---|---|
-| A2A ingress | `a2a-gateway` (class `avi-lb`, HTTPS listener, `a2a-tls`) with per-agent HTTPRoutes | openshift06, ns `inference` |
+| A2A ingress | `a2a-gateway` (class `avi-lb`, HTTPS listener, `a2a-tls`) with per-agent HTTPRoutes | `vks-ai-01`, ns `inference` |
 | DNS/VIP | AKO auto-registers every new HTTPRoute hostname into the VsVip `dns_info` (TTL 30) — **a new agent hostname needs zero VIP or DNS work** | architecture doc §2 |
 | Auth | `AIGatewayAuthPolicy llm-auth` (`jwtQuery`), inherited by A2A routes via `authRef`; jwtQuery claim helper verified | [ai-gateway-auth.md](ai-gateway-auth.md), [ai-gateway-a2a.md §5](ai-gateway-a2a.md) |
 | Per-agent enforcement | `AIA2ARoutePolicy` — agent/skill access rules, task affinity, push-notification egress control | [ai-gateway-a2a.md §4](ai-gateway-a2a.md) |
@@ -80,6 +93,9 @@ Two properties are non-negotiable:
 
 ## 3. AgentSpec — the single contract
 
+The shipped contract between the NL extractor, the console form and the provisioner
+(`ai-gateway-ui/agents.go`). It is deliberately flatter than the 2026-08-14 sketch:
+
 ```json
 {
   "name": "weather-agent",
@@ -87,33 +103,44 @@ Two properties are non-negotiable:
   "systemPrompt": "You are a weather assistant. Use the search tools for current data…",
   "model": "qwen-smart",
   "identity": "weather-agent",
-  "skills": [ {"id": "weather.forecast", "description": "Forecast for a location"} ],
-  "tools": { "mcpServers": ["web-search"] },
-  "callers": [ {"agent": "orchestrator", "allow": ["tasks/*"]} ],
-  "egress": { "hosts": ["api.open-meteo.com"] },
-  "schedule": null,
-  "resources": {"cpu": "50m", "memory": "256Mi"},
-  "approved": false
+  "group": "agents",
+  "maxSteps": 6,
+  "skills": [ {"id": "weather.forecast", "name": "Forecast", "description": "Forecast for a location"} ],
+  "mcpServers": ["web-search"],
+  "callers": [ {"agent": "orchestrator", "allow": ["tasks/send"]} ],
+  "runtime": "go",
+  "workflow": null
 }
 ```
 
 | Field | Maps to |
 |---|---|
 | `name` | All object names, hostname `<name>.ai.avi.com`, registry key |
-| `systemPrompt`, `model`, `skills` | Agent ConfigMap consumed by the runtime (§4) |
-| `identity` | The `sub` the runtime mints its JWT for → group → token budget on the LLM front door |
-| `tools.mcpServers` | Must exist in the **approved MCP registry**; resolved to MCP route URLs, injected as env |
-| `callers[]` | `AIA2ARoutePolicy.spec.agentAccess.rules` (deployed shape) |
-| `egress.hosts` | Optional per-host egress routes (selectorless Service + EndpointSlice + `RouteBackendExtension`), same as mcp-web's `egress.yaml`; runtime runs `EGRESS_STRICT=1` |
-| `schedule` | Optional CronJob curling the agent's `/run` (jobs-agent pattern) |
-| `approved` | Registry publication only — never route existence |
+| `description`, `systemPrompt`, `model`, `skills`, `maxSteps` | `agent.json` in the agent ConfigMap, consumed by the runtime (§4) |
+| `identity` | Display/`agent.json` only. The token's real `sub` comes from a **TokenReview of the pod's ServiceAccount** at `POST /exchange` — see the note below |
+| `group` | Budget group. Also settled at mint time, not asserted by the pod |
+| `mcpServers` | Must exist in the **approved MCP registry**; resolved to gateway-fronted MCP route URLs and written into `agent.json`. An unknown name fails the whole provision before any object exists |
+| `callers[]` | `AIA2ARoutePolicy.spec.agentAccess.rules` |
+| `runtime` | Which **body** runs: `go` (flat ReAct loop) or `adk` (Google ADK). Changes the Deployment image and nothing else. Unknown values fall back to `go` with a warning |
+| `workflow` | Multi-agent graph (`type: single \| parallel-synthesize`, `specialists[]`, `synthesizer`). Framework bodies only — the `go` body ignores it, and a specialist's `mcpServers` **must be a subset of the agent's**, so a workflow can never smuggle a tool past the registry allow-list |
 
-Validation is strict and boring: DNS-1123 name, model must be a live tier alias, every
-MCP server must be registry-approved, every caller agent should exist in the agent
-registry (warn otherwise), no duplicate hostname.
+> **`identity` is not a claim source.** Early drafts had the runtime mint a token for
+> whatever `sub` the spec named. It does not: the runtime presents its pod's projected
+> ServiceAccount token to `POST /exchange`, and the issuer derives subject, group, target
+> and skill from the TokenReview. A spec cannot assert an identity it was not granted.
+> See [Handbook §6.2](ai-gateway-handbook.md#62-principals).
+
+**Not in the shipped spec** (designed 2026-08-14, never built): `egress.hosts[]`,
+`schedule`, `resources`, `approved`. Per-agent egress is still applied by hand with the
+`mcp-web` pattern; resources are chosen by the provisioner from the runtime
+(`agentResources` — the ADK body gets a larger request and a longer probe delay);
+`approved` was always a registry field rather than a spec field, and the provisioner
+always writes `approved: false`.
+
+Validation is strict and boring: DNS-1123 name, every MCP server must be
+registry-approved, callers should exist in the agent registry (warn otherwise).
 
 ---
-
 ## 4. The generic agent runtime — build once, configure forever
 
 **Key design decision: creating an agent must not require building an image.** Per-agent
@@ -138,31 +165,37 @@ hot-tune a live agent's prompt (`kubectl rollout restart`).
 
 ## 5. What the provisioner emits (per agent)
 
-All objects the factory creates for `weather-agent`, in apply order — each one is the
-hand-proven lab pattern, parameterised:
+Every object the factory creates for `weather-agent`, in the order
+`provisionAgent` applies them. Each is the hand-proven lab pattern, parameterised.
+Step 0 runs first on purpose: a bad tool list must fail before anything exists.
 
-| # | Object | Namespace | Notes |
+| # | Step | Namespace | Notes |
 |---|---|---|---|
-| 1 | ConfigMap `weather-agent-config` | `mcp` | `agent.json`: prompt, model, skills, MCP endpoints |
-| 2 | Deployment `weather-agent` | `mcp` | `agent-runtime` image, env `AGENT_NAME`, `LLM_URL`, `IDENTITY`, readiness `/healthz`; jobs-agent resource defaults |
-| 3 | Service `weather-agent` :8080 | `mcp` | |
-| 4 | ReferenceGrant `weather-agent-grant` | `mcp` | HTTPRoute(`inference`) → this Service (listener is `allowedRoutes: Same`) |
-| 5 | HTTPRoute `weather-agent-a2a` | `inference` | `parentRefs: a2a-gateway (sectionName: https)`, hostname `weather-agent.ai.avi.com`, cross-ns backendRef — DNS is automatic |
-| 6 | AIA2ARoutePolicy `weather-agent-a2a` | `inference` | `authRef: llm-auth`, `agentAccess` from `callers[]`, `taskAffinity: 30m`, `onUnauthorized: Reject/403` |
-| 7 | Registry entry in `agent-registry` | `inference` | `approved: false`, `cardURL: https://weather-agent.ai.avi.com/.well-known/agent.json`, `health`, skills |
-| 8 | *(optional)* egress Service + EndpointSlice + RouteBackendExtension + HTTPRoute per `egress.hosts[]` | `inference`/`mcp` | mcp-web egress pattern; omitted when no direct egress requested |
-| 9 | *(optional)* CronJob `weather-agent-schedule` | `mcp` | jobs-agent pattern when `schedule` set |
+| 0 | Resolve MCP tools | — | Every `mcpServers[]` name looked up in the approved `mcp-registry`. Not found → the whole provision fails here, having created nothing |
+| 1 | ConfigMap `weather-agent` | `mcp` | `agent.json`: name, description, prompt, model, identity, maxSteps, skills, resolved MCP endpoints, `runtime`, and `workflow` when set |
+| 2 | ServiceAccount `weather-agent` | `mcp` | The agent's identity. Its projected token is what the runtime exchanges for a front-door JWT — **this is the step that currently fails, see §8** |
+| 3 | Deployment `weather-agent` | `mcp` | Image chosen by `runtime` (`agent-runtime` or `agent-runtime-adk`); env `AGENT_CONFIG`, `AGENT_PUBLIC_URL`, `LLM_URL`, `LLM_VIP`, `MCP_VIP`, `ISSUER_EXCHANGE_URL`. **No identity or group is passed** — both come from the TokenReview. Requests/limits and probe delay are picked per runtime |
+| 4 | Service `weather-agent` :8080 | `mcp` | |
+| 5 | ReferenceGrant `weather-agent-grant` | `mcp` | HTTPRoute(`inference`) → this Service (the listener is `allowedRoutes: Same`) |
+| 6 | HTTPRoute `weather-agent-a2a` | `inference` | `parentRefs: a2a-gateway (sectionName: https)`, hostname `weather-agent.ai.avi.com`, cross-ns backendRef — DNS is automatic |
+| 7 | AIA2ARoutePolicy `weather-agent-a2a` | `inference` | `authRef: llm-auth`, `agentClaim`, `agentAccess` from `callers[]`, card URL, fail-closed |
+| 8 | Registry entry in `agent-registry` | `inference` | `approved: false`, `cardURL`, in-cluster `health` URL, skills, `runtime`, scope `local`, auth `jwt` |
 
-Status is polled after apply: rollout ready → route `Accepted` → `gateway.status.addresses`
-→ card fetch through the VIP. The console ticker shows each beat (great demo moment: the
-agent's hostname resolving via Avi DNS seconds after Approve).
+Status is polled after apply: rollout ready → route `Accepted` →
+`gateway.status.addresses` → card fetch through the VIP. The console ticker shows each
+beat — the agent's hostname resolving via Avi DNS seconds after Approve is the demo
+moment.
+
+Deletion reverses it, including removing the registry entry.
+
+**Not emitted** (designed, not built): per-host egress objects and the scheduled-agent
+CronJob. Both are still applied by hand from the `mcp-web` / `jobs-agent` patterns.
 
 TLS note: `a2a-tls` is a static SAN cert; new hostnames won't match it. Either move the
 listener cert to a wildcard `*.ai.avi.com` (one-time lab change, recommended) or accept
 skip-verify as today's clients already do.
 
 ---
-
 ## 6. NL → AgentSpec extraction
 
 The extractor is a **single OpenAI-style tool call** (`create_agent` with the AgentSpec
@@ -195,49 +228,70 @@ governed traffic (guardrails, budgets, ICAP) like everything else.
 
 ---
 
-## 8. Gaps to close (deltas found in review)
+## 8. Gaps — what closed, and the one still open
 
-1. **UI RBAC** — the `ai-gateway-ui` ClusterRole must add: `apps/deployments`
-   (get,list,create,update,patch), `configmaps` write (master is read-only today; the
-   `feature/agent-registry` branch already bumps this), `secrets` (create,update,patch —
-   `UpsertSecret` already needs it), `gateway.networking.k8s.io/referencegrants`,
-   `batch/cronjobs`, and `ako.vmware.com/routebackendextensions` for egress.
-2. **Branch reconciliation** — `feature/agent-registry` (registry handlers +
-   `/.well-known/agents`) forked before the chat work; its `main.go`/`server.go`/`web`
-   must be merged into master before the factory builds on both.
-3. **A2A wire contract** — jobs-agent/mcp-web-tools don't implement agent cards or
-   JSON-RPC; the new runtime does, and they can later be migrated onto it.
-4. **Wildcard TLS** for `a2a-gateway` (§5 note).
-5. **AIA2ARoutePolicy naming drift** — deployed policies use `agentAccess/agentClaim`;
-   the design doc describes `skillAccess/roleClaim`. The provisioner targets the
-   **deployed** shape; reconcile the doc separately.
+| # | Gap (2026-08-14 review) | Today |
+|---|---|---|
+| 1 | UI ClusterRole needs deployments, configmap writes, secrets, referencegrants, cronjobs | ✅ Granted — **except `serviceaccounts`**, see below |
+| 2 | `feature/agent-registry` branch must merge into UI master before the factory builds on both | ✅ Merged |
+| 3 | A2A wire contract — jobs-agent/mcp-web-tools implement no agent card or JSON-RPC | ✅ The runtime does both; the hand-built agents remain un-migrated |
+| 4 | Wildcard TLS for `a2a-gateway` | ⬜ Open — clients still skip-verify |
+| 5 | `AIA2ARoutePolicy` naming drift (`agentAccess/agentClaim` deployed vs `skillAccess/roleClaim` in the doc) | ✅ Resolved in favour of the deployed shape; [ai-gateway-a2a.md](ai-gateway-a2a.md) uses it |
+
+### 8.1 ⚠️ Open: the provisioner cannot create its agents' ServiceAccounts
+
+The provisioner emits a ServiceAccount per agent (§5 step 2) because the agent's identity
+*is* that ServiceAccount — the runtime exchanges its projected token at `POST /exchange`
+and the issuer derives the subject from a TokenReview. But `ai-gateway-ui`'s ClusterRole
+(`ai-gateway-ui/k8s/01-rbac.yaml`) grants no `serviceaccounts` resource at all, and its
+`services` rule has no `patch` verb.
+
+The failure is quiet in the wrong way. The provision reports the ServiceAccount step as
+failed but carries on, so the Deployment lands, the route is `Accepted`, DNS resolves —
+and the ReplicaSet sits at `FailedCreate` with **no pod**, because the pod spec references
+a ServiceAccount that does not exist. Everything the console shows is green except the
+one dot that matters.
+
+Workaround until the ClusterRole is amended:
+
+```bash
+oc create sa <agent-name> -n mcp
+oc rollout restart deploy/<agent-name> -n mcp
+```
+
+Fix: add `serviceaccounts` (get, list, create) and `services: patch` to the ClusterRole.
 
 ---
 
-## 9. Spikes (in order of risk)
+## 9. Spikes — all three passed
 
-| Spike | Question | Verdict criterion |
+| Spike | Question | Outcome |
 |---|---|---|
-| **A. Config-driven runtime** | Can one image + ConfigMap serve the agent card, JSON-RPC, and the tool loop end-to-end through the gateway? | A factory-shaped agent answers a task through `a2a-gateway` with JWT + agentAccess enforced, model hop metered on the front door |
-| **B. NL → spec reliability** | Does qwen3-14b emit a valid `create_agent` tool call for typical descriptions? | ≥9/10 clean extractions on a 10-prompt suite; else default extractor to the Gemini tier |
-| **C. Provisioner write-path** | Do Deployment/ReferenceGrant/CronJob creates work through the hand-rolled REST client + new RBAC? | `POST /api/agents` (spec from a file, no chat) yields a green status ticker |
+| **A. Config-driven runtime** | Can one image + ConfigMap serve the agent card, JSON-RPC, and the tool loop end-to-end through the gateway? | ✅ Passed. `log-collector` answers tasks through `a2a-gateway` with JWT + `agentAccess` enforced and the model hop metered on the front door. The seam held well enough that a **second** body (ADK) later dropped in behind the same ConfigMap |
+| **B. NL → spec reliability** | Does qwen3-14b emit a valid `create_agent` tool call for typical descriptions? | ✅ Passed on qwen3-14b; the Gemini fallback was not needed. Agents must send `enable_thinking: false` |
+| **C. Provisioner write-path** | Do the creates work through the hand-rolled REST client + new RBAC? | ⚠️ Partial. Every object provisions green **except the ServiceAccount** (§8.1). CronJob and egress creates were never built, so that half of the spike is untested |
 
-None require new SE behaviour — this is the rare feature with no Avi-side unknowns.
+None required new SE behaviour — this was the rare feature with no Avi-side unknowns,
+and that held.
 
 ---
 
 ## 10. Implementation phases
 
-1. **Phase 0 — foundations:** merge `feature/agent-registry` into the UI master; RBAC
-   deltas; wildcard `a2a-tls`.
-2. **Phase 1 — deterministic factory:** `agent-runtime` image (spike A) +
-   `POST /api/agents` provisioner + status ticker + "Agents" console tab with a manual
-   create form (spike C). *Demo-able without any NL.*
-3. **Phase 2 — natural language:** `create_agent` extraction in a "🏭 Create agent" chat
-   mode, preview card, Approve wiring (spike B).
-4. **Phase 3 — lifecycle:** delete/suspend, prompt hot-edit, scheduled agents, egress
-   blocks, migrate ops/security/jobs/mcp-web onto the runtime, federation polish.
+1. **Phase 0 — foundations.** ✅ `feature/agent-registry` merged into the UI master; RBAC
+   deltas granted (bar `serviceaccounts`). Wildcard `a2a-tls` still outstanding.
+2. **Phase 1 — deterministic factory.** ✅ 2026-08-15. `agent-runtime` image +
+   `POST /api/agents` provisioner + status ticker + the "Agents" console tab.
+3. **Phase 2 — natural language.** ✅ `POST /api/agents/draft` extracts a spec from a
+   description and *proposes only*; the operator approves before anything is applied.
+4. **Phase 3 — lifecycle.** ◐ Partial. Delete/teardown is built (registry entry included).
+   Not built: suspend, prompt hot-edit, scheduled agents, egress blocks. The hand-built
+   agents (ops/security/jobs/mcp-web) were never migrated onto the runtime — two mock
+   agents were deleted outright on 2026-08-16.
+5. **Phase 4 — framework bodies.** ✅ 2026-08-18, ADK. See
+   [ai-gateway-agent-framework.md](ai-gateway-agent-framework.md).
 
+---
 ---
 
 ## 11. Related docs

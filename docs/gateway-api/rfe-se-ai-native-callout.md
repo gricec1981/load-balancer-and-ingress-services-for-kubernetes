@@ -156,5 +156,5 @@ metering — each carrying the limits in §1. This RFE is the path from "works, 
 - [Semantic Guardrails (ICAP)](ai-gateway-guardrails-semantic.md) — the workaround this replaces, and its spike evidence
 - [Classifier-Based Routing](ai-gateway-classifier-routing.md) — the stage-order disproof (§0) and the edge-orchestration workaround this returns to the SE
 - [Guardrails & DLP (WAF)](ai-gateway-guardrails.md) — the signature layer and its semantic ceiling
-- [Streaming token limit](ai-token-streaming-limit.md) — the metering wall this subsumes
+- [Token ledger §4 — Streaming](ai-gateway-token-ledger.md) — the metering wall this subsumes
 - [AI Gateway](ai-gateway.md) — the policy family that rides on these primitives

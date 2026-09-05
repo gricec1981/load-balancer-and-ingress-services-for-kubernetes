@@ -49,13 +49,15 @@ The following capabilities are built and callable in the gateway today.
 | [Inference](#inference) | Metric-weighted load balancing across model-server pods |
 | [Authentication](#authentication) | JWT/OIDC validation for browser **and** machine clients, with verified identity/claims |
 | [Token Counting](#token-counting) | Per-consumer / per-group token budgets, counters, rate limits |
-| [Model Routing](#model-routing) | Model-aware routing to quality/cost tiers, with entitlements |
+| [Token Ledger](#token-ledger) | True per-user and per-agent *consumption* accounting, beside the enforcement counter |
+| [Model Routing](#model-routing) | Model-aware routing to quality/cost tiers, with entitlements — including tiers served by an external provider or **another cluster** |
 | [Guardrails & DLP](#guardrails--dlp) | WAF-native data-loss prevention and content guardrails |
 | [MCP](#mcp-agenttool) | The same governance for agent↔tool (Model Context Protocol) traffic |
 | [Semantic Guardrails](#semantic-guardrails) | Model-based prompt-injection detection over ICAP, escalating past what WAF signatures catch |
 | [A2A](#a2a-agentagent) | Governance for agent↔agent (Agent2Agent) delegation traffic |
+| [Agent Factory](#agent-factory) | Describe an agent in plain language; the platform provisions it, governed, behind the A2A gateway |
 
-The agent loop has three governance surfaces; the gateway covers the first two today:
+The agent loop has three governance surfaces; the gateway covers all three:
 
 | Surface | Protocol | Governed by | Status |
 |---|---|---|---|
@@ -131,6 +133,21 @@ identity established by authentication.
 
 → [Token Rate Limiting — `AITokenRateLimitPolicy`](ai-gateway.md#token-rate-limiting--aitokenratelimitpolicy)
 
+## Token Ledger
+
+The budget counter and an accounting figure want opposite things: enforcement wants a number it
+can reset, accounting wants a record it can never lose. The ledger adds the second beside the
+first. The SE writes one immutable usage record per metered response — identity, model, tier,
+prompt/completion/cached/reasoning tokens, route — into a ring it also serves at a drain
+endpoint; the console polls that ring into a durable store and renders Dashboard ▸ Tokens by
+user and by agent. The enforcement counter is unchanged and still enforces budgets.
+
+Measured on the live estate: the SE's recording is exact to the token at 333 rps and
+concurrency 128; the *collector* is the lossy half, with a ceiling near 200 rps sustained.
+Streaming responses still cannot be metered at all — that is the standing RFE.
+
+→ [AI Gateway token ledger](ai-gateway-token-ledger.md)
+
 ## Model Routing
 
 Model routing reads the requested **model** from each incoming request and steers it to a
@@ -141,6 +158,14 @@ requests entitled to it, and everything else lands on cheaper backends. Tiers ca
 the caller's verified group, and a caller who asks for a tier they aren't entitled to is
 downgraded to one they are. Configured with an `AIModelRoutePolicy`; composes with
 authentication and token budgets on the same route.
+
+A tier does not have to be pods in this cluster. Four backend kinds are supported and all are
+built: an `InferencePool` (per-pod metric weighting), a core `Service` (endpoints — so a
+selectorless Service plus a hand-written EndpointSlice fronts a GPU VM or bare metal as a
+first-class tier), an **external provider** (an OpenAI-compatible vendor API over SE egress,
+with the key injected from a Secret), and a **remote site** — a peer AI Gateway in another
+cluster, verified cross-cluster on the lab estate. A labelled model pod can also publish its own
+alias into the model→tier table, so deploying a model and publishing it become one action.
 
 → [Model-Based (Quality/Cost Tier) Routing](model-routing.md)
 
@@ -228,9 +253,33 @@ the `icapprofile` + security-policy rule from `AIGuardrailPolicy.semantic`. FP-h
 re-verified live (openshift06, 2026-08-14) — the classifier's benign-anchor set now covers
 imperative-but-benign prompts (counting, output-format constraints, agent/tool traffic) that had
 been false-positiving, plus a gray-zone LLM-judge cascade for uncertain scores.
-
 → [Semantic Guardrails (prompt-injection over ICAP)](ai-gateway-guardrails-semantic.md)
 
+## Agent Factory
+
+An operator describes an agent in plain language and the platform creates everything else: a
+running agent, holding its own ServiceAccount identity, protected by the shared-IdP auth policy,
+routed through the A2A gateway on its own hostname, and catalogued in the agent registry behind a
+register → approve → route gate. Chat alone never applies anything — the extractor *proposes* a
+spec and an operator approves it.
+
+The design decision that makes it practical is that creating an agent **builds no image**: one
+config-driven runtime serves every agent, so the factory is a provisioner rather than a CI
+system. A second body (Google's ADK, for multi-agent fan-out) drops in behind the same ConfigMap,
+route, policy and registry entry — only the image changes.
+
+→ [Agent Factory](ai-gateway-agent-factory.md) · [Framework agent runtimes](ai-gateway-agent-framework.md) · [Agent registry](ai-gateway-agent-registry.md)
+
+## RAG over the estate's own source
+
+An MCP tool (`code_search`) that answers questions about this system with citations into its own
+GitHub source. It is also the honest demonstration of *indirect* prompt injection: retrieved
+content is scored by the same classifier that guards the front door, so a poisoned document is
+quarantined rather than fed to the model.
+
+→ [AI Gateway RAG](ai-gateway-rag.md)
+
+---
 ---
 
 # Planned
@@ -241,8 +290,13 @@ The following are specified but not yet built. They are included here so the ful
 | Capability | What it provides |
 |---|---|
 | [Backend mTLS](#backend-mtls-spiffespire) | SE↔backend mutual TLS with SPIFFE/SPIRE short-lived identity · *spike-gated* |
-| [Multi-Site Delivery](#multi-site-cross-cluster-delivery) | Cross-cluster model routing via AMKO + Avi GSLB · *spike-gated* |
-
+| [Multi-Site Delivery](#multi-site-cross-cluster-delivery) | Geo/capacity site steering via AMKO + Avi GSLB · *spike-gated*. The **single-peer** case is built — see Model Routing |
+| [One gateway per surface](#one-gateway-per-surface-many-clusters) | Three gateways for a whole estate rather than one per cluster |
+| [Cross-cluster agent authorization](ai-gateway-cross-cluster-auth.md) | One A2A policy governing agents in every cluster. Blocked first on an ambiguous subject: the issuer's `sub` is a bare ServiceAccount name and collides across clusters |
+| [AgentMinder as identity broker](ai-gateway-agentminder-pdp.md) | Replace the hand-rolled in-cluster issuer with a supported broker, keeping enforcement in the SE |
+| A2A push-notification egress allow-list | Governs the webhook an agent may POST task updates to. Designed and spike-proven, never carried into the CRD — [ai-gateway-a2a.md §8](ai-gateway-a2a.md) |
+| A tier that names a *set* of sites | Today a `remote` tier names one peer, so peer-down is tier-down — [ai-gateway-datacenter.md §6](ai-gateway-datacenter.md) |
+| Streaming token metering | Streamed responses cannot be metered on the data plane at all; the demo runs non-streaming. This is the standing RFE — [rfe-se-ai-native-callout.md](rfe-se-ai-native-callout.md) |
 ---
 
 ## Backend mTLS (SPIFFE/SPIRE)
@@ -260,14 +314,20 @@ rather than just a DNS name — is *spike-gated*.
 
 ## Multi-Site (cross-cluster) delivery
 
-Multi-site delivery routes an inference request to the right **model tier** *and* the right
-**site** across a fleet of clusters, by composing three existing capabilities: the per-cluster
-AI Gateway, model-based tier routing, and **AMKO + Avi GSLB** global server load balancing. GPUs
-are scarce and scattered across clusters and regions; this layer delivers a request to the best
-site that can serve the model it wants, without a new data plane. **In design**; cross-site
-behavior is *spike-gated*.
+**The simple case is already built.** A tier can name a peer AI Gateway in another cluster
+(`tiers[].remote`), and that is verified cross-cluster on the lab estate. It uses no GSLB: the SE
+resolves the peer's name itself and a health monitor decides whether the peer is up, so which
+site serves a request is decided by *tier selection* after the model is read from the body — not
+by DNS answering a client. It covers one peer per tier, in one datacentre, with no geo steering.
 
-→ [Multi-Site (Cross-Cluster) Model Delivery](ai-gateway-multisite.md)
+What remains in design is the layer above that: **many** sites per tier, geo and capacity
+steering, and a dedicated cross-site transit path, composing the per-cluster AI Gateway,
+model-based tier routing and **AMKO + Avi GSLB**. GPUs are scarce and scattered; this layer
+delivers a request to the best site that can serve the model it wants, without a new data plane.
+**In design**; cross-site behaviour is *spike-gated*. The nearer step — a tier that names a set
+of peers, still without GSLB — is specified in the datacenter doc §6.
+
+→ [Multi-Site (Cross-Cluster) Model Delivery](ai-gateway-multisite.md) · [One Gateway for a Datacenter](ai-gateway-datacenter.md)
 
 ## One gateway per surface, many clusters
 

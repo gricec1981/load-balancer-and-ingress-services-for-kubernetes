@@ -7,14 +7,14 @@
 
 # AKO AI Gateway — A2A Agent Registry
 
-> **Status: Implemented (feature/ai-a2a-gateway).** This document covers the **Agent
+> **Status: Built and live.** This document covers the **Agent
 > Registry** — a ConfigMap-backed catalog of known A2A agents that the AI Gateway console
 > can browse, add to, and publish for federation. It is the direct A2A counterpart to the
 > [MCP server registry](ai-gateway-mcp.md#9-mcp-server-registry--catalog-onboarding-option-a).
 >
 > The registry is **catalog and discovery only** — it deliberately mirrors the MCP
 > registry's ConfigMap design rather than introducing a new CRD. Per-agent enforcement
-> (skill authorization, session affinity, push-notification egress control) stays in
+> (caller authorization, task affinity) stays in
 > [`AIA2ARoutePolicy`](ai-gateway-a2a.md); the registry is the layer above that decides
 > *which agents exist* in the fleet.
 
@@ -89,6 +89,12 @@ data:
 | `approved` | bool | When `true`, the entry is included in `/.well-known/agents`. When `false`, the entry is visible in the console only. |
 | `description` | string | Free-text description shown in the console table. |
 | `reachable` | string | Computed at read time: `""` (health not configured), `up`, or `down`. Never written to the ConfigMap. |
+| `runtime` | string | The agent **body** that is running: `go` (compact ReAct loop) or `adk` (Google ADK). Recorded by the factory even on the Go body, so the console badge names what is actually running. See [ai-gateway-agent-framework.md](ai-gateway-agent-framework.md). |
+
+> ⚠️ **Never hand-patch the live ConfigMap.** Entries added by hand are silently lost the next
+> time something applies the manifest that owns it — this happened once and the agent hub lost
+> a tool for a day without any error appearing anywhere. Registry entries belong in the
+> manifest that is applied.
 
 ---
 
@@ -268,25 +274,41 @@ earn a place in the fleet.
 
 ---
 
-## 8. Relationship to `AIA2ARoutePolicy`
+## 8. Relationship to `AIA2ARoutePolicy` and to identity
 
 The agent registry is **not** the enforcement layer. It is the catalog. Registering an
 agent (even with `approved: true`) does not create a gateway route or a governing policy.
-Per-agent enforcement — skill authorization, task/context session affinity,
-push-notification egress control — is configured separately via an
+Per-agent enforcement — caller authorization, task affinity — is configured separately via an
 [`AIA2ARoutePolicy`](ai-gateway-a2a.md) that targets the agent's `HTTPRoute`.
 
-The registry's `skills[]` data is intended to pre-fill the `AIA2ARoutePolicy.spec.skillAccess`
-role × skill matrix (the operator checks boxes against the real skill list rather than
-typing skill ids by hand), but this pre-fill step is a console UX concern, not an
-enforcement coupling.
+The registry's `skills[]` data pre-fills the `AIA2ARoutePolicy.spec.agentAccess` allow-list
+(the operator checks boxes against the real skill list rather than typing skill ids by hand),
+but this is a console UX concern, not an enforcement coupling. Note that an allow-list entry is
+matched against the JSON-RPC **method** as well as the skill claim, so a policy pre-filled with
+skills alone will not authorize a method-carrying request.
+
+### 8.1 Registration is not identity
+
+Being in the registry grants an agent nothing. Since 2026-08-16 each agent holds its **own
+Kubernetes ServiceAccount**, and its front-door credential is obtained by presenting that
+ServiceAccount's projected token to the issuer's `POST /exchange`. The issuer runs a
+TokenReview and mints a short-lived (60 s) token whose `sub`, `group`, `target` and `skill` it
+chooses — authorization happens at **mint time**, not only at enforcement time. An agent
+therefore cannot ask for a token naming a different subject, target or skill, because it never
+asserts any of them.
+
+The forgeable `GET /token`, which minted any subject for anyone who could reach it, was retired
+on 2026-08-19 and answers `410 Gone`. Console personas mint at `POST /persona`, callable only by
+the console's own ServiceAccount.
+
+Full model: [Handbook §6.2 — Principals](ai-gateway-handbook.md#62-principals).
 
 ---
 
 ## 9. Related docs
 
 - [A2A Gateway & Agent-to-Agent Routes](ai-gateway-a2a.md) — `AIA2ARoutePolicy`, skill
-  authorization, session affinity, push-notification egress control
+  authorization, task affinity
 - [MCP Gateway & MCP-Specific Routes](ai-gateway-mcp.md) — the sibling MCP server registry
   (§9) whose ConfigMap design this mirrors
 - [AI Gateway Overview](ai-gateway-overview.md) — the full capability picture

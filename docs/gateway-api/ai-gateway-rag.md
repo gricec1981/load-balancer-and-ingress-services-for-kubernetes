@@ -1,24 +1,41 @@
 # AI Gateway RAG — the estate searches its own source
 
-> **Status: BUILT (2026-08-15).** `rag-service` deployed on openshift06
-> (`ako-inference-demo/rag-service`, ns `mcp`, `https://rag.ai.avi.com/mcp`).
+> **Status: BUILT (2026-08-15), live and chat-verified.** `rag-service`
+> (`ako-inference-demo/rag-service`, ns `mcp`, port **8979**) serves
+> `https://rag.ai.avi.com/mcp`. The hub's chat answers questions about the
+> estate's own source with GitHub citations via `code_search`.
 > Companion to [ai-gateway-mcp.md](ai-gateway-mcp.md) (governed MCP tools),
 > [ai-gateway-agent-factory.md](ai-gateway-agent-factory.md) (agent-runtime),
 > and [ai-gateway-guardrails-semantic.md](ai-gateway-guardrails-semantic.md)
-> (the indirect-injection gap this finally demos).
+> (the indirect-injection gap this finally demos — now staged as UC3b).
+>
+> **Since the build, three things moved** (§8 has the detail):
+>
+> - **It lives behind the MCP gateway, authenticated.** The route's `parentRef`
+>   is `mcp-gateway` (VIP `.27`), not `a2a-gateway` (`.28`), and `rag-auth`
+>   enforces `jwtQuery` — an unauthenticated call gets `401`. The "MCP routes
+>   carry no auth policy" note below is obsolete.
+> - **Its embeddings are metered.** They ride the LLM front door as
+>   `sub=rag-service`, group `agents` (the group formerly called `group2`), so
+>   RAG shows on Dashboard ▸ Agents as an MCP tool card with a token badge. The
+>   token is minted by **exchanging the pod's ServiceAccount** at `POST
+>   /exchange`; the `?sub=&group=` in `JWT_ISSUER_URL` is vestigial, since
+>   `GET /token` now returns `410`.
+> - **Its registry entry is in `agent-hub`'s `manifests.yaml`.** It was added by
+>   hand once and an unrelated apply silently wiped it, taking `code_search` out
+>   of the hub. Never hand-patch that ConfigMap.
 >
 > **Build deltas vs. the plan below:** service port is **8979** (8978 was taken
 > by nmap-mcp); the embedder rejects inputs over its **512-token physical
 > batch** (not the 2048 model context) → chunks capped at 1200 chars with
 > per-text fallback; CPU embedding is seconds-per-chunk → `nomic-embed`
 > ISVC scaled to **3 replicas** (`minReplicas: 3`) + 2 concurrent client
-> batches; pods now resolve `ai.avi.com` natively (no VIP pinning anywhere,
-> spike S2 collapsed — the hub already had a TLS child-MCP client); MCP routes
-> carry **no auth policy** on 31.2.1 (k8s-logs parity — netpol is the fence);
+> batches; pods resolve `ai.avi.com` natively (no VIP pinning anywhere,
+> spike S2 collapsed — the hub already had a TLS child-MCP client);
 > fresh egress HTTPRoutes came up 503 until **delete+recreate** (the known
 > ExternalName-workaround quirk), and geo-DNS pins differ PC vs. lab —
 > `codeload`'s EndpointSlice carries both answers. Private-repo indexing
-> awaits the `rag-github-token` Secret (PAT); the public AKO fork indexes
+> still awaits the `rag-github-token` Secret (PAT); the public AKO fork indexes
 > without it.
 
 ## 1. Goal
@@ -55,7 +72,7 @@ GitHub ──(SE egress route: api/codeload.github.com)──▶ indexer
   → embeddings (nomic-embed via models-gateway, SE-fronted)
   → in-memory vectors + gob cache on PVC (re-embed only changed hashes)
 
-hub / agents ──(https://rag.ai.avi.com/mcp, a2a-gateway VIP .28)──▶ /mcp
+hub / agents ──(https://rag.ai.avi.com/mcp, mcp-gateway VIP .27, jwtQuery auth)──▶ /mcp
   code_search(query, repo?, k) → top-k chunks, each ICAP-scored; poisoned
     chunks quarantined (returned as a flagged stub, text withheld)
   read_file(repo, path, startLine?, endLine?) → exact source for follow-up
@@ -137,14 +154,21 @@ hub / agents ──(https://rag.ai.avi.com/mcp, a2a-gateway VIP .28)──▶ /m
 
 ## 7. Gotchas carried in from the estate
 
-- Pods can't resolve `ai.avi.com` (S2) and Avi DNS is .21 — clients need VIP
-  pinning; lab-client resolvers don't forward the zone.
+- ~~Pods can't resolve `ai.avi.com` (S2); clients need VIP pinning.~~ **No longer
+  true** — the cluster's CoreDNS forwards `ai.avi.com` to Avi DNS (`.21`), so pods
+  resolve `*.ai.avi.com` natively and no `MCP_VIP`/`LLM_VIP` pin is needed.
 - Build via internal-registry BuildConfig (Docker Hub anonymous pulls blocked;
   golang base from `mirror.gcr.io`).
 - ICAP shim fails open ~2–5 min after pod reschedule (re-run `attach-icap.sh`)
   — don't demo beat 4 in that window.
 - GitHub unauthenticated rate limit is 60/hr — always send the PAT; tarball
   fetches are 1 request/repo.
-- `jwt-issuer` `/token` returns `{"token":"…"}` JSON, not a bare string.
+- ~~`jwt-issuer` `/token` returns `{"token":"…"}` JSON, not a bare string.~~
+  `GET /token` is **retired (410)**. `rag-service` derives `POST /exchange` from
+  `JWT_ISSUER_URL` and presents its ServiceAccount token; the `?sub=&group=`
+  still in that env var is vestigial and authorizes nothing.
+- The hub's `rag` registry entry belongs in `agent-hub`'s `manifests.yaml`. It
+  was once added to the live ConfigMap by hand, and an unrelated apply
+  overwrote it — the hub silently lost `code_search`.
 - Keep `rag-service` OUT of the factory-agent NetworkPolicy label set; it gets
   its own policy (object 7) so factory-label changes never silently unguard it.

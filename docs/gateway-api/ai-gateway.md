@@ -1,5 +1,15 @@
 # AKO AI Gateway
 
+> **Scope note.** This document is the reference for the **two foundation policies** —
+> `AIGatewayAuthPolicy` (authentication) and `AITokenRateLimitPolicy` (token budgets). Everything
+> built on top of them has its own document: model/tier routing
+> ([model-routing.md](model-routing.md)), tool governance ([ai-gateway-mcp.md](ai-gateway-mcp.md)),
+> agent-to-agent governance ([ai-gateway-a2a.md](ai-gateway-a2a.md)), guardrails
+> ([ai-gateway-guardrails.md](ai-gateway-guardrails.md)) and consumption accounting
+> ([ai-gateway-token-ledger.md](ai-gateway-token-ledger.md)). For the whole system in one place,
+> read the [Handbook](ai-gateway-handbook.md); for what shipped when, the
+> [release notes](ai-gateway-release-notes.md).
+
 ## Overview
 
 The AKO AI Gateway extension adds **OAuth/OIDC authentication** and **token-based rate limiting**
@@ -11,10 +21,11 @@ sidecars, no external rate-limit servers, no changes to the data-plane binary.
 This feature builds directly on top of the [AKO Inference Extension](inference-extension.md).
 It is designed to protect and govern the same LLM endpoints that `InferencePool` load-balances.
 
-A Phase 3 `AIMCPPolicy` extension will bring the same governance to **MCP tool servers**,
-making the AI Gateway the single control plane for the entire agent execution loop — inference
-calls to LLMs and tool calls to MCP servers, authenticated and budget-governed by the same
-policies and the same verified identity.
+The "single control plane for the entire agent execution loop" this document once described as a
+Phase 3 ambition is **built**: tool calls are governed by
+[`AIMCPRoutePolicy`](ai-gateway-mcp.md) and agent↔agent delegation by
+[`AIA2ARoutePolicy`](ai-gateway-a2a.md), both under the same verified identity and the same
+budgets as inference. The CRD is named `AIMCPRoutePolicy`, not the `AIMCPPolicy` sketched below.
 
 > **Why OAuth/OIDC and not raw JWT validation?** Avi's `SSO_TYPE_JWT` validates a bearer token
 > but **strips the `Authorization` header before any DataScript runs**, and this Avi build has no
@@ -537,15 +548,24 @@ Install the CRDs and restart the `ako-gateway-api` pod.
 | 2 | `AIGatewayAuthPolicy` — OAuth/OIDC auth, AKO-managed `Pool` + `AuthProfile` + `SSOPolicy` lifecycle | ✅ Done |
 | 2 | Verified claims in the DataScript via `oauth_get_claim` | ✅ Done |
 | 2.x | [`AIModelRoutePolicy`](model-routing.md) — route by request-body `model` to per-tier `InferencePool` backends (`avi.poolgroup.select`), group entitlement, per-tier token budgets | ✅ Done |
-| 2.5 | Native distributed rate limiter (`avi.vs.rate_limiter()`) for exact cross-SE limits | Planned |
-| 2.5 | `AIObservabilityPolicy` — per-request token usage logging | Planned |
-| 3 | `AIMCPPolicy` — route and govern MCP tool server endpoints from a registry using the same `targetRef` attachment model | Planned |
-| 3 | MCP registry integration — auto-discover registered MCP servers from the registry, materialise them as AKO-managed Avi Pool backends | Planned |
+| 2.5 | Native distributed rate limiter (`avi.vs.rate_limiter()`) for exact cross-SE limits | Planned — filed as an RFE |
+| 2.5 | `AIObservabilityPolicy` — per-request token usage logging | ✅ Superseded and delivered as the [token ledger](ai-gateway-token-ledger.md): one immutable usage record per metered response, drained into a durable store |
+| 3 | MCP tool governance | ✅ Done — shipped as [`AIMCPRoutePolicy`](ai-gateway-mcp.md), not the `AIMCPPolicy` sketched below |
+| 3 | MCP registry integration — the gateway brokers only servers on an approved list | ✅ Done — `mcp-registry` ConfigMap, enforced by the factory and the console |
+| 3 | A2A (agent↔agent) governance | ✅ Done — [`AIA2ARoutePolicy`](ai-gateway-a2a.md) |
+| 3 | Guardrails / DLP on the SE's native WAF, plus a semantic layer over ICAP | ✅ Done — [`AIGuardrailPolicy`](ai-gateway-guardrails.md) |
 | 3 | Cross-resource budget — unified per-consumer spend limit spanning token consumption (LLM) and call count (MCP tools) in a single rolling window | Planned |
 
 ---
 
-## MCP Tool Governance (Phase 3 — Planned)
+## MCP Tool Governance (Phase 3 — superseded)
+
+> **Superseded.** MCP governance shipped as
+> **[`AIMCPRoutePolicy`](ai-gateway-mcp.md)** — a dedicated MCP gateway with its own VIP, the
+> native Avi 32.1.1 MCP application profile, `Mcp-Session-Id` affinity and per-role tool
+> authorization. The section below is the original sketch, kept because its framing of *why*
+> tool calls need governing still reads well. For anything you intend to configure, use
+> [ai-gateway-mcp.md](ai-gateway-mcp.md); the CRD shape described here was never built.
 
 ### The Gap Today
 

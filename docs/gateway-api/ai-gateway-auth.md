@@ -115,19 +115,53 @@ client = OpenAI(
 ### Security: token-in-URL
 
 The property that makes claims readable — the query param surviving to the
-DataScript — also means the token rides in the URL. Mitigate:
+DataScript — also means the token rides in the URL. What actually helps:
 
 - **TLS is mandatory** (encrypts the URL in transit).
-- **Short-lived tokens** (minutes) to bound exposure.
-- **SE query-param log redaction** so the token isn't written to access logs.
-- **Strip before backend.** The SE forwards the query string to the upstream
-  model/MCP server, so the token can land in *its* logs. A query-strip before
-  the pool removes it; the exact SE query-rewrite primitive must be confirmed
-  on-cluster, so AKO does not yet emit it automatically — treat this as the
-  remaining hardening step for production `jwtQuery` use.
+- **Short-lived tokens.** This is the real mitigation, and the estate leans on it:
+  workload tokens minted at the issuer's `POST /exchange` live **60 seconds** and
+  are bound to one target and one skill. A leaked URL is a leaked credential for
+  about as long as it takes to read the log line.
+- **Strip before backend.** The SE forwards the query string upstream, so the
+  token can land in the *backend's* logs. A query-strip before the pool removes
+  it; the exact SE query-rewrite primitive is still unconfirmed on-cluster, so
+  AKO does not emit it automatically — this remains the open hardening step.
+
+> ⚠️ **Avi access logs cannot be made to hide the token — measured, not assumed.**
+> Two things go wrong. `uri_query_field_rules` match on the **parameter name**,
+> so a rule written as `jwt=` never fires. And fixing that does not solve it:
+> on Avi 30.2.1 and later, masking a query field *populates* `orig_uri`
+> ("Unparsed URI") with the original request line, token and all. No
+> configuration removes it from the log. Treat every `jwtQuery` request line as
+> containing a live credential for the token's lifetime, and keep that lifetime
+> short.
+
+> **Length limit.** The whole request line must stay under the SE's
+> `client_max_header_size` (default 12 KB, applied per line rather than to the
+> headers in aggregate). A longer request line is rejected with `400`. Tokens up
+> to ~12 KB read correctly in the DataScript and RBAC stays correct — the limit
+> fails loudly rather than by silently truncating a claim.
 
 `jwtQuery` is intended for **machine-to-machine** traffic on internal/TLS paths,
 not for public browser clients (which use `oauthBrowser`).
+
+### Where a machine client's token comes from
+
+`AIGatewayAuthPolicy` validates a token; it does not mint one. On the lab estate
+the issuer that mints them is deliberately **in-cluster**, and a workload proves
+its identity rather than asserting it: it presents its projected Kubernetes
+ServiceAccount token to `POST /exchange`, and the issuer runs a TokenReview and
+chooses the `sub`, `group`, `target` and `skill` itself. Authorization therefore
+happens at **mint time** as well as at enforcement time. The forgeable
+`GET /token` was retired on 2026-08-19 and answers `410 Gone`.
+
+Two constraints keep that issuer in-cluster rather than pointing the auth policy
+at an enterprise IdP: a generic IdP cannot do mint-time authorization, and AKO
+**snapshots the JWKS** into the `JWTServerProfile`, so a key rotation at the IdP
+is an estate-wide `401` until AKO re-reconciles. See
+[ai-gateway-agentminder-pdp.md](ai-gateway-agentminder-pdp.md) for the
+broker-shaped way out, and [Handbook §6.2](ai-gateway-handbook.md#62-principals)
+for the full identity model.
 
 ## The clean long-term fix (RFE)
 
@@ -137,3 +171,33 @@ preserves the `Authorization` header to DataScripts or exposes validated claims
 via a `get_jwt_claim()` API / claim-to-header injection. With that, `jwtQuery`
 collapses to "the same thing, but read from the header instead of the query
 string," and the token-in-URL tradeoff disappears.
+
+## Spike result 2026-09-05 — the header mode is not as blind as we thought
+
+Measured on the lab (Avi 31.2.1) with a throwaway EVH child whose `jwt_config` was
+set to `JWT_LOCATION_AUTHORIZATION_HEADER`, reusing the live SSO policy by
+reference:
+
+| What | Result |
+|---|---|
+| `avi.http.get_header("Authorization")` in `HTTP_REQ` | stripped (`-1`), as before |
+| Any header/cookie API in `HTTP_AUTH` / `HTTP_POST_AUTH` | **disabled by the sandbox** — `API avi.http.get_header() disabled in the event of http_auth`. Copying the header before validation is impossible by design, not by ordering |
+| **`avi.http.get_userid()`** in `HTTP_POST_AUTH` and `HTTP_REQ` | **the validated token's `sub`** — nil before authentication, `time-agent` / `load-probe` for two different tokens, `401` with no token |
+| reqvars set in `HTTP_AUTH` / `HTTP_POST_AUTH` | persist into `HTTP_REQ` |
+| `avi.utils.sha1_hash`, `md5_hash`, `base64_encode/decode`, `rand_bytes`; `avi.http.method()` | all work, in all three events |
+
+So a bearer in the **Authorization header** gives a DataScript a verified identity
+after all — the SE just never told anyone that JWT validation populates the user
+id (the docs credit only Basic Auth and client certificates). What header mode
+still withholds is every claim *other* than `sub`.
+
+That reframes the trade. `jwtQuery` exists to expose claims; if the only verified
+string the SE will hand over is `sub`, the issuer we own can put the claims *in*
+`sub` — `"agent|target|skill"` for the 60-second per-skill tokens, with the
+`sub→group` map baked into the DataScript exactly as `groupBudgets` is — and the
+token leaves the URL, taking the unmaskable `orig_uri` leak with it. Design only;
+not built. It also unblocks AgentMinder MCP tool discovery, which sends a bearer
+and could never get past the query-only route.
+
+Probe method: `hack/spikes/auth-probe.sh` (header) — the result above supersedes
+its §6 hypothesis.

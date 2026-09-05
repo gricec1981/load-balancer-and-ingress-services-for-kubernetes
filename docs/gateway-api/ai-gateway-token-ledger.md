@@ -1,12 +1,20 @@
 # AI Gateway token ledger — true consumption, per user and per agent
 
-> **Status: BUILT (2026-08-19), not yet exercised on the live estate.**
+> **Status: BUILT (2026-08-19) and measured on the live estate (2026-08-22).**
 > Steps 0-4 are in: the SE emits usage records and serves a drain endpoint, the
 > console collects them into a durable ledger, and Dashboard ▸ Tokens renders
-> users and agents from it. Streaming (step 5) remains unsolved. Companion to
-> [ai-gateway-auth.md](ai-gateway-auth.md) (where identity comes from),
+> users and agents from real data. Streaming (step 5) remains unsolved. Companion
+> to [ai-gateway-auth.md](ai-gateway-auth.md) (where identity comes from),
 > [model-routing.md](model-routing.md) (where `ai_tier` comes from), and
 > [rfe-se-ai-native-callout.md](rfe-se-ai-native-callout.md) (the streaming ask).
+>
+> **What the measurement settled** (§9, full method in
+> `ako-inference-demo/ledger-stress`): the SE's *recording* is exact — 7,500
+> metered responses at up to 333 rps and concurrency 128, ring head +1 per
+> response, budget counter matching ground truth to the token. The **collector**
+> is the lossy half, and its ceiling is sharp: **~200 rps sustained** at the
+> default poll, above which records age past the drain's reach and are reported
+> `lost`. The body-buffer units question (§7) is closed by the same run.
 >
 > **Decisions taken:** the ledger is an **out-of-band collector with its own
 > store** (not Avi client logs, not the SE table as a store), and the accuracy
@@ -217,21 +225,22 @@ nothing; an over-buffer response is still fail-closed but recorded as a penalty;
 an over-budget consumer is still 429'd; a second drain at the returned cursor
 repeats nothing. Skipped where no Lua interpreter is installed.
 
-**Not yet run against the live estate.** The units question in §7 and the drain's
-behaviour on a genuinely scaled-out VS are the two things the stub cannot settle.
+**Run against the live estate 2026-08-22.** See §9 — the stub's two open
+questions (units, and behaviour under real concurrency) are answered; what
+remains open is a genuinely *scaled-out* VS, which the lab does not have.
 
-## 7. Open risk: the body-buffer units
+## 7. Body-buffer units — settled
 
 `avi.http.set_response_body_buffer_size` and `avi.http.get_response_body` are
 called with `RespBodyBufferKB` (256) raw, and the truncation test compares Lua's
-byte-count `#_body` against 262 144. That is correct **if both take kilobytes**,
-which the production evidence supports — counters show figures like 607 and 9.3k
-rather than multiples of 65 536, so real completions are parsing, and a real
-completion is far longer than 256 bytes.
+byte-count `#_body` against 262 144. That is correct only if both take
+**kilobytes**, and being wrong would have been silent in both directions: at 256
+*bytes* no `usage` would ever parse, the penalty would never fire either, and
+completions would go unmetered while everything looked healthy.
 
-It is worth confirming directly, because being wrong is silent in both
-directions: if the buffer were really 256 *bytes*, no `usage` would ever parse and
-the penalty would never fire either, leaving completions unmetered.
+The stress run closes it. Against a backend whose every response is exactly 150
+tokens, the budget counter's delta matched ground truth to the token across 3,500
+responses. A 256-byte buffer cannot produce that; the units are kilobytes.
 
 ## 8. Known adjacent risk
 
@@ -242,3 +251,87 @@ access is evaluated before `pcall` runs, and an unknown name raises. Those
 scripts work today, so the names they use evidently exist; but any future rename
 or build change fails hard rather than degrading. `TestNoBareAviHTTPProbes`
 guards the token-accounting scripts only. Worth a sweep, not part of this work.
+
+---
+
+## 9. Measured on the live estate — 2026-08-22
+
+Method and harness: `ako-inference-demo/ledger-stress` (a mock backend whose every
+response costs exactly 150 tokens, a dedicated `ledger-stress.ai.avi.com` route so
+a run can never 429 a real consumer, and a collector that drains at the
+production cadence rather than once at the end).
+
+### 9.1 The SE's recording is exact
+
+| Run | Records | Tokens (seen / true) | Counter delta |
+|---|---|---|---|
+| 500 responses @ c=32 | 500 | 75,000 / 75,000 | exact |
+| 3,000 responses @ c=128 | head +3,000 | 450,000 / 450,000 | exact |
+
+This is a stronger result than the code deserves. Both the budget counter and the
+ring head are read-modify-writes with no atomic primitive under them
+(`table_lookup` → `table_remove` → `table_insert`), and
+[`testdata/concurrency_spec.lua`](../../ako-gateway-api/aigateway/testdata/concurrency_spec.lua)
+proves that shape loses updates when two responses interleave — 8 concurrent
+responses collapse to 1 record. On this SE it does not happen, so DataScript
+execution for a VS is evidently serialized.
+
+> **The code is not concurrency-safe; today's SE is what makes it correct.** A
+> multi-core datapath, a scaled-out VS, or a future SE release changes that
+> answer, and **nothing in the ledger would report it** — the sequence has no gap
+> when a record is overwritten.
+
+### 9.2 The collector is the lossy half, and its limit is sharp
+
+A drain walks back at most `UsageScanMax` (1000) sequence numbers; anything
+further behind is reported `lost` and can never be retrieved. At the default 5 s
+poll that is a hard ceiling of **~200 rps sustained**:
+
+```
+214 rps for 7s   →  1500 / 1500 collected,     0 lost
+333 rps for 9s   →  1967 / 3000 collected,  1033 lost   (34% of the traffic)
+```
+
+The 1,033 records existed — written by the SE, held in the ring, then aged past
+the drain's reach while the collector was mid-poll. The poll at 333 rps also
+spent **4.4 s of its 5 s interval** paging through what it could, so there is
+very little headroom at that rate. Raising `UsageScanMax`, shortening
+`USAGE_POLL_SECONDS` or raising `UsageDrainMax` all move the line; which is right
+depends on how much SE datapath time a drain may spend, since the scan runs on it.
+
+### 9.3 The ring is per-VS
+
+Records written through `ledger-stress.ai.avi.com` never appeared on the
+`llm.ai.avi.com` drain. The VS datastore does not span EVH children — so a stress
+run cannot pollute the production ledger, **and every metered route needs its own
+collector target**. A route the collector does not poll accumulates records that
+expire unread.
+
+### 9.4 The trap: perfect metering and no metering look identical
+
+A route that meters correctly but has no drain reports zero records and a zero
+counter delta — exactly what a route that never metered reports. The admin blocks
+are only emitted when a credential is configured, so the route needs:
+
+```yaml
+annotations:
+  ai.ako.vmware.com/admin-token-secret: counters-admin
+```
+
+The first run of the harness reported "0 records, 0 tokens, 0 counter delta" for
+precisely this reason, while the SE was in fact recording every response.
+
+### 9.5 Still unmeasured
+
+- **ConfigMap cardinality.** Rollups bucket by identity × model × tier × route
+  against a 1 MB soft cap; every run used a single identity. Firing from a few
+  thousand distinct `sub` values is the cheapest remaining test and the likeliest
+  production-only failure.
+- **Drain cost on the datapath.** Worth measuring inference p99 with the
+  collector polling versus `USAGE_COLLECT=0`.
+- **Instance-id collision.** `inst` is minted from `now + client_ip` of the first
+  metered response. Two SEs first metering in the same second from the same
+  client would claim the same id and merge two rings in the collector's cursor
+  map. Needs a scaled-out VS to test.
+- **Penalty rows under load.** The oversized-response path is exercised, but not
+  at concurrency.

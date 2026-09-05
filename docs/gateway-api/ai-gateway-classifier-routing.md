@@ -11,7 +11,7 @@
 
 > **Status: the SE-native ICAP-header mechanism below (§2–§4) is BLOCKED on Avi
 > 31.2.1 — SPIKE-DISPROVEN 2026-08-09. Implemented instead as UI-orchestrated
-> classification (§0), which is BUILT + live on openshift06.** This design routes a
+> classification (§0), which is BUILT + live on the lab cluster.** This design routes a
 > request to a different model based on what the prompt *is* — its **intent class**
 > (`code` vs everything else) — scored by the on-cluster classifier. The motivating
 > example: **send code prompts to Claude, everyday prompts to a local model, with

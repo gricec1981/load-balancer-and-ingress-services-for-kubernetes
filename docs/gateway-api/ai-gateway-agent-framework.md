@@ -175,7 +175,7 @@ with a fresh token and discard them when the task ends. Task-scoped toolsets, ne
 process-scoped. If a task can exceed 60s (they can — the GPU floor is ~15s/turn), either
 raise the exchange TTL for framework agents or re-create the toolset between graph steps.
 
-DNS resolves `*.ai.avi.com` natively on openshift06 now, so `MCP_VIP` / `LLM_VIP` pinning
+DNS resolves `*.ai.avi.com` natively on the lab cluster now, so `MCP_VIP` / `LLM_VIP` pinning
 is a fallback only — keep the env knobs, expect them empty.
 
 ### 3.3 Qwen3 thinking

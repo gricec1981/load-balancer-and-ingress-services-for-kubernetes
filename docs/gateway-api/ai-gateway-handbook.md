@@ -9,7 +9,7 @@ Written for someone who has never seen this system before.
 | **Data plane** | Avi Service Engine (no in-path proxy or sidecar) |
 | **Control plane** | AKO reconciling Kubernetes CRDs into Avi configuration |
 | **Console** | `ai-gateway-ui` — Go binary + embedded SPA |
-| **Revision** | 20 August 2026 |
+| **Revision** | 5 September 2026 |
 
 **Contents**
 
@@ -63,6 +63,8 @@ Three claims define the design:
 | **Token budgets** | Per-consumer / per-group token ceilings over a window, plus request rate limits | `AITokenRateLimitPolicy` | Governance ▸ Token Rate Limits | Built |
 | **Model routing** | Requested `model` → quality/cost tier; group entitlement with downgrade or reject | `AIModelRoutePolicy` | Governance ▸ Model Routing Policies | Built |
 | **External provider tiers** | A tier whose backend is a public API (e.g. Gemini) reached SE-native over egress | `AIModelRoutePolicy.tiers[].provider` | Governance ▸ Model Routing Policies | Built |
+| **Remote-site tiers** | A tier whose backend is a **peer AI Gateway in another cluster**, reached by FQDN over SE egress with a Host-bearing health monitor. Verified cross-cluster | `AIModelRoutePolicy.tiers[].remote` | Governance ▸ Model Routing Policies | Built |
+| **Service tiers & model discovery** | A tier backed by Service endpoints (so a selectorless Service fronts a GPU VM); a labelled model pod publishes its own alias into the model→tier table | `tiers[].backendRef` (`kind: Service`), `spec.discovery` | Governance ▸ Model Routing Policies | Built |
 | **Guardrails / DLP** | WAF-native secret, PII, prompt-injection and tool-abuse signatures on request and response bodies | `AIGuardrailPolicy` | Gateways (DLP toggle) | Built |
 | **Semantic guardrails** | Embedding classifier over ICAP for novel/paraphrased injection, with an LLM judge for gray-zone scores | `AIGuardrailPolicy.semantic` | Gateways (DLP toggle) | Built |
 | **MCP gateway** | Tool traffic under the same identity model; session affinity; per-tool authorization by role | `AIMCPRoutePolicy` | MCP Registry · Gateways ▸ MCP | Built |
@@ -71,11 +73,16 @@ Three claims define the design:
 | **Agent registry** | Catalogue of approved agents; federated at `/.well-known/agents` | `agent-registry` ConfigMap | Agent Registry | Built |
 | **Agent factory** | Natural-language description → drafted `AgentSpec` → one approval provisions workload, identity, route, policy and registry entry | Console + provisioner | Agents | Built |
 | **Agent runtimes** | Interchangeable bodies behind an identical wire contract — compact Go loop, or Python ADK with parallel specialists | `runtime` field on `AgentSpec` | Agents | Built |
-| **Token ledger** | One immutable usage record per metered response; true per-user and per-agent consumption with cost | SE ring + console collector | Dashboard ▸ Tokens | Built |
+| **Token ledger** | One immutable usage record per metered response; true per-user and per-agent consumption with cost. Recording measured exact at 333 rps; the collector's ceiling is ~200 rps sustained | SE ring + console collector | Dashboard ▸ Tokens | Built |
+| **RAG over the estate's source** | `code_search` MCP tool answering from the estate's own GitHub, with retrieved chunks scored by the same classifier that guards the front door | `rag-service` + MCP registry | MCP Registry · Dashboard ▸ Agents | Built |
+| **Readable Avi object names** | Avi objects named `<cluster>--<surface>-<route>-<hash>` instead of a SHA-1, so an Avi log names its own backend | `useReadableObjectNames` | — | Built |
 | **Live counters** | The enforcement counter itself, per identity against budget | `AITokenRateLimitPolicy` | Dashboard ▸ Live Counters | Built |
 | **Console** | Operate all of the above without hand-editing YAML | — | all | Built |
 | **Backend mTLS** | SE↔backend mutual TLS with SPIFFE/SPIRE short-lived SVIDs | `RouteBackendExtension.BackendTLS` + `seClientCert` | — | Design, spike-gated |
-| **Multi-site delivery** | Cross-cluster model delivery via AMKO + Avi GSLB | AMKO | — | Design, spike-gated |
+| **Multi-site delivery** | Geo/capacity site steering across a fleet via AMKO + Avi GSLB. The **single-peer** case is built — see *Remote-site tiers* | AMKO | — | Design, spike-gated |
+| **A tier that names a set of sites** | Today a `remote` tier names one peer, so peer-down is tier-down | `tiers[].sites[]` | — | Design |
+| **A2A push-notification egress control** | Allow-list for the webhook an agent may POST task updates to. Spike-proven, never carried into the CRD | — | — | Design only |
+| **Cross-cluster agent authorization** | One A2A policy governing agents in every cluster | — | — | Design; blocked on an ambiguous subject |
 | **Provider failover** | Cross-provider active/passive and cost-weighted failover | — | — | Design only |
 | **Classifier routing** | Route on an ICAP classifier verdict header | — | — | Disproven on Avi 31.2.1 |
 
@@ -312,6 +319,18 @@ useful on a route that already has an `AIGatewayAuthPolicy`.
    `completion`), **Fallback budget** for identities in no listed group — `0` rejects them with 403 —
    and the **Reject status code**, conventionally `429` with `Retry-After`.
 4. **Save & apply to cluster.** **View YAML** shows exactly what will be written first.
+
+> **Name groups after the teams they stand for.** The lab estate uses `engineering`,
+> `product-management` and `agents` (it once used `group1`/`group2`/`group3`, which told a
+> viewer nothing). Group names are pure data as far as AKO is concerned — they are baked into
+> the generated Lua as table keys — so renaming them is safe, but it must be done in the issuer
+> and every policy together, since the claim value and the budget key must match exactly.
+>
+> **Every workload defaults into one group** (`agents`), which means the whole fleet shares one
+> budget and one entitlement set — so a single noisy agent can neither be given its own quota
+> nor routed elsewhere without moving every other agent with it. Putting one agent in its own
+> group is what makes it individually controllable; the demo issuer takes an `AGENT_GROUPS`
+> map (`serviceaccount:group`) for exactly that.
 
 ![Editing a token rate limit policy](images/console/17-governance-editor.png)
 
@@ -632,10 +651,11 @@ that make it acceptable:
 | Risk | Mitigation | State |
 |---|---|---|
 | Token visible in transit | TLS mandatory on both auth modes | Enforced |
-| Token in access logs | SE query-param log redaction | Configured |
+| Token in access logs | ❌ **Nothing works.** `uri_query_field_rules` match on the parameter *name*, so a rule written as `jwt=` never fires — and correcting it does not help: on Avi 30.2.1+ masking a query field populates `orig_uri` ("Unparsed URI") with the original request line, token and all. No configuration removes it. | **Cannot be mitigated** — rely on the 60-second lifetime |
 | Long exposure window | 60-second tokens, minted per request | Enforced |
 | Replay against another target | `target` claim checked at the SE | Enforced |
 | Token forwarded to the backend and logged there | Query-strip before the pool | **Open** — the exact SE query-rewrite primitive is unconfirmed, so AKO does not emit it. This is the remaining hardening step for production `jwtQuery`. |
+| Request line longer than ~12 KB | The SE rejects it with `400` (`client_max_header_size`, applied per line). Tokens up to ~12 KB decode correctly and RBAC stays right — it fails loudly, never by emptying a claim | Understood, measured |
 | Guardrail WAF matching the JWT as a secret | Request-phase rule target excludes `!ARGS:jwt` | Fixed |
 
 The clean fix is an SE capability: after JWT validation, either preserve the `Authorization` header to
@@ -775,6 +795,14 @@ Stated plainly, because several of them change what the numbers mean.
 | **Request-body buffer is 32 KB for model routing** | `model` sits at the start of the JSON so the head suffices; larger bodies are not yet validated. |
 | **Agent-card discovery is never body-inspected** | `/.well-known/agent.json` returns early by design, so discovery works before authorization. |
 | **`agentAccess` was fail-open on non-JSON-RPC GETs** | Closed by `requireMethod` / `authorizePaths`; routes that predate those switches must set one of them. |
+| **The ledger collector's ceiling is ~200 rps** | A drain walks back at most 1,000 sequence numbers; at the default 5 s poll, anything above ~200 rps sustained ages past its reach and is reported `lost`. Measured: at 333 rps, 34 % of records were lost. The SE's *recording* stays exact. |
+| **The ledger's ring is per-VS** | Every metered route needs its own collector target. A route the collector does not poll accumulates records that expire unread — and looks identical to a route that never metered. |
+| **Metering is correct only because the SE serializes DataScripts** | The counter and ring head are read-modify-writes with no atomic primitive; a multi-core datapath or a scaled-out VS could lose updates, and nothing in the ledger would report it. |
+| **Tier pools are baked at policy-reconcile time** | Editing an `EndpointSlice` behind a `Service` tier never pushes new members; only a patch to the policy **spec** forces a re-resolve. A stale pool presents as a hang, not a 4xx. |
+| **A `remote` tier names one peer** | Peer down means tier down. A tier that names a set of sites is designed, not built. |
+| **Renaming the cluster or flipping readable names re-creates every Avi object** | VIPs float and **per-VS settings are lost** — `full_client_logs` reverts to off estate-wide, and anything pinning a VIP by address (console `GATEWAY_VIP`, hub `A2A_GATEWAY_VIP`) breaks until repointed. |
+| **A 4xx is not proof of a guardrail block** | Confirm the VS actually carries a WAF policy or ICAP profile *and* that the log shows `response_code: 403` with `waf_log: REJECTED` before claiming anything was blocked. |
+| **A `jwtQuery` token in the URL cannot be masked from Avi logs** | `uri_query_field_rules` match the parameter *name*, and even a correct rule leaves the raw token in `orig_uri` on Avi 30.2.1+. No configuration removes it. |
 | **Registry entries are ConfigMaps, not CRDs** | Deliberate — auditable with standard tooling, no controller reconciliation. But an apply that overwrites the ConfigMap drops hand-added entries; keep entries in the manifest, never hand-patch the live object. |
 | **OAuth issuer is a single pod** | An issuer restart re-IPs and breaks the pinned OAuth pool until reconciled. An HA issuer is needed for production. |
 | **AKO snapshots the JWKS** | Key rotation at the IdP is an estate-wide `401` until AKO re-reconciles — a reason the workload issuer stays in-cluster. |

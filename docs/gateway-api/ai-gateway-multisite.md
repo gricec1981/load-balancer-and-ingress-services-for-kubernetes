@@ -3,17 +3,36 @@
   NOTE: §"Novelty & prior art" contains COMPETITIVE POSITIONING (a "first" claim and a
   named competitor). Review that section with marketing/legal before this doc is published
   to a public branch. Drafted 2026-06-06.
+  UPDATED 2026-09-05: the one-peer case shipped WITHOUT GSLB (AIModelRoutePolicy
+  tiers[].remote, verified cross-cluster 2026-08-23). This doc is now the layer ABOVE
+  that — many sites, geo/capacity steering, cross-site transit. Read the status block
+  and ai-gateway-datacenter.md §6 before quoting anything here as unbuilt.
 -->
 
 # AKO AI Gateway — Multi-Site (Cross-Cluster) Model Delivery
 
-> **Status: Design draft (Phase 3).** This document specifies how the AKO AI Gateway
-> routes an inference request to the right **model tier** *and* the right **site**, across
-> a fleet of Kubernetes clusters, by composing three existing Broadcom/Avi capabilities:
-> the per-cluster **AI Gateway** ([ai-gateway.md](ai-gateway.md)), **model-based tier
-> routing** ([model-routing.md](model-routing.md)), and **AMKO + Avi GSLB** global server
-> load balancing. It introduces no new data plane. Cross-site behaviour is **spike-gated**:
-> sections marked ⚠️ are hypotheses to validate before they are claimed as capabilities.
+> **Status: superseded in part — the simple case is BUILT.** Since 2026-08-23 an
+> `AIModelRoutePolicy` tier can name a **peer AI Gateway in another cluster**
+> directly (`tiers[].remote`), and that path is verified cross-cluster on the lab
+> estate: the `qwen-antrea` tier on the `vks-ai-01` front door is served by the
+> `k8s-antrea` cluster, proven by the serving pod's fingerprint. See
+> [model-routing.md](model-routing.md) for the shipped CRD and
+> [ai-gateway-datacenter.md](ai-gateway-datacenter.md) for the estate shape.
+>
+> That mechanism deliberately does **not** use GSLB. The SE resolves the peer's
+> FQDN itself at connection time and a Host-bearing health monitor decides whether
+> the peer is up; which site serves a request is decided by *tier selection*, after
+> the model has been read from the body — not by DNS answering a client. It covers
+> one peer per tier, one datacentre, no geo steering.
+>
+> **This document remains the design for the layer above that**: many sites, geo
+> and capacity steering, and a dedicated cross-site transit path, composing the
+> per-cluster **AI Gateway** ([ai-gateway.md](ai-gateway.md)), **model-based tier
+> routing** ([model-routing.md](model-routing.md)) and **AMKO + Avi GSLB**. It
+> introduces no new data plane. Cross-site behaviour is still **spike-gated**:
+> sections marked ⚠️ are hypotheses, not capabilities. Read §6 of
+> [ai-gateway-datacenter.md](ai-gateway-datacenter.md) first — a tier that names a
+> *set* of peers is the smaller, nearer step, and it does not need GSLB either.
 
 ---
 
@@ -323,6 +342,8 @@ REST from an in-cluster pod, torn down after). Ordered by how load-bearing they 
 
 | Phase | Feature | Status |
 |---|---|---|
+| 3 | Single-peer remote tier (`tiers[].remote`) — no GSLB, SE-resolved FQDN, health-monitored | ✅ **Built 2026-08-23**, verified cross-cluster |
+| 3 | A tier that names a **set** of peers (`tiers[].sites[]`, priority/weight/drain) | Designed — [datacenter §6](ai-gateway-datacenter.md) |
 | 3 | Federated tier via GSLB FQDN backend (B′) + forwarder/ingress SE groups | Design (this doc); **spike-gated** |
 | 3 | Health-based cross-site failover (inherited from GSLB) | Design |
 | 3 | Geo / capacity-weighted site steering | Design |

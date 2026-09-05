@@ -282,7 +282,7 @@ no new CRD, no new informer — `semantic` is a field on the policy that already
 
 ## 6. Streaming — why request-ICAP is safe ⚠️
 
-Response-side buffering is the known wall (token metering collapses SSE — [avi-datascript-gotchas](../../) , [ai-token-streaming-limit](ai-token-streaming-limit.md)). This design inspects the **request** body only:
+Response-side buffering is the known wall (token metering collapses SSE — [ai-gateway-token-ledger.md §4](ai-gateway-token-ledger.md), [rfe-se-ai-native-callout.md](rfe-se-ai-native-callout.md)). This design inspects the **request** body only:
 
 - The request body (the prompt) is **fully present** before forwarding — buffering it is
   free and is already done for model-routing/metering.
@@ -373,14 +373,32 @@ py3.11; `kubectl cp` fails on the Windows drive-letter colon (use `kubectl exec 
   the semantic (paraphrase/novel) layer is silently absent. This is an operational gap, not a
   classifier-accuracy one: the fix is a stable ClusterIP pool target or `ICAP_FAIL_CLOSED` on
   routes where availability during a reschedule is not acceptable — neither is done today.
-- **Indirect / response-side injection** (poisoned tool results, RAG content, agent
-  messages) is response-side → inherits the streaming-buffering wall (§6); deferred.
+- **Indirect injection is only partly covered, and not by the SE.** Poisoned *retrieved*
+  content is handled today by `rag-service`, which scores each retrieved chunk against this
+  same classifier and quarantines the ones that flag — returning a stub with the text withheld,
+  so the answer is still delivered from the clean chunks. Two caveats matter when demoing it
+  ([ai-gateway-rag.md](ai-gateway-rag.md), UC3b): that quarantine is a **direct pod-to-pod
+  call**, so it never appears in an Avi log, and the block that *is* Avi-visible is the
+  front-door ICAP/WAF firing on the north-south LLM call — which only happens if the poisoned
+  text is folded into the newest user turn. General response-side inspection (output DLP,
+  system-prompt leak, poisoned tool results in the response body) still inherits the
+  streaming-buffering wall (§6) and remains deferred to the RFE.
 - **Fail-open vs fail-closed** is a real security/availability trade the operator owns
   (`semantic.failOpen`); there is no free lunch if the classifier is down.
+- **A 4xx is not evidence.** Before attributing a rejection to this layer, check that the VS
+  actually carries an ICAP profile (or WAF policy) *and* that the log shows the block. A
+  transient `403` from a route with neither has been misread as a classifier catch.
 
 ---
 
-## 10. Implementation outline (after spikes pass)
+## 10. Implementation outline
+
+> **Shipped.** All six steps below are built; the classifier and shim live in
+> `ako-inference-demo/icap-shim`, and AKO authors both the `icapprofile` and the
+> `HTTP_SECURITY_ACTION_REQUEST_CHECK_ICAP` policy from `AIGuardrailPolicy.semantic`
+> ([`guardrail_icap_rest.go`](../../ako-gateway-api/aigateway/guardrail_icap_rest.go)). The
+> classifier is an embedding-prototype model, not the DeBERTa named in step 1 — the lab
+> hardware has no AVX2. Kept as the record of how it was wired.
 
 Mirrors how the signature layer was wired (`e5a706f7`). **Branch `feature/ai-mcp-gateway` is
 shared with the model-routing and MCP workstreams — commit ONLY the new ICAP files; the
@@ -426,4 +444,4 @@ WAF/DLP guardrail code is already committed.**
 - [Guardrails & DLP](ai-gateway-guardrails.md) — the signature layer this escalates from (§11 ceiling, Spike-4)
 - [Model-Based Routing](model-routing.md) — the request-body buffering pattern the SE reuses
 - [MCP Gateway](ai-gateway-mcp.md) / [A2A Gateway](ai-gateway-a2a.md) — the other two surfaces the shim extracts prompt text from
-- [Streaming token limit](ai-token-streaming-limit.md) — why this is request-side only (§6)
+- [Token ledger §4 — Streaming](ai-gateway-token-ledger.md) — why this is request-side only (§6)

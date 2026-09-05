@@ -562,6 +562,33 @@ Rollback at every phase is a one-line CRD revert.
 
 - *"14 cores available in the cluster (7 cores in case enclave services are not deployed)"*
 - *"44 GB available in the cluster. (28 GB in case enclave services are not deployed)"*
+
+> ✅ **Those figures are correct — but only for the `demo` sizing profile.** The charts are **public**
+> (`https://ssp_helm_charts.storage.googleapis.com`, chart `ssp` 4.1.1+1673, *"Helm chart to deploy
+> AgentMinder"*), so the real footprint can be measured rather than guessed. Rendered locally with
+> stock values (2026-09-05, `observe.enabled=false`), **the `ssp` chart alone** asks for:
+>
+> **The single most important value is `ssp.deployment.size`.** It defaults to **`custom`**, and the
+> options are `demo` (60 auth/min), `small` (1200), `medium` (4000), `large` (8000), `custom`. Every
+> deployment template branches on it:
+> `{{- if eq .Values.ssp.deployment.size "demo" }} replicas: 1 {{- else }} replicas: {{ .Values.ssp.<c>.podReplicaCount }} {{- end }}`
+>
+> | Profile | CPU requests | Memory requests |
+> |---|---|---|
+> | `size: custom` (the **default** — 2 replicas everywhere) | 20.5 cores | 45.8 Gi |
+> | **`size: demo`** | **6.7 cores** | **17.8 Gi** |
+>
+> So the techdocs figure of *"7 cores … 28 GB"* is **accurate for demo mode** — 6.7 cores measured.
+> An earlier draft of this section claimed the sizing page was "badly wrong"; that was this author
+> rendering the wrong profile, not a documentation error. Corrected 2026-09-05.
+>
+> ⚠ **Setting `podReplicaCount: "1"` on all 21 components does NOT work** — the templates ignore it
+> unless `size` is `custom`, and at `custom` the *other* branch is taken. Set `size: demo`; do not
+> hand-roll replica counts. `ssp-infra` (a **Percona XtraDB Cluster**, not a single MySQL) sits on
+> top either way.
+>
+> **VM sizing that follows:** demo needs ~6.7 cores / ~17.8 Gi plus the database, so **16 vCPU /
+> 30 GB** is comfortable — and 30 rather than 32 leaves `.66` about 6 GB of headroom instead of 4.5.
 - An **NGINX ingress controller** (chart 4.14.0 / ingress-nginx v1.14.0) — note this lab
   deliberately runs no router, with Avi as the LB
 - The infra chart stands up **its own MySQL** in demo mode (`db.enabled=true`) — no external DB to
@@ -645,9 +672,38 @@ k8s-antrea nodes.
 | **B** | Add RAM to `.66` (R720, DDR3 ECC, secondhand): 128 → 256 GB | ~£100–200 | do anyway; also unblocks openshift07 |
 | **C** | Rebuild openshift07 as the identity cluster | nothing until B — same host, same RAM | after B |
 
-Route A works because load is uneven: `worker-0` carries 111 pods, `worker-1` and `worker-2`
-carry 30 and 35 at ~8–9 Gi of requests each. Consolidating those two leaves ~12 Gi against
-14.5 Gi allocatable — tight but schedulable. **Drain `worker-2`**; leave `worker-0` alone.
+> ⚠ **Correction, verified 2026-09-04 — route A does not work as first written.** An earlier draft
+> said draining `worker-2` was "tight but schedulable". That was reasoned from **memory** requests
+> and pod counts, and memory is not the constraint. **CPU requests are**, and they do not fit:
+>
+> | Node | CPU requested / 3500m allocatable | Free |
+> |---|---|---|
+> | `worker-0` | 3238m (92%) | **262m** |
+> | `worker-1` | 3304m (94%) | **196m** |
+> | `worker-2` | 3140m (89%) | *to relocate* |
+>
+> Masters are tainted `node-role.kubernetes.io/master`, so nothing relocates there. Stripping the
+> DaemonSets and per-node pods that leave with the node, roughly **2 600m still has to move into
+> 458m of space** — short by a factor of five or six. The drain would strand
+> `qwen-15b-predictor` (1000m), `nomic-embed-predictor` (500m) and quite possibly **`ako-0`**
+> (400m) in `Pending`. AKO going Pending stops the gateway reconciling, which is the worst
+> possible outcome of a capacity exercise.
+>
+> **The cluster is request-bound, not resource-bound.** Actual CPU use is 7–22% against requests of
+> 89–94%. The two KServe predictors alone reserve 1500m for work that runs on the PC's GPU. So the
+> prerequisite for route A is a **request-trimming pass** (and/or making masters schedulable, which
+> frees ~3.4 cores and is the compact-cluster posture openshift07 already used). Do that first,
+> re-measure, then drain.
+
+Two further mechanical notes for whenever the drain does happen:
+
+- **Draining does not free ESXi RAM.** The VM keeps its 16 GB until it is powered off. The good
+  news is that `worker-2`'s `Machine` has **no `ownerReferences`** and the only MachineSet is at
+  `DESIRED=0`, so nothing will auto-recreate it — `oc delete machine openshift06-2l8ct-worker-2`
+  deprovisions the VM and actually returns the memory. That is the irreversible step; the drain
+  itself is undone with `uncordon`.
+- **Evicting `ako-0` costs a front-door blip.** Rolling AKO 500s the front door for ~90 s while it
+  reconciles. Expected, not a fault — wait it out rather than rolling anything back.
 
 **Build it as plain Kubernetes, not OpenShift.** IDSP wants NGINX ingress and this estate
 deliberately has the router disabled — a k3s/kubeadm VM sidesteps that, and it demonstrates that

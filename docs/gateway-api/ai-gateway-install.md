@@ -484,6 +484,7 @@ kubectl get gateway avi-gateway -n inference \
 ```
 
 ### Deploy the in-cluster JWT issuer
+### Deploy the in-cluster JWT issuer
 
 `jwt-issuer.yaml` exposes `GET /jwks` (SE — actually AKO — fetches the public keyset) and a
 legacy direct-mint endpoint `GET /token?sub=&group=` for claim tests. `jwtQuery` clients use
@@ -491,6 +492,16 @@ legacy direct-mint endpoint `GET /token?sub=&group=` for claim tests. `jwtQuery`
 **alice/carol → engineering, bob → product-management, dave → admin.** Any extra query param on `/token` becomes
 an extra JWT claim (e.g. `&agent_id=orchestrator`, used later for A2A).
 
+> ⚠️ **`GET /token` is a test fixture, not a pattern to copy into production.** It mints any
+> subject and any claim for anyone who can reach it — identity *asserted*, never proven. It is
+> kept in this demo issuer because a walkthrough needs to conjure a caller in one line.
+>
+> The lab estate's own issuer **retired it on 2026-08-19**; it now answers `410 Gone`. Real
+> workloads there present their projected Kubernetes ServiceAccount token to `POST /exchange`,
+> and the issuer derives the subject, group, target and skill from a TokenReview — so a
+> workload cannot claim an identity it was not granted. Console personas mint at
+> `POST /persona`, which only the console's own ServiceAccount may call. See
+> [Handbook §6.2](ai-gateway-handbook.md#62-principals).
 ```bash
 openssl genrsa -out /tmp/key.pem 2048
 kubectl create secret generic jwt-signing-key -n inference --from-file=key.pem=/tmp/key.pem
@@ -736,12 +747,30 @@ curl -sk "https://llm.demo.local/v1/chat/completions?jwt=${TOKEN}" --resolve "ll
 ```
 
 Add `entitlements` (gated by the verified `group` claim, same mint-a-token flow as above) and
+Add `entitlements` (gated by the verified `group` claim, same mint-a-token flow as above) and
 `onUnentitled: { type: Downgrade }` to see a `free`-group caller silently dropped to `economy`
 even when it asks for the premium model — see the ["Tier entitlement by
 group"](model-routing.md#tier-entitlement-by-group-with-auth) example.
 
----
+### Tiers that are not local pods
 
+The two tiers above are `InferencePool`s, but a tier can also name:
+
+- **`backendRef` with `kind: Service`** — members come from the Service's endpoints, so a
+  selectorless Service plus a hand-written EndpointSlice publishes a GPU VM or bare-metal server
+  as a first-class tier;
+- **`provider`** — an external OpenAI-compatible API (Gemini) reached over SE egress, with the
+  key injected from a Secret;
+- **`remote`** — a **peer AI Gateway in another cluster**, reached by FQDN with a health monitor.
+
+All three are built; see [model-routing.md](model-routing.md) for the fields and defaults.
+
+> ⚠️ **If you later change a tier's backend endpoints, patch the policy spec.** Tier pools are
+> resolved at policy-reconcile time, so editing an `EndpointSlice` — even deleting and
+> recreating it — pushes nothing. Adding and removing a throwaway `modelTiers` key is enough to
+> force a re-resolve. A stale pool presents as a **hang**, not an error.
+
+---
 ## MCP — `AIMCPRoutePolicy`
 
 Governs agent↔tool (Model Context Protocol) traffic: per-role authorization of individual
@@ -898,6 +927,15 @@ spec:
   taskAffinity: { timeout: 30m }
   agentAccess:
     agentClaim: agent_id             # a distinct claim from "sub" for agent identity
+    # Three switches close fail-opens, and all three default OFF for compatibility:
+    #   requireMethod  — reject a request with no extractable JSON-RPC method,
+    #                    instead of letting it through unauthorized. Set it on any
+    #                    agent that speaks only JSON-RPC.
+    #   authorizePaths — also match rules against the request PATH, and evaluate
+    #                    them for every request. For agents that serve plain REST.
+    #   targetAgent    — reject a token whose `target` claim names another agent.
+    requireMethod: true
+    targetAgent: ops-agent
     rules:
       - agent: orchestrator
         allow: ["tasks/send", "tasks/sendSubscribe", "tasks/get", "tasks/cancel", "tasks/resubscribe"]
@@ -905,6 +943,12 @@ spec:
         allow: ["tasks/get"]         # read-only
   onUnauthorized: { type: Reject, statusCode: 403 }
 ```
+
+> **Without `requireMethod` or `authorizePaths`, a non-JSON-RPC request skips authorization
+> entirely** — the allow-list has nothing to match against, so any caller holding a valid token
+> reaches the backend whatever the rules say. Note also that an `allow` entry is matched against
+> the JSON-RPC **method** as well as the skill claim: a rules list naming only skills is
+> effectively deny-all against a method-carrying request.
 
 ### Run it
 
@@ -1103,8 +1147,13 @@ guardrail's built-in `jwt` secret-signature matches the bearer token riding in t
 Verify your AKO image includes this commit; no CRD or manifest change is needed once it does.
 
 **MCP route policy never attaches / VS not programmed** — the MCP application profile
-(`System-Secure-HTTP-MCP`) and session DataScript (`System-Standard-MCP`) are native **Avi
-32.1.1+** objects; on an older controller the VS build fails. Confirm the controller version.
+(`System-Secure-HTTP-MCP`) is a native **Avi 32.1.1+** object; on an older controller the VS
+build fails. Confirm the controller version. Note that AKO does **not** use Avi's
+`System-Standard-MCP` session DataScript: that script's `avi.pool.select(name, ip)` raises on
+an EVH child VS behind a PoolGroup (a `tools/call` carrying an `Mcp-Session-Id` returns **500**,
+while the same call without one succeeds), so AKO attaches its own `pcall`-guarded equivalent.
+If you see 500s only on session-carrying MCP calls, you are running a build that still
+references the system script.
 
 **MCP/A2A route unauthenticated even with `authRef` set** — `authRef` must name an
 `AIGatewayAuthPolicy` **in the same namespace**; a typo leaves the MCP/A2A route unauthenticated

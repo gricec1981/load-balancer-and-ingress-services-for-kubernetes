@@ -1,5 +1,23 @@
 # AI Gateway — Multi-Provider LLM Routing + Health-Based Failover (design)
 
+> **Status: design. Half of the substrate it assumed is now built** — updated 2026-09-05.
+>
+> - **External-provider tiers shipped 2026-08-09** as `AIModelRoutePolicy.tiers[].provider`:
+>   AKO authors the FQDN pool with backend TLS/SNI and the DataScript rewrites path/Host and
+>   injects the key from a Secret. So build-checklist items 2 (external pool, key inject) and
+>   3 (no DataScript change) are done, in a different shape from the `ModelBackendRef.External`
+>   sketched below.
+> - **Remote-site tiers shipped 2026-08-23** (`tiers[].remote`) and brought the other missing
+>   piece with them: an FQDN pool with an attached **health monitor**, verified cross-cluster.
+>
+> What remains genuinely unbuilt is the thing this document is about: **a tier's pool group
+> holding more than one member**, priority-labelled, so a provider going down fails traffic
+> over rather than failing it. Today every provider and remote tier is a one-member pool group.
+> The nearest specified version of that shape is
+> [ai-gateway-datacenter.md §6](ai-gateway-datacenter.md) (`tiers[].sites[]`, with priority,
+> weight and drain) — worth reconciling with the `Fallbacks` design here rather than building
+> both.
+
 **Goal:** route a model tier to a *primary* LLM provider and fail over to *backup* provider(s)
 on health failure / rate-limit / cost-ceiling — using Avi's native LB muscle (priority pools +
 health monitors + GSLB), not bolted-on proxy logic. Doubles as the demand evidence for RFE-4761

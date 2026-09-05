@@ -6,18 +6,38 @@
 -->
 
 # AKO AI Gateway — MCP Gateway & MCP-Specific Routes
-
-> **Status: Phase 3 — design complete, object model verified, foundation landed.** This
-> document specifies an **MCP Gateway** — a dedicated Gateway API entry point for **Model
-> Context Protocol** (agent↔tool) traffic — and a new `AIMCPRoutePolicy` CRD that attaches
-> **MCP-specific routes** to it. It gives MCP traffic **its own auth enforcement tied to the
-> same IdP as the LLM gateway** (one login, separate per-tool authorization), built on the
-> **native MCP features in Avi Load Balancer 32.1.1** (verified live — §2). It composes with
-> the existing per-cluster AI Gateway ([ai-gateway.md](ai-gateway.md)) and model-based routing
-> ([model-routing.md](model-routing.md)), reusing their machinery (OAuth/OIDC object graph,
-> DataScript body parsing).
+> **Status: Built and live.** This document specifies an **MCP Gateway** — a dedicated
+> Gateway API entry point for **Model Context Protocol** (agent↔tool) traffic — and the
+> `AIMCPRoutePolicy` CRD that attaches **MCP-specific routes** to it. It gives MCP traffic
+> **its own auth enforcement tied to the same IdP as the LLM gateway** (one login, separate
+> per-tool authorization), built on the **native MCP features in Avi Load Balancer 32.1.1**
+> (verified live — §2). It composes with the existing per-cluster AI Gateway
+> ([ai-gateway.md](ai-gateway.md)) and model-based routing ([model-routing.md](model-routing.md)),
+> reusing their machinery (OAuth/OIDC object graph, DataScript body parsing).
 >
-> **Built:** the CRD, `AIMCPRoutePolicy` types/validation, the tool-authz DataScript
+> **Built:** CRD and types, RBAC, the tool-authz DataScript generator, the informer and
+> event handlers, and the `ApplyMCPRoutePolicy` translator
+> ([`avi_mcp_route.go`](../../ako-gateway-api/nodes/avi_mcp_route.go)). §11 tracks each step.
+> **Not built:** the `ai.ako.vmware.com/mcp` Gateway annotation (§11 step 6) — the
+> application profile is set per route by the policy, not per Gateway.
+>
+> ⚠️ **One design assumption did not survive contact.** The plan was for AKO to reference
+> Avi's built-in **`System-Standard-MCP`** DataScriptSet for session persistence and write no
+> session logic of its own. That script calls `avi.pool.select(name, ip)`, which **raises
+> (HTTP 500) on AKO's EVH-child-VS + PoolGroup topology** — verified live: a `tools/call`
+> carrying an `Mcp-Session-Id` 500s, the same call without one succeeds. AKO therefore
+> authors its own `pcall`-guarded equivalent (`GenerateMCPSessionScripts`) and does **not**
+> reference the system script. The application profile (`System-Secure-HTTP-MCP`) is still
+> Avi's. Read §2 and §6 with that correction in mind.
+>
+> **On the live estate**, the four MCP servers (`web-search`, `k8s-logs`, `nmap-mcp`,
+> `rag`) sit behind a dedicated `mcp-gateway` with its own VIP, authenticated by an
+> `AIGatewayAuthPolicy` in `jwtQuery` mode — unauthenticated calls get `401`. Most of those
+> routes carry auth and a caller allow-list rather than a full `AIMCPRoutePolicy`, because
+> applying the MCP kind also flips the child VS to the MCP application profile and swaps in
+> the session DataScripts. For a server exposing a single tool, gating the JSON-RPC method
+> with an `AIA2ARoutePolicy` is equivalent in effect and changes nothing about a working
+> route. That is a deliberate operational choice, not a gap in this design.
 > generator, and RBAC (+ guardrail test) — see §11. **Remaining:** controller wiring and the
 > `ApplyMCPRoutePolicy` translator (§11 steps 4–6), plus the spikes in §10 (2–6).
 
@@ -67,7 +87,7 @@ below are **verified against a live 32.1.1 controller** (read-only probe,
 | 32.1.1 native feature | What it does | Verified Avi mechanism AKO reuses |
 |---|---|---|
 | **MCP application profile** | Marks a VS as MCP-aware (websockets, HTTP/2). | An `APPLICATION_PROFILE_TYPE_HTTP` profile with the new field **`app_service_type: APP_SERVICE_TYPE_HTTP_MCP`** — shipped as the system profile **`System-Secure-HTTP-MCP`**. *Not* a new profile type. |
-| **MCP session persistence** | Pins a stateful MCP session to the same backend pool+server across a scaled-out fleet, with full session lifecycle. | The **built-in DataScriptSet `System-Standard-MCP`** — not a persistence profile. It keys on the `Mcp-Session-Id` header and uses VS persistence tables: `avi.vs.table_lookup("pool_table"/"server_table", id, 600)` + `avi.pool.select` on HTTP_REQ; `avi.vs.table_insert` on HTTP_RESP (create-on-response); `avi.vs.table_remove` on a 2xx `DELETE` (teardown). |
+| **MCP session persistence** | Pins a stateful MCP session to the same backend pool+server across a scaled-out fleet, with full session lifecycle. | The **built-in DataScriptSet `System-Standard-MCP`** — not a persistence profile. It keys on the `Mcp-Session-Id` header and uses VS persistence tables: `avi.vs.table_lookup("pool_table"/"server_table", id, 600)` + `avi.pool.select` on HTTP_REQ; `avi.vs.table_insert` on HTTP_RESP (create-on-response); `avi.vs.table_remove` on a 2xx `DELETE` (teardown). ⚠️ **AKO does not use it** — its `avi.pool.select(name, ip)` raises on an EVH child VS fronted by a PoolGroup. AKO authors a `pcall`-guarded equivalent (`GenerateMCPSessionScripts`) with the same table shape and lifecycle. |
 | **OAuth 2.0 authorization at the LB** | Enforces the OAuth 2.x resource-server check *before* traffic reaches the MCP server — the MCP spec's auth model. | The **existing** `AUTH_PROFILE_OAUTH` + `SSO_TYPE_OAUTH` graph the AI Gateway already builds ([oauth_rest.go](../../ako-gateway-api/aigateway/oauth_rest.go)). |
 
 **Per-tool authorization is *not* native — and that is AKO's value-add.** The probe confirmed
@@ -92,10 +112,10 @@ the two scale, secure, and fail independently (the same separation rationale as 
 cross-site forwarder SE in [ai-gateway-multisite.md](ai-gateway-multisite.md) §4).
 
 A Gateway (or a specific listener) is **designated as MCP** with an annotation. AKO then
-configures the resulting VS with Avi's **built-in** MCP objects (verified §2): it sets the
-VS `application_profile_ref` to **`System-Secure-HTTP-MCP`** and attaches the
-**`System-Standard-MCP`** DataScriptSet for `Mcp-Session-Id` session persistence — AKO
-*reuses* these system objects rather than generating session logic of its own:
+configures the resulting VS with Avi's **built-in** MCP application profile (verified §2):
+it sets the VS `application_profile_ref` to **`System-Secure-HTTP-MCP`**, and adds its own
+`Mcp-Session-Id` session-persistence DataScripts, which mirror `System-Standard-MCP`'s
+tables and lifecycle but survive AKO's EVH-child topology (see the status block):
 
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1
@@ -259,11 +279,11 @@ from [`modelroute_datascript.go`](../../ako-gateway-api/aigateway/modelroute_dat
 and is already implemented as `GenerateMCPToolAuthScripts`
 ([`mcproute_datascript.go`](../../ako-gateway-api/aigateway/mcproute_datascript.go)).
 
-This DataScript runs in **`HTTP_REQ_DATA`** (it needs the request *body*), whereas Avi's
-built-in `System-Standard-MCP` session DataScript runs in `HTTP_REQ`/`HTTP_RESP` (it only
-reads the `Mcp-Session-Id` *header*). They occupy different events on the same VS, so AKO's
-tool-authz layer and Avi's native session persistence **coexist** — the one remaining item to
-confirm under load (§10).
+This DataScript runs in **`HTTP_REQ_DATA`** (it needs the request *body*), whereas the
+session-persistence DataScripts run in `HTTP_REQ`/`HTTP_RESP` (they only read the
+`Mcp-Session-Id` *header*). They occupy different events on the same VS, so the tool-authz
+layer and session persistence **coexist** — confirmed by construction in `ApplyMCPRoutePolicy`,
+still unconfirmed under load (§10).
 
 An MCP `tools/call` request body looks like:
 
@@ -542,33 +562,35 @@ Mirrors how `AIModelRoutePolicy` was wired (commits `c05fc5bc` → `a2e7b995` �
    ([`rbac_clusterrole_test.go`](../../ako-gateway-api/aigateway/rbac_clusterrole_test.go)) so
    the model-routing RBAC miss (`404775d4`) cannot recur silently.
 3. **Tool-authz DataScript — ✅ done.** `GenerateMCPToolAuthScripts` in
-   [`mcproute_datascript.go`](../../ako-gateway-api/aigateway/mcproute_datascript.go).
-4. **Informer + handlers** — a dynamic informer and `SetupMCPRoutePolicyEventHandlers` wired
-   in [`gateway_crd_controller.go`](../../ako-gateway-api/k8s/gateway_crd_controller.go),
+4. **Informer + handlers — ✅ done.** A dynamic informer and `SetupMCPRoutePolicyEventHandlers`
+   wired in [`gateway_crd_controller.go`](../../ako-gateway-api/k8s/gateway_crd_controller.go),
    started in [`gateway_controller.go`](../../ako-gateway-api/k8s/gateway_controller.go), plus
    a `PolicyStore` entry (`GetMCPRoutePoliciesForRoute`) in
    [`controller.go`](../../ako-gateway-api/aigateway/controller.go).
-5. **Translator** — `ApplyMCPRoutePolicy(key, policy, vsNode, …)` invoked from the same
-   per-child-VS hook as `ApplyAuthPolicy` / `ApplyModelRoutePolicy`. Per the 32.1.1 probe it
-   **reuses Avi's system objects**: set the VS `application_profile_ref` =
-   `System-Secure-HTTP-MCP` and attach the `System-Standard-MCP` DataScriptSet (Avi's session
-   persistence — AKO writes no session logic); resolve `authRef` and reuse/ref-count the OAuth
-   graph; emit the MCP SSO policy; and attach the already-built tool-authz DataScript set.
-6. **Gateway annotation** — honor `ai.ako.vmware.com/mcp: "true"` when building the Gateway's
-   VS to apply step 5's system application profile + session DataScript.
+5. **Translator — ✅ done, with one deviation.**
+   [`ApplyMCPRoutePolicy`](../../ako-gateway-api/nodes/avi_mcp_route.go) is invoked from the
+   same per-child-VS hook as `ApplyAuthPolicy` / `ApplyModelRoutePolicy`. It sets the VS
+   `application_profile_ref` = `System-Secure-HTTP-MCP`, resolves `authRef` and applies that
+   `AIGatewayAuthPolicy`'s OAuth graph, and attaches the tool-authz DataScript set (only when
+   `toolAccess` is set). **Deviation:** it does *not* reference the `System-Standard-MCP`
+   DataScriptSet. That script's `avi.pool.select(name, ip)` raises on an EVH child VS behind a
+   PoolGroup — a `tools/call` with an `Mcp-Session-Id` returns 500 — so AKO attaches its own
+   `pcall`-guarded `GenerateMCPSessionScripts` instead.
+6. **Gateway annotation — ⬜ not built.** `ai.ako.vmware.com/mcp: "true"` is not read
+   anywhere. The MCP application profile is applied **per route by the policy**, which is
+   sufficient for every route deployed so far; a Gateway-wide switch would only matter for a
+   listener whose routes have no `AIMCPRoutePolicy`.
 
 > **Status semantics.** `AIMCPRoutePolicy.status.conditions` reports an unresolved `authRef`
 > (no such `AIGatewayAuthPolicy`) and unknown tools/roles referenced in `toolAccess`, the
 > same validation shape as `AIModelRoutePolicy`.
-
----
 
 ## 12. Failure modes (graceful degradation)
 
 | Condition | Behaviour |
 |---|---|
 | `AIMCPRoutePolicy` absent / unreconciled | MCP route serves as a plain HTTPRoute — no session profile, no tool-authz. Reachable but ungoverned. (Benign, like a missing `AIModelRoutePolicy`.) |
-| `authRef` unresolved | MCP VS has no SSO policy → fail closed: reject with 401 (don't silently serve unauthenticated). Status condition flags the dangling ref. |
+| `authRef` unresolved | ⚠️ **Does not match the design.** `ApplyMCPRoutePolicy` logs a warning and leaves the route **unauthenticated** rather than failing closed with 401. On the live estate the MCP routes carry their own `AIGatewayAuthPolicy` targeting the route directly, so this path is not exercised — but it is a fail-open and should be closed. |
 | Tool name unextractable (oversized/garbled body) | `tools/call` denied (fail closed); other methods unaffected. |
 | Session persistence profile unsupported on the build | Sessions still work but may rebalance mid-run (degraded statefulness); alarmed. Spike-1 gates this. |
 | Shared OAuth graph deleted out from under MCP | Prevented by ref-counting (§5/§11); MCP enforcement never depends on an object it doesn't keep alive. |
@@ -579,10 +601,13 @@ Mirrors how `AIModelRoutePolicy` was wired (commits `c05fc5bc` → `a2e7b995` �
 
 | Phase | Feature | Status |
 |---|---|---|
-| 3 | `AIMCPRoutePolicy` + MCP Gateway annotation; shared-IdP/separate-SSO auth | Design (this doc); **spike-gated** |
-| 3 | Native MCP session persistence (`Mcp-Session-Id`) | Design; Spike-1 |
-| 3 | Role-based tool authorization DataScript | Design; reuses model-route mechanism |
+| 3 | `AIMCPRoutePolicy`; shared-IdP/separate-SSO auth | ✅ Built |
+| 3 | MCP Gateway annotation (`ai.ako.vmware.com/mcp`) | ⬜ Not built — the profile is applied per route (§11.6) |
+| 3 | MCP session persistence (`Mcp-Session-Id`) | ✅ Built — AKO-authored, **not** the system script (see status block) |
+| 3 | Role-based tool authorization DataScript | ✅ Built (`GenerateMCPToolAuthScripts`) |
+| 3 | A dedicated MCP gateway on its own VIP with `jwtQuery` auth, fronting every MCP server | ✅ Live — 4 servers migrated, agents followed via DNS with zero edits |
 | 3 | Per-tool call budgets via `AITokenRateLimitPolicy` on the MCP route | Design (reuse) |
+| 3.x | UI "MCP Routes" tab — list/create/edit MCP HTTPRoutes with a hostname guardrail | ✅ Built (external repo) |
 | 3.x | UI "MCP Gateways" section (external repo) | Spec (§8) |
 | 3.x | Registry-driven catalog onboarding — **Option A** (console browses a private subregistry, writes the §8 CRDs + provenance annotations) | Spec (§9) |
 | 3.x | **Approved-registry allow-list** — default-deny: the gateway routes only to approved servers (structural) | Spec (§9.6) |

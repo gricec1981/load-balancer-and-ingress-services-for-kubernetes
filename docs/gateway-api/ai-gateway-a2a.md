@@ -8,24 +8,32 @@
 
 # AKO AI Gateway — A2A Gateway & Agent-to-Agent Routes
 
-> **Status: Implemented (feature/ai-a2a-gateway).** The `AIA2ARoutePolicy` CRD, controller,
-> DataScript generator, and translator are implemented and end-to-end verified on the demo
-> cluster (orchestrator→200, security-agent send→403/get→200, rogue→403). This document
-> covers the **A2A Gateway** — a dedicated Gateway API entry point for **Agent2Agent**
-> (agent↔agent) traffic — and the `AIA2ARoutePolicy` CRD that governs it: shared-IdP
-> authentication, **per-skill** authorization, task/context **session affinity**, and
-> **push-notification egress control**. It completes the "govern the whole agent loop under
+> **Status: Built and live.** The `AIA2ARoutePolicy` CRD, controller, DataScript generator
+> and translator are implemented and verified end-to-end (orchestrator→200,
+> security-agent send→403/get→200, rogue→403). This document covers the **A2A Gateway** — a
+> dedicated Gateway API entry point for **Agent2Agent** (agent↔agent) traffic — and the
+> `AIA2ARoutePolicy` CRD that governs it: shared-IdP authentication, **per-caller**
+> authorization, and task **affinity**. It completes the "govern the whole agent loop under
 > one identity" thesis (inference → tools → agents) alongside [ai-gateway.md](ai-gateway.md),
-> [model-routing.md](model-routing.md), and [ai-gateway-mcp.md](ai-gateway-mcp.md), and reuses
+> [model-routing.md](model-routing.md) and [ai-gateway-mcp.md](ai-gateway-mcp.md), and reuses
 > their machinery (OAuth/OIDC object graph, request-body DataScript parsing, per-rule Pool
 > Groups).
+>
+> **Read §4 before anything else if you are writing a policy.** The shipped CRD is
+> `agentAccess` (keyed on the calling agent), not the `skillAccess`/`roleClaim` this document
+> was first drafted against, and **`pushNotifications` (§8) was never built**.
+>
+> **Since 2026-08-16 the surface is fail-closed by intent**, which it previously was not:
+> `requireMethod` rejects requests carrying no JSON-RPC method, `authorizePaths` authorizes
+> plain-REST endpoints by path, and `targetAgent` binds a token to the agent it was minted
+> for. All three default off for backward compatibility — see the warnings in §4. A policy
+> backfill closed four unauthenticated routes; 12 of 12 agent routes are now protected.
 >
 > **Key difference from MCP:** Avi 32.1.1 added *native* MCP features (session profile,
 > MCP-aware persistence). **A2A has no native Avi support.** Everything here is built from
 > generic Avi primitives + DataScripts — so A2A is architecturally closer to model routing
 > than to the MCP design. Body-derived session affinity (Spike-A) is resolved: the DataScript
-> stamps `X-A2A-Context` and Avi custom-header persistence keys on it (verified end-to-end).
-
+> captures the task id from the response and keys Avi persistence on it (verified end-to-end).
 ---
 
 ## 1. Overview — the third leg of the agent loop
@@ -132,49 +140,54 @@ the MCP Gateway.
 ## 4. CRD — `AIA2ARoutePolicy`
 
 Shaped like the other AI Gateway policies (`targetRef` → an `HTTPRoute`). It carries four
-concerns: **which auth to inherit**, **task/context session affinity**, **per-skill
-authorization**, and **push-notification egress control**.
+concerns: **which auth to inherit**, **agent-card handling**, **task affinity**, and
+**per-caller authorization**.
+
+> **This section describes the shipped CRD**
+> ([`a2aroute_types.go`](../../ako-gateway-api/aigateway/a2aroute_types.go)), which differs
+> from the original design in three ways. The authorization block is `agentAccess` keyed on
+> the *calling agent*, not `skillAccess` keyed on a role. Affinity is `taskAffinity`
+> (timeout only — the key is the task id from the response body, not a configurable field).
+> And **`pushNotifications` was never built**: §8's egress control remains a design, and the
+> spike that passed exercised a prototype, not this CRD.
 
 ```yaml
 apiVersion: ai.ako.vmware.com/v1alpha1
 kind: AIA2ARoutePolicy
 metadata:
-  name: agents-policy
+  name: log-collector-a2a
   namespace: inference
 spec:
   targetRef:
     group: gateway.networking.k8s.io
     kind: HTTPRoute
-    name: a2a-route                       # the /a2a/<agent> route on the A2A Gateway
+    name: log-collector-a2a               # the agent's route on the A2A Gateway
 
   # ── Auth: tie A2A to the SAME IdP as the LLM/MCP gateways ─────────────────────
   authRef:
     name: llm-auth                        # an AIGatewayAuthPolicy in this namespace (§5)
 
-  # ── Task/context session affinity (the hard part — §7) ───────────────────────
-  session:
-    keySource: body                       # "body" (extract from JSON-RPC) | "header"
-    bodyField: contextId                  # JSON-RPC field that identifies the task/session
-    headerName: X-A2A-Context             # the synthetic header the DataScript stamps
+  # ── Agent card: rewrite the backend's self-reported address ──────────────────
+  agentCard:
+    rewrite: true
+    url: https://log-collector.ai.avi.com
+
+  # ── Task affinity (§7): tasks/send's result.id pins later calls to a backend ──
+  taskAffinity:
     timeout: 30m
 
-  # ── Per-skill authorization (the AKO-programmed layer — §6) ──────────────────
-  skillAccess:
-    roleClaim: role                       # verified JWT claim carrying the caller's role
+  # ── Per-caller authorization (the AKO-programmed layer — §6) ─────────────────
+  agentAccess:
+    agentClaim: sub                       # claim carrying the CALLER's identity
+    skillClaim: skill                     # claim carrying the skill it was granted
+    targetAgent: log-collector            # reject a token minted for another agent
+    requireMethod: true                   # deny requests with no JSON-RPC method
+    authorizePaths: false                 # set true for agents that serve plain REST
     rules:
-      - role: orchestrator                # an orchestrator agent may delegate anything
-        allow: ["*"]
-      - role: analyst                      # analysts: read/analyze skills only
-        allow: ["search.*", "report.generate", "data.read"]
-      - role: guest
-        allow: ["search.query"]
-
-  # ── Push-notification egress control (A2A-specific — §8) ─────────────────────
-  pushNotifications:
-    mode: AllowList                       # AllowList (default-deny) | Deny | Allow
-    allowedHosts:                         # webhook hosts the gateway will permit
-      - "callbacks.internal"
-      - "*.trusted-partner.example"
+      - agent: avi-controller-agent
+        allow: ["tasks/send", "log.collection"]
+      - agent: agent-hub
+        allow: ["tasks/*"]
 
   onUnauthorized:
     type: Reject                          # Reject (default) | Log
@@ -185,19 +198,39 @@ spec:
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `spec.targetRef.*` | PolicyTargetRef | yes | The A2A `HTTPRoute` (or `Gateway`). Same shape as the other AI Gateway policies. |
-| `spec.authRef.name` | string | no | An `AIGatewayAuthPolicy` whose IdP this A2A route shares (§5). Omit to run unauthenticated (not recommended; §13 fails closed). |
-| `spec.session.keySource` | string | no | `body` (default — extract the task/context id from the JSON-RPC body) or `header`. |
-| `spec.session.bodyField` | string | no | JSON-RPC field naming the session (e.g. `contextId` or `taskId`). Used when `keySource: body`. |
-| `spec.session.headerName` | string | no | Synthetic header the DataScript stamps with the extracted id, on which Avi persistence then keys. Default `X-A2A-Context`. |
-| `spec.session.timeout` | duration | no | Idle task/session lifetime. Default `30m`. |
-| `spec.skillAccess.roleClaim` | string | no | Verified JWT claim carrying the caller's role. Default `role`. |
-| `spec.skillAccess.rules[].role` | string | yes\* | A role value (required when `skillAccess` is present). |
-| `spec.skillAccess.rules[].allow` | []string | yes\* | Skill ids / JSON-RPC methods this role may invoke. `"*"` = all; trailing `"*"` = prefix glob (e.g. `"search.*"`), matching the glob semantics in [model-routing.md](model-routing.md). |
-| `spec.pushNotifications.mode` | string | no | `AllowList` (default-deny except `allowedHosts`), `Deny` (block all push config), or `Allow` (no egress control — not recommended). |
-| `spec.pushNotifications.allowedHosts` | []string | no | Webhook hosts permitted in `tasks/pushNotificationConfig/set` (exact or trailing-`*` glob). |
+| `spec.targetRef.*` | PolicyTargetRef | yes | The A2A `HTTPRoute`. Same shape as the other AI Gateway policies. |
+| `spec.authRef.name` | string | no | An `AIGatewayAuthPolicy` whose IdP this A2A route shares (§5). Omit to run unauthenticated (not recommended). |
+| `spec.agentCard.rewrite` | bool | no | Rewrite the `url` field in the agent card JSON served at `/.well-known/agent.json`. Use when the backend reports an internal address. |
+| `spec.agentCard.url` | string | no | The public gateway URL injected when `rewrite` is true. |
+| `spec.taskAffinity.timeout` | duration | no | Idle task-affinity lifetime. Default `30m`. The key is `result.id` captured from the `tasks/send` **response** body; later calls carrying it in `params.id` are re-pinned. There is no field to configure — see §7. |
+| `spec.agentAccess.agentClaim` | string | no | Verified JWT claim carrying the **calling agent's** identity. Default `sub`. Use a distinct claim (e.g. `agent_id`) to separate human and agent tokens from one IdP. |
+| `spec.agentAccess.skillClaim` | string | no | Verified claim carrying the agent-card **skill** the caller was granted. Default `skill`, which is what the issuer's token-exchange endpoint mints. An allow-list entry matches the method **or** the skill, so a legacy token with no skill still works method-only. |
+| `spec.agentAccess.targetAgent` | string | no | This route's own agent name. A token whose `target` claim names a *different* agent is rejected. Audience binding at the authorization layer — see the note below. |
+| `spec.agentAccess.authorizePaths` | bool | no | Adds the request **path** as a third match dimension and evaluates the rules for **every** request, not just JSON-RPC ones. For agents that serve plain REST. Default `false` — turning it on converts a REST fail-open into a fail-closed. |
+| `spec.agentAccess.requireMethod` | bool | no | Reject a request with no extractable JSON-RPC method instead of letting it through unauthorized. Default `false`, because agents legitimately serve REST here. The agent-card path is exempt either way. |
+| `spec.agentAccess.rules[].agent` | string | yes\* | An `agentClaim` value (exact match). |
+| `spec.agentAccess.rules[].allow` | []string | yes\* | JSON-RPC methods (`tasks/send`) and/or skills (`log.collection`) — and paths when `authorizePaths` is on. `"*"` = all; trailing `"*"` = prefix glob, matching the glob semantics in [model-routing.md](model-routing.md). |
 | `spec.onUnauthorized.type` | string | no | `Reject` (default) or `Log`. |
 | `spec.onUnauthorized.statusCode` | int | no | HTTP status on reject. Default `403`. |
+
+> **Why `targetAgent` and not an audience.** The SE validates a single audience per
+> `AIGatewayAuthPolicy`, and one policy is shared across every surface, so binding a token to
+> one agent via `aud` would be an estate-wide hard cutover rather than a per-route setting.
+> The DataScript is generated per route and already knows which agent it fronts, so the same
+> property costs one string comparison. It is weaker in one respect — the token stays
+> cryptographically valid elsewhere, and a route with **no** `AIA2ARoutePolicy` checks
+> nothing — but it stops a token minted for one agent being spent against another.
+
+> ⚠️ **The two fail-opens these switches close are real, and both defaulted open.** The
+> allow-list can only be matched against a method, a skill, or (with `authorizePaths`) a
+> path. A plain REST request carries none of the first two, so before `requireMethod` /
+> `authorizePaths` existed, **any caller holding a valid estate token reached the backend
+> whatever the rules said**. Both default to `false` so that existing REST-serving agents
+> keep working; both should be set per route on any agent whose interface allows it.
+
+> ⚠️ **An allow-list entry matches the JSON-RPC method, not only the skill.** Two agents on
+> the estate were written with skill-only allow-lists and were effectively deny-all until
+> their rules named the method too.
 
 Go types, deepcopy, informer, `PolicyStore` entry, and validation mirror
 [`modelroute_types.go`](../../ako-gateway-api/aigateway/modelroute_types.go) /
@@ -307,7 +340,14 @@ matters for multi-turn tasks with long-running state.
 
 ---
 
-## 8. Push-notification egress control (A2A-specific)
+## 8. ⚠️ NOT BUILT — Push-notification egress control (A2A-specific)
+
+> **Design only.** `spec.pushNotifications` does not exist in the shipped CRD
+> ([`a2aroute_types.go`](../../ako-gateway-api/aigateway/a2aroute_types.go)) and the
+> generated DataScript does not inspect `tasks/pushNotificationConfig/set`. Spike-D (§12)
+> passed against a prototype, so the mechanism is known to work — it was simply never
+> carried into the CRD. Nothing on the estate registers a webhook today, which is why the
+> gap has not bitten. Treat the rest of this section as the specification to build.
 
 A2A lets a client register a **webhook** (`tasks/pushNotificationConfig/set`) so the agent
 **POSTs task updates back** to a client-provided URL asynchronously. That is an **outbound
@@ -445,7 +485,7 @@ mirroring how `AIModelRoutePolicy` was wired (`c05fc5bc` → `a2e7b995` → `404
    [`ako-gateway-api/aigateway/a2aroute_datascript.go`](../../ako-gateway-api/aigateway/a2aroute_datascript.go),
    mirroring `GenerateModelRouteScripts`.
 6. **Demo manifests** ✅ — complete A2A demo in
-   [`docs/gateway-api/examples/ai-gateway-demo/`](../examples/ai-gateway-demo/) including
+   [`docs/gateway-api/examples/ai-gateway-demo/`](examples/ai-gateway-demo/) including
    `a2a-gateway.yaml`, `a2a-gateway-policies.yaml`, `mock-a2a-agent.yaml`, `setup-a2a.sh`,
    and extended `demo.sh`.
 
@@ -471,13 +511,19 @@ mirroring how `AIModelRoutePolicy` was wired (`c05fc5bc` → `a2e7b995` → `404
 
 | Phase | Feature | Status |
 |---|---|---|
-| 3/4 | `AIA2ARoutePolicy` CRD + A2A Gateway annotation; shared-IdP/separate-SSO auth | ✅ Implemented (`72f6fd2a`) |
-| 3/4 | Per-skill authorization DataScript | ✅ Implemented (`72f6fd2a`) |
-| 3/4 | Task/context session affinity via `X-A2A-Context` synthetic header | ✅ Implemented + verified (`80d36e07`) |
-| 3/4 | Push-notification egress allow-list | ✅ Implemented (`72f6fd2a`) |
+| 3/4 | `AIA2ARoutePolicy` CRD; shared-IdP/separate-SSO auth | ✅ Implemented (`72f6fd2a`) |
+| 3/4 | Per-caller authorization DataScript (`agentAccess`, method **or** skill) | ✅ Implemented (`72f6fd2a`) |
+| 3/4 | Task affinity keyed on the `tasks/send` response's `result.id` | ✅ Implemented + verified (`80d36e07`) |
+| 3/4 | **`requireMethod`** — close the non-JSON-RPC fail-open | ✅ Implemented 2026-08-16 (`945c1ec0`) |
+| 3/4 | **`authorizePaths`** — authorize plain-REST endpoints by path | ✅ Implemented 2026-08-16 (`ecb3be81`) |
+| 3/4 | **`targetAgent`** — bind a token to its target agent without splitting the audience | ✅ Implemented 2026-08-16 (`81501c6d`) |
+| 3/4 | Push-notification egress allow-list | ⬜ **Not built** — spec only, see §8 |
 | 3/4 | jwtQuery mode claim accessor fix | ✅ Implemented (`5fbb575e`) |
 | 3/4 | Demo manifests + `setup-a2a.sh` | ✅ Implemented (`5fbb575e`) |
+| 3/4 | Per-agent ServiceAccounts + mint-time authorization at `POST /exchange` | ✅ Live 2026-08-16 — see [ai-gateway-agent-registry.md](ai-gateway-agent-registry.md) |
 | 3/4 | Per-skill call budgets via `AITokenRateLimitPolicy` | Planned (reuse — no new work) |
+| 3/4 | SSE `message/stream` end-to-end affinity validation | Open (Spike-F, see §12) |
+| 3/4 | East-west lockdown: NetworkPolicy on factory-labelled pods + VIP-pinned dial, so a caller cannot bypass the SE by hitting the Service directly | Coded, **not deployed** |
 | 3/4 | SSE `message/stream` end-to-end affinity validation | Open (Spike-F, see §12) |
 | 3.x | UI "A2A Gateways" section (external repo) | Spec (§10) |
 | 3.x | Agent Card registry onboarding + approved allow-list (default-deny) | Spec (§11) |
