@@ -31,7 +31,7 @@
 ## 1. Overview — the south-bound identity gap
 
 The AI Gateway runs entirely on the Avi data plane (see
-[ai-gateway-se-native-brief.md](ai-gateway-se-native-brief.md)). North-bound, the SE already
+the SE-native brief (internal memo, not in this repo)). North-bound, the SE already
 verifies **who the caller is** with OAuth/OIDC. South-bound — SE to the model/tool backend —
 the connection today is at best **one-way TLS**: the SE can validate the backend's server
 cert, but neither side proves a strong, short-lived **workload identity**.
@@ -234,7 +234,7 @@ cheaply the SE reloads:
 
 - **No native SPIRE↔Avi integration.** The rotation controller is hand-built — the same
   "repurposed primitive" pattern as the ICAP/DataScript workarounds in
-  [ai-gateway-se-native-brief.md](ai-gateway-se-native-brief.md). The first-class end state is
+  the SE-native brief (internal memo, not in this repo). The first-class end state is
   a **native SPIFFE/SVID cert source** on Avi (analogous to a cert-manager integration) so the
   SE pulls its own identity instead of being fed one. → RFE.
 - **The SE isn't a SPIFFE workload**, so its identity is controller-issued, not node-attested.
@@ -262,5 +262,5 @@ cheaply the SE reloads:
 - [AI Gateway](ai-gateway.md) — the policy family this joins; north-bound OAuth/OIDC identity
 - [MCP Gateway](ai-gateway-mcp.md) — MCP backends this secures south-bound
 - [Guardrails & DLP](ai-gateway-guardrails.md) — content inspection on the same SE
-- [SE-Native Brief](ai-gateway-se-native-brief.md) — the "move workarounds native" thesis (RFE home)
+- SE-Native Brief (internal memo, not in this repo) — the "move workarounds native" thesis (RFE home)
 - [Overview](ai-gateway-overview.md) — where this fits in the gateway

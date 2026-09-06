@@ -150,7 +150,7 @@ hub / agents ──(https://rag.ai.avi.com/mcp, mcp-gateway VIP .27, jwtQuery au
    routes — `curl https://github.com` from the pod fails.
 4. Poisoned doc retrieved → chunk quarantined by the front door's own
    classifier → answer still delivered from clean chunks. Segue to the
-   response-side SE-native RFE ([rfe-se-ai-native-callout.md](rfe-se-ai-native-callout.md)).
+   response-side SE-native RFE (the SE-native RFE (internal memo, not in this repo)).
 
 ## 7. Gotchas carried in from the estate
 

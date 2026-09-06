@@ -6,7 +6,7 @@
 > users and agents from real data. Streaming (step 5) remains unsolved. Companion
 > to [ai-gateway-auth.md](ai-gateway-auth.md) (where identity comes from),
 > [model-routing.md](model-routing.md) (where `ai_tier` comes from), and
-> [rfe-se-ai-native-callout.md](rfe-se-ai-native-callout.md) (the streaming ask).
+> the SE-native RFE (internal memo, not in this repo) (the streaming ask).
 >
 > **What the measurement settled** (§9, full method in
 > `ako-inference-demo/ledger-stress`): the SE's *recording* is exact — 7,500

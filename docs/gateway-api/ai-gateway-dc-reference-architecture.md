@@ -163,7 +163,7 @@ What makes it survivable, and what a security team will want written down:
    credential-bearing log, and the SIEM ingest path masks the `jwt=` parameter on the way in.
 4. **The RFE is open** — a `Bearer` token that is both validated *and* readable by policy
    removes the trade-off entirely, and is tracked in
-   [rfe-se-ai-native-callout.md](rfe-se-ai-native-callout.md).
+   the SE-native RFE (internal memo, not in this repo).
 
 If the customer's policy forbids credentials in URLs under any compensating control, this
 architecture does not fit today, and that belongs in the first meeting rather than the fifth.
@@ -407,4 +407,4 @@ Four unknowns, in the order in which they would sink the design:
 - [ai-gateway-token-ledger.md](ai-gateway-token-ledger.md) — the record, the collector, streaming
 - [ai-gateway-backend-mtls.md](ai-gateway-backend-mtls.md) — SE → backend identity
 - [ai-gateway-multisite.md](ai-gateway-multisite.md) — the GSLB-flavoured multi-DC variant
-- [rfe-se-ai-native-callout.md](rfe-se-ai-native-callout.md) — the SE-native asks
+- the SE-native RFE (internal memo, not in this repo) — the SE-native asks

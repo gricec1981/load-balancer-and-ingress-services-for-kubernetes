@@ -517,7 +517,7 @@ that the streaming objection is gone:
 | PDP-evaluated constraints | none | §8 gets them from the token instead |
 
 The reason remains structural: the SE has no general-purpose HTTP callout
-([rfe-se-ai-native-callout.md](rfe-se-ai-native-callout.md)), so a PDP call would ride ICAP
+(the SE-native RFE (internal memo, not in this repo)), so a PDP call would ride ICAP
 REQMOD — a second bespoke 2003-protocol shim, in the authorization path, on every tool call.
 Mint-time authz plus §8 plus §9 gets the value without it. If per-request revocation ever
 becomes a hard requirement, that is the trigger to revisit, and this section is the record.

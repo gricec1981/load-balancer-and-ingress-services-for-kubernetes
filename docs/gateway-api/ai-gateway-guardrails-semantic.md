@@ -282,7 +282,7 @@ no new CRD, no new informer — `semantic` is a field on the policy that already
 
 ## 6. Streaming — why request-ICAP is safe ⚠️
 
-Response-side buffering is the known wall (token metering collapses SSE — [ai-gateway-token-ledger.md §4](ai-gateway-token-ledger.md), [rfe-se-ai-native-callout.md](rfe-se-ai-native-callout.md)). This design inspects the **request** body only:
+Response-side buffering is the known wall (token metering collapses SSE — [ai-gateway-token-ledger.md §4](ai-gateway-token-ledger.md), the SE-native RFE (internal memo, not in this repo)). This design inspects the **request** body only:
 
 - The request body (the prompt) is **fully present** before forwarding — buffering it is
   free and is already done for model-routing/metering.

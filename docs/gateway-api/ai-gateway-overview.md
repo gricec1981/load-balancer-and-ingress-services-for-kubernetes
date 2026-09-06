@@ -296,7 +296,7 @@ The following are specified but not yet built. They are included here so the ful
 | [AgentMinder as identity broker](ai-gateway-agentminder-pdp.md) | Replace the hand-rolled in-cluster issuer with a supported broker, keeping enforcement in the SE |
 | A2A push-notification egress allow-list | Governs the webhook an agent may POST task updates to. Designed and spike-proven, never carried into the CRD — [ai-gateway-a2a.md §8](ai-gateway-a2a.md) |
 | A tier that names a *set* of sites | Today a `remote` tier names one peer, so peer-down is tier-down — [ai-gateway-datacenter.md §6](ai-gateway-datacenter.md) |
-| Streaming token metering | Streamed responses cannot be metered on the data plane at all; the demo runs non-streaming. This is the standing RFE — [rfe-se-ai-native-callout.md](rfe-se-ai-native-callout.md) |
+| Streaming token metering | Streamed responses cannot be metered on the data plane at all; the demo runs non-streaming. This is the standing RFE (internal memo, not in this repo) |
 ---
 
 ## Backend mTLS (SPIFFE/SPIRE)
