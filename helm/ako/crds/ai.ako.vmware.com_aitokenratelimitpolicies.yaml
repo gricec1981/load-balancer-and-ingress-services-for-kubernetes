@@ -209,6 +209,44 @@ spec:
                     enum:
                     - consumer
                     - clientIP
+              streaming:
+                description: |-
+                  streaming says what the Service Engine does with a request whose body
+                  carries "stream": true. A streamed response cannot be metered from its
+                  body without collapsing the stream, so the budget is charged at
+                  admission with what the client asked for. Absent means Reserve.
+                type: object
+                properties:
+                  mode:
+                    description: |-
+                      "Reserve" (default) charges prompt-estimate + max_tokens to every limit
+                      when the request is admitted, relays the stream untouched, and records
+                      the reservation in the ledger as quality "estimated"; a non-2xx hands the
+                      reservation back. "Deny" answers 400 to any streamed request before
+                      routing. "Allow" relays and charges nothing (a budget bypass, flagged
+                      as fail-open by the console).
+                    type: string
+                    default: Reserve
+                    enum:
+                    - Reserve
+                    - Deny
+                    - Allow
+                  defaultMaxTokens:
+                    description: |-
+                      defaultMaxTokens is the completion reservation for a streamed request
+                      that states no max_tokens. 0 (default) rejects such a request with
+                      400 max_tokens_required, because without a ceiling the reservation is
+                      not a bound.
+                    type: integer
+                    minimum: 0
+                  promptCharsPerToken:
+                    description: |-
+                      promptCharsPerToken divides the buffered request-body bytes to estimate
+                      prompt tokens. 4 suits English chat; code and non-Latin text run nearer
+                      2–3. Defaults to 4.
+                    type: integer
+                    minimum: 1
+                    maximum: 16
           status:
             description: Status reflects the observed state of the policy.
             type: object

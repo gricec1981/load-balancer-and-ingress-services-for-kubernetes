@@ -307,6 +307,82 @@ type AITokenRateLimitPolicySpec struct {
 	// RequestRateLimit applies a classic RPS rate limiter using Avi's native
 	// distributed rate limiter. This is exact and consistent across all SEs.
 	RequestRateLimit *RequestRateLimit `json:"requestRateLimit,omitempty"`
+
+	// Streaming says what the SE does with a request whose body carries
+	// "stream": true. A streamed response cannot be metered from its body (the
+	// response-body event is buffer-complete, and buffering collapses the
+	// stream), so the budget is charged at admission instead. Absent means
+	// Reserve. See StreamingPolicy.
+	// +optional
+	Streaming *StreamingPolicy `json:"streaming,omitempty"`
+}
+
+// StreamingPolicy controls streamed (SSE) completions on a route with token
+// budgets. The choice is the same one the hosted providers make at admission:
+// charge the ceiling the client asked for, because the actual count is not
+// known until the stream ends and the SE cannot read it then.
+type StreamingPolicy struct {
+	// Mode is one of:
+	//   "Reserve" (default) – read `max_tokens` (or `max_completion_tokens`) and
+	//                          the prompt size from the buffered request head,
+	//                          charge prompt-estimate + max_tokens to every limit
+	//                          at admission, relay the stream untouched, and
+	//                          record the reservation in the ledger as
+	//                          quality "estimated". A non-2xx response hands the
+	//                          reservation back.
+	//   "Deny"              – answer 400 to any streamed request, before routing.
+	//   "Allow"             – relay and charge nothing (the pre-existing
+	//                          behaviour; a streamed request is then a budget
+	//                          bypass, which the console flags as fail-open).
+	// +optional
+	Mode string `json:"mode,omitempty"`
+
+	// DefaultMaxTokens is the completion reservation for a streamed request that
+	// states no max_tokens. 0 (the default) rejects such a request with 400
+	// max_tokens_required, because without a ceiling the reservation is not a
+	// bound: vLLM will generate up to the context limit.
+	// +optional
+	DefaultMaxTokens int64 `json:"defaultMaxTokens,omitempty"`
+
+	// PromptCharsPerToken is the divisor for the prompt estimate (request body
+	// bytes / this). 4 is right for English chat; code and non-Latin text run
+	// nearer 2–3. Defaults to 4.
+	// +optional
+	PromptCharsPerToken int `json:"promptCharsPerToken,omitempty"`
+}
+
+// Streaming mode values (see StreamingPolicy.Mode).
+const (
+	StreamingModeReserve = "Reserve"
+	StreamingModeDeny    = "Deny"
+	StreamingModeAllow   = "Allow"
+)
+
+// DefaultPromptCharsPerToken is the prompt-estimate divisor when the policy
+// does not set one.
+const DefaultPromptCharsPerToken = 4
+
+// EffectiveStreaming returns the streaming policy with defaults applied: mode
+// Reserve, no default ceiling (max_tokens required), 4 chars per token. An
+// unrecognised mode is Reserve — the safe direction is the one that charges.
+func (s *AITokenRateLimitPolicySpec) EffectiveStreaming() StreamingPolicy {
+	out := StreamingPolicy{Mode: StreamingModeReserve, PromptCharsPerToken: DefaultPromptCharsPerToken}
+	if s.Streaming == nil {
+		return out
+	}
+	switch strings.ToLower(s.Streaming.Mode) {
+	case "deny":
+		out.Mode = StreamingModeDeny
+	case "allow":
+		out.Mode = StreamingModeAllow
+	}
+	if s.Streaming.DefaultMaxTokens > 0 {
+		out.DefaultMaxTokens = s.Streaming.DefaultMaxTokens
+	}
+	if s.Streaming.PromptCharsPerToken > 0 {
+		out.PromptCharsPerToken = s.Streaming.PromptCharsPerToken
+	}
+	return out
 }
 
 // IdentitySource controls how the consumer identity is resolved for rate limiting.

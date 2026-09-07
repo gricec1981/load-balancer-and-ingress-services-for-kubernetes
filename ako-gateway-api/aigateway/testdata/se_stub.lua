@@ -25,11 +25,21 @@ M.env = {
   now = 1000000, path = "/v1/chat/completions", query = "", clientip = "10.1.2.3",
   status = 200, body = nil, reqheaders = {}, respheaders = {}, reqvars = {},
   resp = nil, buffered = nil,
+  -- The request body and how much of it HTTP_REQ asked to buffer (bytes). Only
+  -- the buffered head is readable in HTTP_REQ_DATA — which is exactly how a
+  -- "stream" field serialised after a long prompt goes unseen.
+  reqbody = nil, reqbuffered = nil,
   -- What avi.vs.log wrote for this request, in order. This is the client-log
   -- text an operator reads in Analytics > Logs, so a spec can assert on the
   -- thing the demo actually shows rather than on the source that produced it.
   logs = {},
 }
+
+-- The native rate limiter's buckets, name.."|"..key -> tokens remaining. A
+-- spec sets M.rl_budget before the first exceed() on a bucket; the default is
+-- effectively unlimited so specs that are not about the limiter never trip it.
+M.RL = {}
+M.rl_budget = 1e12
 
 function M.reset_request(over)
   M.env.path = "/v1/chat/completions"
@@ -41,6 +51,8 @@ function M.reset_request(over)
   M.env.reqvars = {}
   M.env.resp = nil
   M.env.buffered = nil
+  M.env.reqbody = nil
+  M.env.reqbuffered = nil
   M.env.logs = {}
   for k, v in pairs(over or {}) do M.env[k] = v end
 end
@@ -146,10 +158,38 @@ local http = strict("avi.http", {
   status = function() return env.status end,
   response = function(code, hdrs, body) env.resp = { code = code, body = body } end,
   oauth_get_claim = function(_, claim) return { (env.claims or {})[claim] } end,
+  -- Request-side buffering takes BYTES and is capped at 32 KB on this SE build
+  -- (spike-verified: 65536 errors "buf size should between 0 and 32768").
+  set_request_body_buffer_size = function(n)
+    if n > 32768 then error("buf size should between 0 and 32768", 2) end
+    env.reqbuffered = n
+  end,
+  -- Only the buffered head is readable, and only once HTTP_REQ asked for it.
+  get_req_body = function(n)
+    if not env.reqbuffered then return nil end
+    local lim = n
+    if env.reqbuffered < lim then lim = env.reqbuffered end
+    return string.sub(env.reqbody or "", 1, lim)
+  end,
+})
+
+-- avi.vs.ratelimit.exceed(name, key, n) consumes n from the named bucket for
+-- key, all-or-nothing: true means "could not cover n" (the gate rejects), false
+-- means consumed. Modelled that way because the generated gate relies on the
+-- all-or-nothing property to gate on the carry charge itself.
+local ratelimit = strict("avi.vs.ratelimit", {
+  exceed = function(name, key, n)
+    local k = tostring(name) .. "|" .. tostring(key)
+    if M.RL[k] == nil then M.RL[k] = M.rl_budget end
+    if n > M.RL[k] then return true end
+    M.RL[k] = M.RL[k] - n
+    return false
+  end,
 })
 
 local vs = strict("avi.vs", {
   client_ip = function() return env.clientip end,
+  ratelimit = ratelimit,
   -- Writes a line into this request's client log entry (and marks the entry
   -- significant, which is why a script must not call it unconditionally on a
   -- high-volume VS).

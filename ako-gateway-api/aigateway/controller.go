@@ -563,6 +563,28 @@ func unstructuredToTokenRateLimitPolicy(obj *unstructured.Unstructured) (*AIToke
 		p.Spec.RequestRateLimit = rl
 	}
 
+	// streaming (absent → Reserve; EffectiveStreaming applies the defaults)
+	if sm, found, _ := unstructured.NestedMap(spec, "streaming"); found {
+		st := &StreamingPolicy{}
+		if v, _, _ := unstructured.NestedString(sm, "mode"); v != "" {
+			switch strings.ToLower(v) {
+			case "reserve", "deny", "allow":
+				st.Mode = v
+			default:
+				utils.AviLog.Warnf("AITokenRateLimitPolicy %s/%s: unknown streaming.mode %q, using Reserve",
+					p.Namespace, p.Name, v)
+				st.Mode = StreamingModeReserve
+			}
+		}
+		if v, _, _ := unstructured.NestedInt64(sm, "defaultMaxTokens"); v > 0 {
+			st.DefaultMaxTokens = v
+		}
+		if v, _, _ := unstructured.NestedInt64(sm, "promptCharsPerToken"); v > 0 {
+			st.PromptCharsPerToken = int(v)
+		}
+		p.Spec.Streaming = st
+	}
+
 	return p, nil
 }
 

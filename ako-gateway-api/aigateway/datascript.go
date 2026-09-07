@@ -208,9 +208,17 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 		}
 		reqParts = append(reqParts, buildReqLimitBlock(limit, policy.CounterEpoch))
 	}
-	if needReqData {
+	// Streamed completions (see streaming.go). Reserve and Deny both need the
+	// request head in HTTP_REQ_DATA; Allow emits nothing and keeps the bypass.
+	streaming := spec.EffectiveStreaming()
+	streamActive := streaming.Mode != StreamingModeAllow
+	if streamActive {
+		reqParts = append(reqParts, buildReqBodyBufferBlock())
+	}
+
+	if needReqData || streamActive {
 		reqDataEnforceParts = append(reqDataEnforceParts,
-			"-- AKO AI Gateway: tier-dependent token-budget enforcement (HTTP_REQ_DATA, after model routing sets ai_tier)")
+			"-- AKO AI Gateway: tier-dependent token-budget enforcement and streaming reservation (HTTP_REQ_DATA, after model routing sets ai_tier)")
 		reqDataEnforceParts = append(reqDataEnforceParts, helper)
 		reqDataEnforceParts = append(reqDataEnforceParts, identityBlock)
 		reqDataEnforceParts = append(reqDataEnforceParts, "local now = os.time()")
@@ -221,12 +229,40 @@ func GenerateTokenAccountingScripts(policy *AITokenRateLimitPolicy, mode AuthCla
 		}
 	}
 
+	// A reservation lands in exactly the keys a measured completion would: the
+	// native carry (charged at the consumer's next request) plus the display
+	// counter for native limits, the window counter for DataScript limits.
+	chargeLimit := func(limit TokenLimit) string {
+		if nativeOK(limit) {
+			return buildNativeConsumeBlock(limit, policy.CounterEpoch)
+		}
+		return buildRespLimitBlock(limit, policy.CounterEpoch)
+	}
+	releaseLimit := func(limit TokenLimit) string {
+		return buildReleaseBlock(limit, policy.CounterEpoch, nativeOK(limit))
+	}
+	if streamActive {
+		// After the tier gates: a request the gate rejects reserves nothing.
+		reqDataEnforceParts = append(reqDataEnforceParts,
+			buildStreamReserveBlock(spec.Limits, streaming, chargeLimit))
+	}
+
 	// ── Skip metering for external-provider tiers ────────────────────────
 	// A provider tier (e.g. Gemini) is routed by AIModelRoutePolicy, which sets
 	// the ai_skip_meter reqvar. Its response is chunked (like streaming), which
 	// the body-based usage parser can't read anyway, so skip the response phases
 	// entirely rather than error on it.
 	skipGuard := `if avi.http.get_reqvar("ai_skip_meter") == "1" then return end`
+	if streamActive {
+		// A reserved stream also carries ai_skip_meter, so this must come first:
+		// it records the reservation (or hands it back) and returns, and it is
+		// the fail-closed backstop for a stream that was never reserved.
+		respParts = append(respParts, "-- AKO AI Gateway: streamed-response handling")
+		respParts = append(respParts, helper)
+		respParts = append(respParts, identityBlock)
+		respParts = append(respParts, "local now = os.time()")
+		respParts = append(respParts, buildStreamRespBlock(spec.Limits, spec.TargetRef.Name, chargeLimit, releaseLimit))
+	}
 	respParts = append(respParts, skipGuard)
 	respDataParts = append(respDataParts, skipGuard)
 

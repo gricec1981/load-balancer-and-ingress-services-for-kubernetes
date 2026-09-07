@@ -84,6 +84,17 @@ spec:
       statusCode: 429
       retryAfter: true
 
+  # Streamed completions ("stream": true). The SE cannot count a stream it
+  # relays, so Reserve (the default) charges prompt-estimate + max_tokens to
+  # every limit when the request is admitted, relays the stream untouched, and
+  # records the reservation in the ledger as quality "estimated". A request
+  # without max_tokens is refused (400) unless defaultMaxTokens is set. Deny
+  # answers 400 to every streamed request; Allow lets streams through unmetered.
+  streaming:
+    mode: Reserve
+    # defaultMaxTokens: 512
+    # promptCharsPerToken: 4
+
   # Optional: soft RPS throttle (per-window token bucket).
   # requestRateLimit:
   #   requestsPerSecond: 5

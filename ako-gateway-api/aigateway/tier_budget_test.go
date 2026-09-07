@@ -75,12 +75,15 @@ func TestTierBudgetEnforcedInReqData(t *testing.T) {
 func TestNonReqvarLimitUnchanged(t *testing.T) {
 	// A classic per-consumer budget (no reqvar) must keep enforcing in HTTP_REQ and
 	// produce no req-data enforcement script — i.e. existing behaviour is unchanged.
+	// Streaming is switched off here because Reserve (the default) is the one other
+	// thing that lives in HTTP_REQ_DATA; its own tests are in streaming_test.go.
 	p := &AITokenRateLimitPolicy{
 		Spec: AITokenRateLimitPolicySpec{
 			TargetRef: PolicyTargetRef{Group: "gateway.networking.k8s.io", Kind: "HTTPRoute", Name: "llm-route"},
 			Limits: []TokenLimit{
 				{Name: "hourly", Key: "consumer", Tokens: "total", Window: "1h", Budget: 1000},
 			},
+			Streaming: &StreamingPolicy{Mode: StreamingModeAllow},
 		},
 	}
 	s := GenerateTokenAccountingScripts(p, ClaimModeOAuth, "vs-test")

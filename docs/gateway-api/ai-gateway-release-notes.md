@@ -35,6 +35,7 @@ For the whole system in one place — architecture, console guide, how-tos, secu
 | Token ledger — true per-user / per-agent consumption | 2026-08-19 | Built · measured 2026-08-22 (§ below) | [ai-gateway-token-ledger.md](ai-gateway-token-ledger.md) |
 | Readable Avi object names | 2026-08-22 | Built · `<cluster>--<surface>-<route>-<hash>` | [Release note below](#readable-avi-object-names--2026-08-22) |
 | Remote-site tiers — a tier served by a peer gateway in another cluster | 2026-08-23 | Built · verified cross-cluster | [model-routing.md](model-routing.md) |
+| Streamed completions — budget reserved at admission (`spec.streaming`) | 2026-09-06 | Built · `Reserve` / `Deny` / `Allow`; `estimated` ledger rows; SSE backstop | [ai-gateway-token-ledger.md §4](ai-gateway-token-ledger.md) |
 | Backend mTLS with SPIFFE/SPIRE | — | Design, spike-gated | [ai-gateway-backend-mtls.md](ai-gateway-backend-mtls.md) |
 | A tier that names a *set* of sites | — | Design | [ai-gateway-datacenter.md §6](ai-gateway-datacenter.md) |
 | Multi-site delivery via AMKO + GSLB | — | Design, spike-gated · superseded for the single-peer case | [ai-gateway-multisite.md](ai-gateway-multisite.md) |
@@ -43,6 +44,52 @@ For the whole system in one place — architecture, console guide, how-tos, secu
 | A2A push-notification egress allow-list | — | Design only — never carried into the CRD | [ai-gateway-a2a.md §8](ai-gateway-a2a.md) |
 | Cross-provider failover | — | Design only | [ai-provider-failover-design.md](ai-provider-failover-design.md) |
 ---
+
+## Streamed completions — the budget is reserved at admission — 2026-09-06
+
+Until now a `"stream": true` request was charged **zero**: the response-body event is
+buffer-complete, the token scripts skip `text/event-stream` so as not to collapse the stream,
+and so every streamed completion slipped every budget. Any client that streams — which is every
+real client — found the bypass in an afternoon.
+
+`AITokenRateLimitPolicy.spec.streaming` closes it the way the hosted providers' rate limiters do:
+charge the ceiling the client asked for when the request is admitted, because the actual count is
+not known until the stream ends and the Service Engine cannot read it then.
+
+- **`mode: Reserve`** (the default, also when the block is absent) — `HTTP_REQ_DATA` reads the
+  buffered request head and charges *prompt estimate + `max_tokens`* (× `n`) to every limit, in
+  the same keys a measured completion uses: the native carry, applied at the consumer's next
+  gate, and the per-SE window counter. The stream is relayed untouched. `HTTP_RESP` appends the
+  ledger row as `quality=estimated` on a 2xx, or hands the reservation back on an error. A
+  request that states no `max_tokens` is refused with `400 max_tokens_required` — without a
+  ceiling the reservation is not a bound — unless `defaultMaxTokens` is set.
+- **`mode: Deny`** — `400 streaming_not_allowed` before routing.
+- **`mode: Allow`** — the previous behaviour; the console's Governance page flags it as fail-open.
+- **The backstop.** The request head is 32 KB and the Python client serialises `messages` first,
+  so a long prompt can hide `stream` past the buffer. `HTTP_RESP` treats a `text/event-stream`
+  nobody reserved as an unreadable body: the fail-closed penalty, recorded as `penalty`.
+
+Everything on the request side — the bearer, AgentMinder rules, model routing and downgrade,
+WAF, ICAP, request-rate limits — is untouched; it never saw the difference.
+
+**Console.** `estimated` is a third class beside `exact` and `penalty`: `reservedTokens` /
+`reservedRequests` / `reservedCost` on every totals object, a hatched band on the spend chart, "≤"
+on rows and chain hops, a *Streams* column on Budgets, and `charged` (measured + reserved +
+penalty) as the figure to read against a cap. The Playground streams by default and prints, per
+reply, what the SE reserved beside what the model reported.
+
+**Accuracy.** The prompt estimate is ±30 % on chat; the completion figure is a hard ceiling with
+`max_tokens` and no bound without it; enforcement is one request late on native limits, as for a
+measured completion. A client sending a sensible `max_tokens` lands 1.3–2× over on streamed
+traffic. The settle-to-actual half — reading the final SSE frame's `usage` — is the SE-native
+metering RFE.
+
+**Testing.** `testdata/streaming_spec.lua` runs the generated phases in the SE sandbox stub (now
+with `get_req_body`, request-buffer sizing and a native rate-limiter model): reservation in both
+key kinds, the estimated row, `n`, whitespace, no-`max_tokens` refusal and default, the release
+on a 503, the SSE backstop at 40 KB, the native gate tripping one request late, Deny, and
+`stream:false`. `TestStreamingGeneration` covers the three auth modes; `TestStreamingParse` the CR
+shape.
 
 ## `jwtHeader` — a standard bearer at the front door — 2026-09-05
 

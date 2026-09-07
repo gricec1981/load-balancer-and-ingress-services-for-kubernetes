@@ -143,24 +143,50 @@ Dropping raw records is not dropping accounting — the rollups hold their sums.
 
 ## 4. Streaming
 
-The one thing the ledger does not fix. `HTTP_RESP_DATA` is buffer-complete
+The one thing the ledger cannot measure. `HTTP_RESP_DATA` is buffer-complete
 (probed live): reading the body forces buffering, which collapses the stream.
-So a streamed response cannot be measured in a DataScript today.
+So a streamed response cannot be counted in a DataScript today — and until
+2026-09-06 a `stream: true` request was counted as **zero**, a silent bypass.
 
-Three moves, in order:
+**Built (2026-09-06): reserve at admission.** The same thing the hosted
+providers' rate limiters do — charge the ceiling the client asked for when the
+request is admitted, because the count is not known until the stream ends. The
+settle-to-actual half is what the SE-native metering RFE adds.
 
-1. **Inject `stream_options:{include_usage:true}`** into the request body in
-   `HTTP_REQ_DATA` — the model-route script already rewrites bodies there. This
-   makes the final SSE frame actually carry usage, and is a prerequisite for
-   anything below.
-2. **Spike response trailers.** Can a DataScript read a trailer in a post-body
-   event without buffering? If yes, the backend emits `X-AI-Usage`, streams
-   meter exactly, and the whole model above works unchanged. **This single
-   unknown sets the ceiling** — it is the make-or-break spike.
-3. **Until then: reserve, and say so.** Pre-flight estimate from prompt chars/4
-   plus `max_tokens`, written as `quality=estimated`. It charges the budget
-   (closing today's bypass, defect 2) and appears in the console as an estimate,
-   never summed into the exact figure.
+`AITokenRateLimitPolicy.spec.streaming` (`streaming.go`):
+
+| `mode` | What the SE does with `"stream": true` |
+|---|---|
+| `Reserve` (default, also when the block is absent) | `HTTP_REQ_DATA` reads the buffered head: prompt estimate = body bytes ÷ `promptCharsPerToken` (4), completion = `max_tokens` (or `max_completion_tokens`, × `n`). The sum is charged to every limit in the same keys a measured completion uses — the native carry (applied at the consumer's next gate) and the window counter — and the request is flagged `ai_stream`, `ai_skip_meter`. `HTTP_RESP` on a 2xx appends the ledger row with `quality=estimated`; on a non-2xx it hands the reservation back. No `max_tokens` → `400 max_tokens_required` unless `defaultMaxTokens` is set, because without a ceiling the reservation is not a bound. |
+| `Deny` | `400 streaming_not_allowed` in `HTTP_REQ_DATA`, before routing. |
+| `Allow` | Nothing — the pre-existing bypass, which the console flags as fail-open. |
+
+**The backstop.** The request head is 32 KB. The Python OpenAI client serialises
+`messages` first, so on a long prompt `stream` sits past the buffer and admission
+never sees it. `HTTP_RESP` therefore treats a `text/event-stream` with no
+reservation flag as an unreadable body: it charges `FailClosedTokens` and
+records a `penalty` row. Nothing streamed costs zero.
+
+**What the console does with an `estimated` row.** It is a third class beside
+`exact` and `penalty`: rolled up as `reservedTokens` / `reservedRequests` /
+`reservedCost` on every totals object, drawn as its own hatched band on the
+spend chart, shown as "≤" on rows and chain hops, and never summed into the
+measured figures. `charged` (measured + reserved + penalty) is the number to
+read against a cap. The Playground streams by default and prints, per reply,
+what the SE reserved beside what the model reported.
+
+**Accuracy, honestly.** Stream detection is exact (with the backstop). The
+prompt estimate is ±30 % on chat, worse for code and non-Latin text, floored at
+32 KB. The completion figure is a hard ceiling when `max_tokens` is present and
+no bound when it is absent — hence the 400. Enforcement is one request late on
+native limits, as for a measured completion. A chat client sending a sensible
+`max_tokens` lands 1.3–2× over on streamed traffic; an uncontrolled 4096 lands
+5–10× over. The bill says "at most"; the budget is safe.
+
+Still open: reading the final SSE frame's `usage` (needs a per-chunk response
+event on the SE — the RFE), and a request-body rewrite to inject
+`stream_options.include_usage`, for which no verified DataScript primitive
+exists. The trailer idea is dead for the reason the gap review gives.
 
 The rule that makes the console trustworthy: **never render an estimate as a
 measurement.** "1.2 M tokens · 94 % exactly metered" is a stronger claim than a
@@ -213,7 +239,8 @@ else would make a 429 look unexplained.
 | 2 | Collector + store in `ai-gateway-ui`; per-instance cursors; `/api/usage`, `/api/usage/recent`, `/api/usage/export` | ✅ `155b6d2` (ui) |
 | 3 | Cost table (`USAGE_RATES`, cached discount) | ✅ `155b6d2` (ui) |
 | 4 | Dashboard ▸ Tokens | ✅ `155b6d2` (ui) |
-| 5 | Streaming: `include_usage` injection, then the trailer spike | not started |
+| 5 | Streaming: reserve at admission (`spec.streaming`), `estimated` rows, SSE backstop, console reserved class, Playground streams | ✅ 2026-09-06 (§4) |
+| 6 | Streaming settle-to-actual (final-frame `usage`) | needs the SE-native RFE |
 
 **Verification.** The generated Lua is executed, not string-matched:
 `testdata/se_stub.lua` reproduces the SE sandbox — `tonumber(nil)` raises, Lua
