@@ -20,8 +20,9 @@
 
 **Goal:** route a model tier to a *primary* LLM provider and fail over to *backup* provider(s)
 on health failure / rate-limit / cost-ceiling — using Avi's native LB muscle (priority pools +
-health monitors + GSLB), not bolted-on proxy logic. Doubles as the demand evidence for RFE-4761
-(SE-native streaming), which the response-side controls depend on for real streaming providers.
+health monitors + GSLB), not bolted-on proxy logic. Against a real streaming provider the
+response-side controls are bounded by what the SE can see mid-stream — see the streaming
+boundary below.
 
 ## Design principle: failover is Avi config, not new datascript logic
 
@@ -109,22 +110,21 @@ Tier `standard`: primary = `mock-openai` pool (priority 10), fallback = `mock-an
 - Narrative: "competitors bolt failover onto a proxy; Avi *is* the enterprise LB — health
   monitors, priority pools, GSLB across providers/regions are native."
 
-## The streaming boundary → RFE-4761 (the RFE writeup section)
+## The streaming boundary
 
-Failover splits into two layers; only the second needs SE-native streaming:
+Failover splits into two layers; only the second depends on the SE seeing response chunks:
 
 | Capability | Needs streaming? | Status |
 |---|---|---|
 | Connection/health failover to healthy provider (new requests) | **No** | works today (native PG) |
 | Request routing (read model from body → tier → PG) | No | works today (32KB body buffer) |
 | Response-side guardrails/DLP on the answer (non-streaming) | No | works today (buffer+inspect) |
-| **Response-side guardrails/token metering on a STREAMED (SSE) answer** | **YES** | **RFE-4761** |
-| **Clean mid-stream failover** (provider dies mid-SSE response) | **YES** | **RFE-4761** |
+| **Response-side guardrails/token metering on a STREAMED (SSE) answer** | **YES** | not available |
+| **Clean mid-stream failover** (provider dies mid-SSE response) | **YES** | not available |
 
-**RFE framing:** failover is the demand-backed use case that surfaces the boundary. Point it at a
-real streaming provider and the response-side controls hit the wall exactly where RFE-4761 applies —
-turning "we'd like streaming" into "this differentiated, customer-wanted capability is gated on one
-platform investment." Do NOT imply mid-stream failover works today; that gap *is* part of the RFE ask.
+Mid-stream failover does **not** work today, and response-side controls on an SSE answer are
+outside what the datascript can observe. Run metered or guardrailed paths non-streaming; the
+streaming variants are a platform limitation, not a configuration mistake.
 
 ## Build checklist
 
