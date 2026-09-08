@@ -13,3 +13,10 @@ docs/gateway-api/ai-gateway-multicluster-strategy.md
 docs/gateway-api/ai-gateway-multisite-opportunity.md
 docs/gateway-api/_brief.html
 ~$*.html
+# AI Gateway: Service Engine gap/RFE memos (internal — kept local, not for the public fork)
+docs/gateway-api/ai-gateway-se-gap-register.md
+docs/gateway-api/ai-gateway-se-gap-workarounds-review.md
+docs/gateway-api/ai-gateway-se-native-brief.md
+docs/gateway-api/rfe-se-ai-native-callout.md
+docs/gateway-api/ai-gateway-se-engineering-handoff.md
+docs/gateway-api/ai-gateway-vdefend-security-plane.md
