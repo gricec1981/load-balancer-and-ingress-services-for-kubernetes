@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -142,52 +143,69 @@ func (s *PolicyStore) GetTokenRateLimitPoliciesForRoute(routeNsName string) []*A
 	return out
 }
 
-// upsertAuthPolicy stores the policy and updates route→policy mappings.
-func (s *PolicyStore) upsertAuthPolicy(p *AIGatewayAuthPolicy) {
+// Every policy kind is stored the same way: the policy by "ns/name", and an
+// index route "ns/targetRef.name" → policy names. Upserts return the targetRef
+// name the policy moved away from ("" when it did not move), and deletes return
+// the removed policy, so the event handlers can re-enqueue every route whose
+// policies changed, and only after the store reflects the change: a rebuild
+// dequeued in between must never still see the old mapping.
+
+// upsertAuthPolicy stores the policy and updates route→policy mappings. It
+// returns the targetRef name the policy left, or "".
+func (s *PolicyStore) upsertAuthPolicy(p *AIGatewayAuthPolicy) (movedFrom string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pNsName := p.Namespace + "/" + p.Name
+	var prevTarget *string
+	if prev := s.authPolicyByNsName[pNsName]; prev != nil {
+		prevTarget = &prev.Spec.TargetRef.Name
+	}
 	s.authPolicyByNsName[pNsName] = p
-	routeNsName := p.Namespace + "/" + p.Spec.TargetRef.Name
-	s.routeToAuthPolicies[routeNsName] = addUnique(s.routeToAuthPolicies[routeNsName], pNsName)
+	return indexPolicyRoute(s.routeToAuthPolicies, p.Namespace, pNsName, prevTarget, p.Spec.TargetRef.Name)
 }
 
-// deleteAuthPolicy removes the policy and cleans route→policy mappings.
-func (s *PolicyStore) deleteAuthPolicy(ns, name string) {
+// deleteAuthPolicy removes the policy and cleans route→policy mappings. It
+// returns the removed policy, or nil if it was not stored.
+func (s *PolicyStore) deleteAuthPolicy(ns, name string) *AIGatewayAuthPolicy {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pNsName := ns + "/" + name
 	p, ok := s.authPolicyByNsName[pNsName]
 	if !ok {
-		return
+		return nil
 	}
-	routeNsName := p.Namespace + "/" + p.Spec.TargetRef.Name
-	s.routeToAuthPolicies[routeNsName] = removeElem(s.routeToAuthPolicies[routeNsName], pNsName)
+	unindexPolicyRoute(s.routeToAuthPolicies, p.Namespace+"/"+p.Spec.TargetRef.Name, pNsName)
 	delete(s.authPolicyByNsName, pNsName)
+	return p
 }
 
-// upsertTokenRateLimitPolicy stores the policy and updates route→policy mappings.
-func (s *PolicyStore) upsertTokenRateLimitPolicy(p *AITokenRateLimitPolicy) {
+// upsertTokenRateLimitPolicy stores the policy and updates route→policy
+// mappings. It returns the targetRef name the policy left, or "".
+func (s *PolicyStore) upsertTokenRateLimitPolicy(p *AITokenRateLimitPolicy) (movedFrom string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pNsName := p.Namespace + "/" + p.Name
+	var prevTarget *string
+	if prev := s.tokenPolicyByNsName[pNsName]; prev != nil {
+		prevTarget = &prev.Spec.TargetRef.Name
+	}
 	s.tokenPolicyByNsName[pNsName] = p
-	routeNsName := p.Namespace + "/" + p.Spec.TargetRef.Name
-	s.routeToTokenPolicies[routeNsName] = addUnique(s.routeToTokenPolicies[routeNsName], pNsName)
+	return indexPolicyRoute(s.routeToTokenPolicies, p.Namespace, pNsName, prevTarget, p.Spec.TargetRef.Name)
 }
 
-// deleteTokenRateLimitPolicy removes the policy and cleans route→policy mappings.
-func (s *PolicyStore) deleteTokenRateLimitPolicy(ns, name string) {
+// deleteTokenRateLimitPolicy removes the policy and cleans route→policy
+// mappings. It returns the removed policy, or nil if it was not stored.
+func (s *PolicyStore) deleteTokenRateLimitPolicy(ns, name string) *AITokenRateLimitPolicy {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pNsName := ns + "/" + name
 	p, ok := s.tokenPolicyByNsName[pNsName]
 	if !ok {
-		return
+		return nil
 	}
-	routeNsName := p.Namespace + "/" + p.Spec.TargetRef.Name
-	s.routeToTokenPolicies[routeNsName] = removeElem(s.routeToTokenPolicies[routeNsName], pNsName)
+	unindexPolicyRoute(s.routeToTokenPolicies, p.Namespace+"/"+p.Spec.TargetRef.Name, pNsName)
 	delete(s.tokenPolicyByNsName, pNsName)
+	return p
 }
 
 // ─── Event handlers ──────────────────────────────────────────────────────────
@@ -201,32 +219,39 @@ func SetupAuthPolicyEventHandlers(
 	workqueues []workqueue.RateLimitingInterface, //nolint:staticcheck
 	numWorkers uint32,
 ) {
+	// A route whose auth could not be realized (fail-closed) or is serving on a
+	// last-known-good keyset is re-enqueued after a delay: the informers have no
+	// periodic resync, so nothing else would retry it.
+	setAuthRetryHook(func(ns, name string, after time.Duration) {
+		routeKey := lib.HTTPRoute + "/" + ns + "/" + name
+		workqueues[utils.Bkt(ns, numWorkers)].AddAfter(routeKey, after)
+	})
 	handler := cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			u, ok := toUnstructured(obj)
 			if !ok {
 				return
 			}
-			p, err := parseAuthPolicy(dynamicClient, u.GetNamespace(), u.GetName())
+			p, err := parseAuthPolicy(dynamicClient, u)
 			if err != nil {
 				utils.AviLog.Warnf("AIGatewayAuthPolicy add: failed to parse %s/%s: %v", u.GetNamespace(), u.GetName(), err)
 				return
 			}
-			SharedPolicyStore().upsertAuthPolicy(p)
-			enqueueTargetRoute(p.Namespace, p.Spec.TargetRef.Name, lib.AIGatewayAuthPolicy, workqueues, numWorkers)
+			movedFrom := SharedPolicyStore().upsertAuthPolicy(p)
+			enqueuePolicyRoutes(p.Namespace, p.Spec.TargetRef.Name, movedFrom, lib.AIGatewayAuthPolicy, workqueues, numWorkers)
 		},
 		UpdateFunc: func(_, newObj interface{}) {
 			u, ok := toUnstructured(newObj)
 			if !ok {
 				return
 			}
-			p, err := parseAuthPolicy(dynamicClient, u.GetNamespace(), u.GetName())
+			p, err := parseAuthPolicy(dynamicClient, u)
 			if err != nil {
 				utils.AviLog.Warnf("AIGatewayAuthPolicy update: failed to parse %s/%s: %v", u.GetNamespace(), u.GetName(), err)
 				return
 			}
-			SharedPolicyStore().upsertAuthPolicy(p)
-			enqueueTargetRoute(p.Namespace, p.Spec.TargetRef.Name, lib.AIGatewayAuthPolicy, workqueues, numWorkers)
+			movedFrom := SharedPolicyStore().upsertAuthPolicy(p)
+			enqueuePolicyRoutes(p.Namespace, p.Spec.TargetRef.Name, movedFrom, lib.AIGatewayAuthPolicy, workqueues, numWorkers)
 		},
 		DeleteFunc: func(obj interface{}) {
 			u, ok := toUnstructured(obj)
@@ -242,13 +267,9 @@ func SetupAuthPolicyEventHandlers(
 				}
 			}
 			ns, name := u.GetNamespace(), u.GetName()
-			// Re-enqueue before deleting so the translator sees the last known targetRef.
-			ps := SharedPolicyStore()
-			pNsName := ns + "/" + name
-			ps.mu.RLock()
-			p := ps.authPolicyByNsName[pNsName]
-			ps.mu.RUnlock()
-			if p != nil {
+			// Remove from the store first, then re-enqueue the route the removed
+			// policy targeted: the rebuild must no longer see the policy.
+			if p := SharedPolicyStore().deleteAuthPolicy(ns, name); p != nil {
 				enqueueTargetRoute(ns, p.Spec.TargetRef.Name, lib.AIGatewayAuthPolicy, workqueues, numWorkers)
 				// Clean up AKO-managed Avi objects for whichever auth mode was used:
 				// OAuth (SSOPolicy, AuthProfile, issuer Pool) or JWT query/header
@@ -260,10 +281,12 @@ func SetupAuthPolicyEventHandlers(
 					DeleteOAuthObjects(delKey, p)
 				}
 			}
-			ps.deleteAuthPolicy(ns, name)
 		},
 	}
-	informer.Informer().AddEventHandler(handler)
+	// Tracked so startup can wait until this handler has put every
+	// existing policy in the store before any route is translated.
+	reg, err := informer.Informer().AddEventHandler(handler)
+	trackPolicyHandler(lib.AIGatewayAuthPolicy, reg, err)
 }
 
 // SetupTokenRateLimitPolicyEventHandlers wires Add/Update/Delete handlers for
@@ -280,26 +303,26 @@ func SetupTokenRateLimitPolicyEventHandlers(
 			if !ok {
 				return
 			}
-			p, err := parseTokenRateLimitPolicy(dynamicClient, u.GetNamespace(), u.GetName())
+			p, err := parseTokenRateLimitPolicy(dynamicClient, u)
 			if err != nil {
 				utils.AviLog.Warnf("AITokenRateLimitPolicy add: failed to parse %s/%s: %v", u.GetNamespace(), u.GetName(), err)
 				return
 			}
-			SharedPolicyStore().upsertTokenRateLimitPolicy(p)
-			enqueueTargetRoute(p.Namespace, p.Spec.TargetRef.Name, lib.AITokenRateLimitPolicy, workqueues, numWorkers)
+			movedFrom := SharedPolicyStore().upsertTokenRateLimitPolicy(p)
+			enqueuePolicyRoutes(p.Namespace, p.Spec.TargetRef.Name, movedFrom, lib.AITokenRateLimitPolicy, workqueues, numWorkers)
 		},
 		UpdateFunc: func(_, newObj interface{}) {
 			u, ok := toUnstructured(newObj)
 			if !ok {
 				return
 			}
-			p, err := parseTokenRateLimitPolicy(dynamicClient, u.GetNamespace(), u.GetName())
+			p, err := parseTokenRateLimitPolicy(dynamicClient, u)
 			if err != nil {
 				utils.AviLog.Warnf("AITokenRateLimitPolicy update: failed to parse %s/%s: %v", u.GetNamespace(), u.GetName(), err)
 				return
 			}
-			SharedPolicyStore().upsertTokenRateLimitPolicy(p)
-			enqueueTargetRoute(p.Namespace, p.Spec.TargetRef.Name, lib.AITokenRateLimitPolicy, workqueues, numWorkers)
+			movedFrom := SharedPolicyStore().upsertTokenRateLimitPolicy(p)
+			enqueuePolicyRoutes(p.Namespace, p.Spec.TargetRef.Name, movedFrom, lib.AITokenRateLimitPolicy, workqueues, numWorkers)
 		},
 		DeleteFunc: func(obj interface{}) {
 			u, ok := toUnstructured(obj)
@@ -315,41 +338,29 @@ func SetupTokenRateLimitPolicyEventHandlers(
 				}
 			}
 			ns, name := u.GetNamespace(), u.GetName()
-			ps := SharedPolicyStore()
-			pNsName := ns + "/" + name
-			ps.mu.RLock()
-			p := ps.tokenPolicyByNsName[pNsName]
-			ps.mu.RUnlock()
-			if p != nil {
+			// Remove first, then re-enqueue: the rebuild must not see the policy.
+			if p := SharedPolicyStore().deleteTokenRateLimitPolicy(ns, name); p != nil {
 				enqueueTargetRoute(ns, p.Spec.TargetRef.Name, lib.AITokenRateLimitPolicy, workqueues, numWorkers)
 			}
-			ps.deleteTokenRateLimitPolicy(ns, name)
 		},
 	}
-	informer.Informer().AddEventHandler(handler)
+	// Tracked so startup can wait until this handler has put every
+	// existing policy in the store before any route is translated.
+	reg, err := informer.Informer().AddEventHandler(handler)
+	trackPolicyHandler(lib.AITokenRateLimitPolicy, reg, err)
 }
 
 // ─── Parsing ─────────────────────────────────────────────────────────────────
 
 // parseAuthPolicy fetches and parses an AIGatewayAuthPolicy from the API server.
-func parseAuthPolicy(client dynamic.Interface, ns, name string) (*AIGatewayAuthPolicy, error) {
-	obj, err := client.Resource(AIGatewayAuthPolicyGVR).Namespace(ns).Get(
-		context.TODO(), name, metav1.GetOptions{},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("get AIGatewayAuthPolicy %s/%s: %w", ns, name, err)
-	}
-	return unstructuredToAuthPolicy(obj)
+func parseAuthPolicy(client dynamic.Interface, u *unstructured.Unstructured) (*AIGatewayAuthPolicy, error) {
+	return unstructuredToAuthPolicy(livePolicyObject(client, AIGatewayAuthPolicyGVR, lib.AIGatewayAuthPolicy, u))
 }
 
 // parseTokenRateLimitPolicy fetches and parses an AITokenRateLimitPolicy.
-func parseTokenRateLimitPolicy(client dynamic.Interface, ns, name string) (*AITokenRateLimitPolicy, error) {
-	obj, err := client.Resource(AITokenRateLimitPolicyGVR).Namespace(ns).Get(
-		context.TODO(), name, metav1.GetOptions{},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("get AITokenRateLimitPolicy %s/%s: %w", ns, name, err)
-	}
+func parseTokenRateLimitPolicy(client dynamic.Interface, u *unstructured.Unstructured) (*AITokenRateLimitPolicy, error) {
+	obj := livePolicyObject(client, AITokenRateLimitPolicyGVR, lib.AITokenRateLimitPolicy, u)
+	ns, name := obj.GetNamespace(), obj.GetName()
 	p, err := unstructuredToTokenRateLimitPolicy(obj)
 	if err != nil {
 		return nil, err
@@ -602,6 +613,43 @@ func enqueueTargetRoute(ns, routeName, policyKind string, wqs []workqueue.RateLi
 	bkt := utils.Bkt(ns, numWorkers)
 	wqs[bkt].AddRateLimited(routeKey)
 	utils.AviLog.Debugf("%s: re-enqueued HTTPRoute %s", policyKind, routeKey)
+}
+
+// enqueuePolicyRoutes re-enqueues the route a stored policy targets and, when
+// the update moved the policy off another route (movedFrom, from an upsert),
+// that route too, so its rebuild drops the policy.
+func enqueuePolicyRoutes(ns, target, movedFrom, policyKind string, wqs []workqueue.RateLimitingInterface, numWorkers uint32) { //nolint:staticcheck
+	if movedFrom != "" && movedFrom != target {
+		utils.AviLog.Infof("%s: targetRef moved from HTTPRoute %s/%s to %s/%s; re-enqueuing both",
+			policyKind, ns, movedFrom, ns, target)
+		enqueueTargetRoute(ns, movedFrom, policyKind, wqs, numWorkers)
+	}
+	enqueueTargetRoute(ns, target, policyKind, wqs, numWorkers)
+}
+
+// indexPolicyRoute maps policy pNsName under route ns/target in index. When
+// the policy was stored before (prevTarget non-nil) under a different target,
+// that old mapping is dropped, so the route it left no longer resolves it, and
+// the old target name is returned; otherwise it returns "". The caller holds
+// the store lock.
+func indexPolicyRoute(index map[string][]string, ns, pNsName string, prevTarget *string, target string) (movedFrom string) {
+	if prevTarget != nil && *prevTarget != target {
+		unindexPolicyRoute(index, ns+"/"+*prevTarget, pNsName)
+		movedFrom = *prevTarget
+	}
+	route := ns + "/" + target
+	index[route] = addUnique(index[route], pNsName)
+	return movedFrom
+}
+
+// unindexPolicyRoute removes policy pNsName from route in index, dropping the
+// route's entry once it is empty. The caller holds the store lock.
+func unindexPolicyRoute(index map[string][]string, route, pNsName string) {
+	if rest := removeElem(index[route], pNsName); len(rest) > 0 {
+		index[route] = rest
+	} else {
+		delete(index, route)
+	}
 }
 
 func addUnique(slice []string, elem string) []string {

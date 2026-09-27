@@ -19,6 +19,7 @@ import (
 	"strconv"
 
 	"github.com/vmware/alb-sdk/go/models"
+	"google.golang.org/protobuf/proto"
 
 	akogatewayapiaigateway "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/aigateway"
 	akogatewayapilib "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/lib"
@@ -63,6 +64,9 @@ func (o *AviObjectGraph) ApplyModelRoutePolicy(key string, policy *akogatewayapi
 		return
 	}
 	listenerProtocol := listeners[0].Protocol
+	// The Tier-1 (VPC) path of this child VS: every pool of every tier, node-graph
+	// or REST-authored, must carry the same one (see aigateway/tier1.go).
+	tier1LR := akogatewayapiaigateway.GatewayTier1LR(key, parentNsName)
 
 	// Build one Pool Group per tier and collect tier→PG-name for the DataScript.
 	tierPG := make(map[string]string, len(policy.Spec.Tiers))
@@ -70,12 +74,18 @@ func (o *AviObjectGraph) ApplyModelRoutePolicy(key string, policy *akogatewayapi
 	remotes := make(map[string]*akogatewayapiaigateway.RemoteRuntime)
 	var pgRefNames []string
 	for _, tier := range policy.Spec.Tiers {
+		// Per-tier rules (backendTLS only on Service tiers, backendRef.namespace
+		// only on Service tiers): a violation skips this tier, not the policy.
+		if err := akogatewayapiaigateway.ValidateTierBackend(policy.Namespace, tier); err != nil {
+			utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: %v; skipping tier", key, policy.Namespace, policy.Name, tier.Name, err)
+			continue
+		}
 		// External-provider tier (e.g. Gemini): AKO authors an FQDN pool + pool
 		// group over REST (backend TLS/SNI); the DataScript rewrites path/Host and
 		// injects the key. No node-graph pool — the DataScript selects the REST PG
 		// by name (declared in pool_group_refs).
 		if tier.IsProvider() {
-			rt, err := akogatewayapiaigateway.EnsureProviderTier(key, policy, tier)
+			rt, err := akogatewayapiaigateway.EnsureProviderTier(key, policy, tier, tier1LR)
 			if err != nil {
 				utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: provider setup failed: %v", key, policy.Namespace, policy.Name, tier.Name, err)
 				continue
@@ -90,7 +100,7 @@ func (o *AviObjectGraph) ApplyModelRoutePolicy(key string, policy *akogatewayapi
 		// REST, selected by the DataScript — but the SE resolves a peer VIP rather
 		// than a vendor's rotating addresses, and nothing is rewritten except Host.
 		if tier.IsRemote() {
-			rt, err := akogatewayapiaigateway.EnsureRemoteTier(key, policy, tier)
+			rt, err := akogatewayapiaigateway.EnsureRemoteTier(key, policy, tier, tier1LR)
 			if err != nil {
 				utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: remote setup failed: %v", key, policy.Namespace, policy.Name, tier.Name, err)
 				continue
@@ -118,8 +128,24 @@ func (o *AviObjectGraph) ApplyModelRoutePolicy(key string, policy *akogatewayapi
 			// A core Service tier: members come from the Service's endpoints, so a
 			// selectorless Service + manual EndpointSlice can front infrastructure
 			// outside the cluster (GPU VMs, bare metal) as a first-class tier.
-			o.buildModelRouteServicePool(key, policy.Namespace, policy.Name, tier.Name, tier.BackendRef.Name,
-				parentNs, parentName, routeModel, childVsNode, listenerProtocol, PG)
+			//
+			// The Service may live in another namespace when a ReferenceGrant there
+			// allows it; without one the tier is skipped — never retried against a
+			// same-named Service in the policy namespace.
+			backendNs, err := akogatewayapiaigateway.ServiceTierBackendNamespace(policy, tier)
+			if err != nil {
+				utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: %v; skipping tier", key, policy.Namespace, policy.Name, tier.Name, err)
+				continue
+			}
+			// backendTLS must resolve completely (grants, Secrets, keys) or the tier
+			// is skipped: an mTLS backend is never handed a plaintext pool.
+			tlsMaterial, err := akogatewayapiaigateway.ResolveBackendTLS(policy, tier, backendNs)
+			if err != nil {
+				utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: backendTLS: %v; skipping tier (no plaintext fallback)", key, policy.Namespace, policy.Name, tier.Name, err)
+				continue
+			}
+			o.buildModelRouteServicePool(key, policy.Namespace, policy.Name, tier.Name, backendNs, tier.BackendRef.Name,
+				parentNs, parentName, parentNsName, routeModel, childVsNode, listenerProtocol, PG, tlsMaterial)
 		} else {
 			hb := &HTTPBackend{Backend: &Backend{
 				Name:      tier.BackendRef.Name,
@@ -172,32 +198,38 @@ func attachModelRoutePoolGroup(childVsNode *nodes.AviEvhVsNode, PG *nodes.AviPoo
 // and adds it to the tier's Pool Group. Members come from the Service's endpoints
 // (PopulateServers), so a selectorless Service backed by a manual EndpointSlice
 // exposes out-of-cluster serving infrastructure (GPU VMs, bare metal) as a tier.
-func (o *AviObjectGraph) buildModelRouteServicePool(key, policyNs, policyName, tierName, svcName string,
-	parentNs, parentName string, routeModel RouteModel, childVsNode *nodes.AviEvhVsNode,
-	listenerProtocol string, PG *nodes.AviPoolGroupNode) {
-	svcObj, err := utils.GetInformers().ServiceInformer.Lister().Services(policyNs).Get(svcName)
+//
+// backendNs is the Service's namespace — the policy's own, or another one a
+// ReferenceGrant admitted. Every lookup, the pool name and the ServiceMetadata
+// use it, so the pool is keyed to the Service it really fronts and NodePortLocal
+// resolves the right pods. tlsMaterial (nil = plaintext) makes the pool TLS /
+// mTLS to the backend (see applyModelTierBackendTLS).
+func (o *AviObjectGraph) buildModelRouteServicePool(key, policyNs, policyName, tierName, backendNs, svcName string,
+	parentNs, parentName, parentNsName string, routeModel RouteModel, childVsNode *nodes.AviEvhVsNode,
+	listenerProtocol string, PG *nodes.AviPoolGroupNode, tlsMaterial *akogatewayapiaigateway.BackendTLSMaterial) {
+	svcObj, err := utils.GetInformers().ServiceInformer.Lister().Services(backendNs).Get(svcName)
 	if err != nil {
-		utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: service %s/%s not found: %v", key, policyNs, policyName, tierName, policyNs, svcName, err)
+		utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: service %s/%s not found: %v", key, policyNs, policyName, tierName, backendNs, svcName, err)
 		return
 	}
 	if len(svcObj.Spec.Ports) == 0 {
-		utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: service %s/%s has no ports", key, policyNs, policyName, tierName, policyNs, svcName)
+		utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: service %s/%s has no ports", key, policyNs, policyName, tierName, backendNs, svcName)
 		return
 	}
 	port := svcObj.Spec.Ports[0].Port
 	poolName := akogatewayapilib.GetPoolName(parentNs, parentName,
 		routeModel.GetNamespace(), routeModel.GetName(),
 		"aimr-"+policyName+"-"+tierName,
-		policyNs, svcName, strconv.Itoa(int(port)))
+		backendNs, svcName, strconv.Itoa(int(port)))
 	poolNode := &nodes.AviPoolNode{
 		Name:       poolName,
 		Tenant:     childVsNode.Tenant,
 		Protocol:   listenerProtocol,
-		PortName:   akogatewayapilib.FindPortName(svcName, policyNs, port, key),
-		TargetPort: akogatewayapilib.FindTargetPort(svcName, policyNs, port, key),
+		PortName:   akogatewayapilib.FindPortName(svcName, backendNs, port, key),
+		TargetPort: akogatewayapilib.FindTargetPort(svcName, backendNs, port, key),
 		Port:       port,
 		ServiceMetadata: lib.ServiceMetadataObj{
-			NamespaceServiceName: []string{policyNs + "/" + svcName},
+			NamespaceServiceName: []string{backendNs + "/" + svcName},
 		},
 		VrfContext: lib.GetVrf(),
 	}
@@ -206,27 +238,48 @@ func (o *AviObjectGraph) buildModelRouteServicePool(key, policyNs, policyName, t
 		GatewayNamespace:   parentNs,
 		HTTPRouteName:      routeModel.GetName(),
 		HTTPRouteNamespace: routeModel.GetNamespace(),
-		BackendNs:          policyNs,
+		BackendNs:          backendNs,
 		BackendName:        svcName,
+	}
+	// NSX-T / VPC clouds: a pool must carry the Tier-1 (or VPC) path, else the Controller
+	// rejects it with "Tier 1 cannot be derived from vrf". Same resolution as BuildPGPool
+	// and the REST-authored tier pools: the AKO-wide T1LR, overridden by an accepted
+	// AviInfraSetting bound to the Gateway.
+	if t1LR := akogatewayapiaigateway.GatewayTier1LR(key, parentNsName); t1LR != "" {
+		poolNode.T1Lr = t1LR
+		poolNode.VrfContext = ""
 	}
 	poolNode.NetworkPlacementSettings = lib.GetNodeNetworkMap()
 	serviceType := lib.GetServiceType()
-	if serviceType == lib.NodePortLocal {
-		if servers := nodes.PopulateServersForNPL(poolNode, policyNs, svcName, false, key); servers != nil {
+	if serviceType == lib.NodePortLocal && len(svcObj.Spec.Selector) == 0 {
+		// Selectorless Service = off-cluster tier backend via a hand-written EndpointSlice;
+		// NodePortLocal has no pods to map for it, so use the endpoints as-is (ClusterIP mode).
+		utils.AviLog.Infof("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: service %s/%s has no selector; populating servers from its endpoints instead of NodePortLocal", key, policyNs, policyName, tierName, backendNs, svcName)
+		if servers := nodes.PopulateServers(poolNode, backendNs, svcName, false, key); servers != nil {
+			poolNode.Servers = servers
+		}
+	} else if serviceType == lib.NodePortLocal {
+		if servers := nodes.PopulateServersForNPL(poolNode, backendNs, svcName, false, key); servers != nil {
 			poolNode.Servers = servers
 		}
 	} else if serviceType == lib.NodePort {
-		if servers := nodes.PopulateServersForNodePort(poolNode, policyNs, svcName, false, key); servers != nil {
+		if servers := nodes.PopulateServersForNodePort(poolNode, backendNs, svcName, false, key); servers != nil {
 			poolNode.Servers = servers
 		}
 	} else {
-		if servers := nodes.PopulateServers(poolNode, policyNs, svcName, false, key); servers != nil {
+		if servers := nodes.PopulateServers(poolNode, backendNs, svcName, false, key); servers != nil {
 			poolNode.Servers = servers
 		}
 	}
 	if len(poolNode.Servers) == 0 {
-		utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: service %s/%s has no endpoints", key, policyNs, policyName, tierName, policyNs, svcName)
+		utils.AviLog.Warnf("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: service %s/%s has no endpoints", key, policyNs, policyName, tierName, backendNs, svcName)
 		return
+	}
+	if tlsMaterial != nil {
+		applyModelTierBackendTLS(key, childVsNode, poolNode, tlsMaterial)
+		utils.AviLog.Infof("key: %s, msg: AIModelRoutePolicy %s/%s tier %q: pool %s speaks TLS to %s/%s (sni=%q, hostCheck=%t, pki=%t, clientCert=%t)",
+			key, policyNs, policyName, tierName, poolNode.Name, backendNs, svcName, tlsMaterial.SNI, tlsMaterial.HostCheck,
+			poolNode.PkiProfile != nil, poolNode.SslKeyAndCertificateRef != nil)
 	}
 	if childVsNode.CheckPoolNChecksum(poolNode.Name, poolNode.GetCheckSum()) {
 		childVsNode.ReplaceEvhPoolInEVHNode(poolNode, key)
@@ -234,6 +287,121 @@ func (o *AviObjectGraph) buildModelRouteServicePool(key, policyNs, policyName, t
 	poolRef := fmt.Sprintf("/api/pool?name=%s", poolNode.Name)
 	ratio := uint32(1)
 	PG.Members = append(PG.Members, &models.PoolGroupMember{PoolRef: &poolRef, Ratio: &ratio})
+}
+
+// applyModelTierBackendTLS turns a tier pool into a TLS (optionally mutual TLS)
+// pool, reusing the node-graph objects AKO already manages for backend TLS:
+//
+//   - ssl_profile_ref = System-Standard (lib.DefaultPoolSSLProfile), sni_enabled,
+//     server_name = sni, host_check_enabled (+ domain_name = [sni]) — the pool
+//     fields RouteBackendExtension.backendTLS and route re-encrypt set;
+//   - PKI profile = the pool's PkiProfile node (named lib.GetPoolPKIProfileName),
+//     created/updated/deleted with the pool by the REST layer's PkiProfileCU;
+//   - client certificate = TLSKeyCert nodes on the child VS's CACertRefs (the
+//     leaf, type VIRTUALSERVICE, linked to its intermediates, type CA), named
+//     after the pool (modelTierClientCertName) and created, checksum-updated and
+//     deleted with the child VS by KeyCertCU/SSLKeyCertDelete.
+//     They are deliberately not SSLKeyCertRefs: those become the VS's own
+//     server certificates.
+func applyModelTierBackendTLS(key string, childVsNode *nodes.AviEvhVsNode, poolNode *nodes.AviPoolNode,
+	m *akogatewayapiaigateway.BackendTLSMaterial) {
+	poolNode.SniEnabled = true
+	poolNode.SslProfileRef = proto.String(fmt.Sprintf("/api/sslprofile?name=%s", lib.DefaultPoolSSLProfile))
+	if m.SNI != "" {
+		poolNode.ServerName = proto.String(m.SNI)
+	}
+	poolNode.HostCheckEnabled = proto.Bool(m.HostCheck)
+	if m.HostCheck && m.SNI != "" {
+		poolNode.DomainName = []string{m.SNI}
+	}
+	if m.CABundle != "" {
+		poolNode.PkiProfile = &nodes.AviPkiProfileNode{
+			Name:       lib.GetPoolPKIProfileName(poolNode.Name),
+			Tenant:     poolNode.Tenant,
+			CACert:     m.CABundle,
+			AviMarkers: poolNode.AviMarkers,
+		}
+	}
+	if m.ClientCert != nil {
+		leafName := attachModelTierClientCert(key, childVsNode, poolNode.Name, m.ClientCert, poolNode.AviMarkers)
+		poolNode.SslKeyAndCertificateRef = proto.String("/api/sslkeyandcertificate?name=" + leafName)
+	}
+}
+
+// modelTierClientCertName names the Avi SSLKeyAndCertificate AKO authors for a
+// tier client certificate. It is deterministic in (pool, Secret) and follows the
+// pool exactly, as GetPoolPKIProfileName does: the tier pool is named per route
+// (not per rule), so every rule's child VS of a multi-rule HTTPRoute builds the
+// same pool — and must point it at the same certificate. Keying the name on the
+// child VS instead made each child re-point the shared pool at its own copy and,
+// after a restart, delete the copy another child's pool still referenced. Each
+// child VS carries an identical node, which replaceModelTierCertNode dedups.
+// The readable form (when enabled) shows only the Secret. index 0 is the leaf;
+// index i > 0 is the i-th certificate after the leaf in tls.crt (an intermediate CA).
+func modelTierClientCertName(poolName, secretNs, secretName string, index int) string {
+	s := poolName + "/aimr-clientcert/" + secretNs + "/" + secretName
+	hint := "aimr-clientcert-" + secretNs + "-" + secretName
+	if index > 0 {
+		s = fmt.Sprintf("%s/ca%d", s, index)
+		hint = fmt.Sprintf("%s-ca%d", hint, index)
+	}
+	return lib.EncodeWithHint(s, hint, lib.SSLKeyCert)
+}
+
+// attachModelTierClientCert adds the client certificate (and its intermediates)
+// to the child VS as TLSKeyCert nodes and returns the leaf's name. The leaf links
+// its issuer (ca_certs), each intermediate links the next, so the SE sends the
+// chain. Issuers are placed first: KeyCertCU emits creates in slice order and a
+// certificate's CA must exist before it is referenced. poolName is the pool that
+// presents the certificate; the names derive from it (see modelTierClientCertName).
+func attachModelTierClientCert(key string, childVsNode *nodes.AviEvhVsNode, poolName string,
+	cc *akogatewayapiaigateway.ClientCertMaterial, markers utils.AviObjectMarkers) string {
+	leafName := modelTierClientCertName(poolName, cc.SecretNamespace, cc.SecretName, 0)
+	chainNames := make([]string, len(cc.ChainPEM))
+	for i := range cc.ChainPEM {
+		chainNames[i] = modelTierClientCertName(poolName, cc.SecretNamespace, cc.SecretName, i+1)
+	}
+	// Top of the chain first.
+	for i := len(cc.ChainPEM) - 1; i >= 0; i-- {
+		caNode := &nodes.AviTLSKeyCertNode{
+			Name:       chainNames[i],
+			Tenant:     childVsNode.Tenant,
+			Type:       lib.CertTypeCA,
+			Cert:       []byte(cc.ChainPEM[i]),
+			AviMarkers: markers,
+		}
+		if i+1 < len(chainNames) {
+			caNode.CACert = chainNames[i+1]
+		}
+		replaceModelTierCertNode(childVsNode, caNode)
+	}
+	leaf := &nodes.AviTLSKeyCertNode{
+		Name:       leafName,
+		Tenant:     childVsNode.Tenant,
+		Type:       lib.CertTypeVS,
+		Cert:       []byte(cc.LeafPEM),
+		Key:        []byte(cc.KeyPEM),
+		AviMarkers: markers,
+	}
+	if len(chainNames) > 0 {
+		leaf.CACert = chainNames[0]
+	}
+	replaceModelTierCertNode(childVsNode, leaf)
+	utils.AviLog.Debugf("key: %s, msg: child VS %s: client certificate %s from Secret %s/%s (%d intermediates)",
+		key, childVsNode.Name, leafName, cc.SecretNamespace, cc.SecretName, len(chainNames))
+	return leafName
+}
+
+// replaceModelTierCertNode adds cert to the child VS's CACertRefs, replacing a
+// same-named node in place (a rebuild of the same pool's certificate).
+func replaceModelTierCertNode(childVsNode *nodes.AviEvhVsNode, cert *nodes.AviTLSKeyCertNode) {
+	for i, existing := range childVsNode.CACertRefs {
+		if existing.Name == cert.Name {
+			childVsNode.CACertRefs[i] = cert
+			return
+		}
+	}
+	childVsNode.CACertRefs = append(childVsNode.CACertRefs, cert)
 }
 
 // attachModelRouteDS adds (or replaces by name) a model-route DataScript on the

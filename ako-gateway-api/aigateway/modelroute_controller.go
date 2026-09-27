@@ -15,10 +15,8 @@
 package aigateway
 
 import (
-	"context"
 	"fmt"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
@@ -52,28 +50,44 @@ func (s *PolicyStore) GetModelRoutePoliciesForRoute(routeNsName string) []*AIMod
 	return out
 }
 
+// AllModelRoutePolicies returns every stored AIModelRoutePolicy (any order).
+func (s *PolicyStore) AllModelRoutePolicies() []*AIModelRoutePolicy {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*AIModelRoutePolicy, 0, len(s.modelRoutePolicyByNsName))
+	for _, p := range s.modelRoutePolicyByNsName {
+		out = append(out, p)
+	}
+	return out
+}
+
 // upsertModelRoutePolicy stores the policy and updates route→policy mappings.
-func (s *PolicyStore) upsertModelRoutePolicy(p *AIModelRoutePolicy) {
+// It returns the targetRef name the policy left, or "".
+func (s *PolicyStore) upsertModelRoutePolicy(p *AIModelRoutePolicy) (movedFrom string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pNsName := p.Namespace + "/" + p.Name
+	var prevTarget *string
+	if prev := s.modelRoutePolicyByNsName[pNsName]; prev != nil {
+		prevTarget = &prev.Spec.TargetRef.Name
+	}
 	s.modelRoutePolicyByNsName[pNsName] = p
-	routeNsName := p.Namespace + "/" + p.Spec.TargetRef.Name
-	s.routeToModelRoutePolicies[routeNsName] = addUnique(s.routeToModelRoutePolicies[routeNsName], pNsName)
+	return indexPolicyRoute(s.routeToModelRoutePolicies, p.Namespace, pNsName, prevTarget, p.Spec.TargetRef.Name)
 }
 
 // deleteModelRoutePolicy removes the policy and cleans route→policy mappings.
-func (s *PolicyStore) deleteModelRoutePolicy(ns, name string) {
+// It returns the removed policy, or nil if it was not stored.
+func (s *PolicyStore) deleteModelRoutePolicy(ns, name string) *AIModelRoutePolicy {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pNsName := ns + "/" + name
 	p, ok := s.modelRoutePolicyByNsName[pNsName]
 	if !ok {
-		return
+		return nil
 	}
-	routeNsName := p.Namespace + "/" + p.Spec.TargetRef.Name
-	s.routeToModelRoutePolicies[routeNsName] = removeElem(s.routeToModelRoutePolicies[routeNsName], pNsName)
+	unindexPolicyRoute(s.routeToModelRoutePolicies, p.Namespace+"/"+p.Spec.TargetRef.Name, pNsName)
 	delete(s.modelRoutePolicyByNsName, pNsName)
+	return p
 }
 
 // ─── Event handlers ────────────────────────────────────────────────────────────
@@ -93,26 +107,26 @@ func SetupModelRoutePolicyEventHandlers(
 			if !ok {
 				return
 			}
-			p, err := parseModelRoutePolicy(dynamicClient, u.GetNamespace(), u.GetName())
+			p, err := parseModelRoutePolicy(dynamicClient, u)
 			if err != nil {
 				utils.AviLog.Warnf("AIModelRoutePolicy add: failed to parse %s/%s: %v", u.GetNamespace(), u.GetName(), err)
 				return
 			}
-			SharedPolicyStore().upsertModelRoutePolicy(p)
-			enqueueTargetRoute(p.Namespace, p.Spec.TargetRef.Name, lib.AIModelRoutePolicy, workqueues, numWorkers)
+			movedFrom := SharedPolicyStore().upsertModelRoutePolicy(p)
+			enqueuePolicyRoutes(p.Namespace, p.Spec.TargetRef.Name, movedFrom, lib.AIModelRoutePolicy, workqueues, numWorkers)
 		},
 		UpdateFunc: func(_, newObj interface{}) {
 			u, ok := toUnstructured(newObj)
 			if !ok {
 				return
 			}
-			p, err := parseModelRoutePolicy(dynamicClient, u.GetNamespace(), u.GetName())
+			p, err := parseModelRoutePolicy(dynamicClient, u)
 			if err != nil {
 				utils.AviLog.Warnf("AIModelRoutePolicy update: failed to parse %s/%s: %v", u.GetNamespace(), u.GetName(), err)
 				return
 			}
-			SharedPolicyStore().upsertModelRoutePolicy(p)
-			enqueueTargetRoute(p.Namespace, p.Spec.TargetRef.Name, lib.AIModelRoutePolicy, workqueues, numWorkers)
+			movedFrom := SharedPolicyStore().upsertModelRoutePolicy(p)
+			enqueuePolicyRoutes(p.Namespace, p.Spec.TargetRef.Name, movedFrom, lib.AIModelRoutePolicy, workqueues, numWorkers)
 		},
 		DeleteFunc: func(obj interface{}) {
 			u, ok := toUnstructured(obj)
@@ -128,36 +142,29 @@ func SetupModelRoutePolicyEventHandlers(
 				}
 			}
 			ns, name := u.GetNamespace(), u.GetName()
-			ps := SharedPolicyStore()
-			pNsName := ns + "/" + name
-			ps.mu.RLock()
-			p := ps.modelRoutePolicyByNsName[pNsName]
-			ps.mu.RUnlock()
-			if p != nil {
-				// Re-enqueue before deleting so the translator sees the last targetRef.
+			// Remove from the store first, then re-enqueue the route the removed
+			// policy targeted: a rebuild that still saw the policy would re-apply
+			// its tiers (and re-create the pools torn down below).
+			if p := SharedPolicyStore().deleteModelRoutePolicy(ns, name); p != nil {
 				enqueueTargetRoute(ns, p.Spec.TargetRef.Name, lib.AIModelRoutePolicy, workqueues, numWorkers)
 				// Tear down any AKO-authored FQDN pools/pool groups (external providers
 				// and remote-site peers); node-graph tiers are cleaned by the translator.
 				DeleteProviderTiers("AIModelRoutePolicy/"+ns+"/"+name, p)
 				DeleteRemoteTiers("AIModelRoutePolicy/"+ns+"/"+name, p)
 			}
-			ps.deleteModelRoutePolicy(ns, name)
 		},
 	}
-	informer.Informer().AddEventHandler(handler)
+	// Tracked so startup can wait until this handler has put every
+	// existing policy in the store before any route is translated.
+	reg, err := informer.Informer().AddEventHandler(handler)
+	trackPolicyHandler(lib.AIModelRoutePolicy, reg, err)
 }
 
 // ─── Parsing ───────────────────────────────────────────────────────────────────
 
 // parseModelRoutePolicy fetches and parses an AIModelRoutePolicy from the API server.
-func parseModelRoutePolicy(client dynamic.Interface, ns, name string) (*AIModelRoutePolicy, error) {
-	obj, err := client.Resource(AIModelRoutePolicyGVR).Namespace(ns).Get(
-		context.TODO(), name, metav1.GetOptions{},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("get AIModelRoutePolicy %s/%s: %w", ns, name, err)
-	}
-	return unstructuredToModelRoutePolicy(obj)
+func parseModelRoutePolicy(client dynamic.Interface, u *unstructured.Unstructured) (*AIModelRoutePolicy, error) {
+	return unstructuredToModelRoutePolicy(livePolicyObject(client, AIModelRoutePolicyGVR, lib.AIModelRoutePolicy, u))
 }
 
 // unstructuredToModelRoutePolicy converts an unstructured object to AIModelRoutePolicy.
@@ -208,6 +215,12 @@ func unstructuredToModelRoutePolicy(obj *unstructured.Unstructured) (*AIModelRou
 			}
 			if v, _, _ := unstructured.NestedString(tm, "backendRef", "name"); v != "" {
 				tier.BackendRef.Name = v
+			}
+			if v, _, _ := unstructured.NestedString(tm, "backendRef", "namespace"); v != "" {
+				tier.BackendRef.Namespace = v
+			}
+			if bt, found, _ := unstructured.NestedMap(tm, "backendTLS"); found {
+				tier.BackendTLS = parseModelBackendTLS(bt)
 			}
 			if pv, found, _ := unstructured.NestedMap(tm, "provider"); found {
 				prov := &ModelProvider{}
@@ -330,4 +343,30 @@ func unstructuredToModelRoutePolicy(obj *unstructured.Unstructured) (*AIModelRou
 	}
 
 	return p, nil
+}
+
+// parseModelBackendTLS reads a tier's backendTLS block. Only references are
+// read here; the Secrets themselves are resolved at translation time.
+func parseModelBackendTLS(bt map[string]interface{}) *ModelBackendTLS {
+	out := &ModelBackendTLS{}
+	if v, _, _ := unstructured.NestedString(bt, "sni"); v != "" {
+		out.SNI = v
+	}
+	if v, found, _ := unstructured.NestedBool(bt, "hostCheck"); found {
+		out.HostCheck = v
+	}
+	if ca, found, _ := unstructured.NestedMap(bt, "caSecretRef"); found {
+		ref := &BackendTLSCASecretRef{}
+		ref.Name, _, _ = unstructured.NestedString(ca, "name")
+		ref.Namespace, _, _ = unstructured.NestedString(ca, "namespace")
+		ref.Key, _, _ = unstructured.NestedString(ca, "key")
+		out.CASecretRef = ref
+	}
+	if cc, found, _ := unstructured.NestedMap(bt, "clientCertificateSecretRef"); found {
+		ref := &BackendTLSSecretRef{}
+		ref.Name, _, _ = unstructured.NestedString(cc, "name")
+		ref.Namespace, _, _ = unstructured.NestedString(cc, "namespace")
+		out.ClientCertificateSecretRef = ref
+	}
+	return out
 }

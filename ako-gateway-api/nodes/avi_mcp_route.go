@@ -15,6 +15,8 @@
 package nodes
 
 import (
+	"fmt"
+
 	akogatewayapiaigateway "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/aigateway"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/internal/nodes"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/pkg/utils"
@@ -41,6 +43,13 @@ func ApplyMCPRoutePolicy(key string, policy *akogatewayapiaigateway.AIMCPRoutePo
 	}
 	if err := policy.Spec.Validate(); err != nil {
 		utils.AviLog.Warnf("key: %s, msg: AIMCPRoutePolicy %s/%s invalid, skipping: %v", key, policy.Namespace, policy.Name, err)
+		// A policy that asks for auth must not leave the route open because some
+		// other part of it is invalid: fail closed until it is fixed.
+		if policy.Spec.AuthRef != nil {
+			akogatewayapiaigateway.DenyUnauthenticated(key, childVsNode,
+				fmt.Sprintf("AIMCPRoutePolicy %s/%s declares an authRef but is invalid: %v",
+					policy.Namespace, policy.Name, err))
+		}
 		return
 	}
 
@@ -64,8 +73,12 @@ func ApplyMCPRoutePolicy(key string, policy *akogatewayapiaigateway.AIMCPRoutePo
 		if authPolicy != nil {
 			akogatewayapiaigateway.ApplyAuthPolicy(key, authPolicy, childVsNode, authHost, routePrefix)
 		} else {
-			utils.AviLog.Warnf("key: %s, msg: AIMCPRoutePolicy %s/%s authRef %q not found; MCP route left unauthenticated",
-				key, policy.Namespace, policy.Name, policy.Spec.AuthRef.Name)
+			// The policy asks for auth that cannot be applied: fail closed rather
+			// than serve the MCP route unauthenticated. The guard retries the route
+			// and is removed once the referenced policy exists and realizes.
+			akogatewayapiaigateway.DenyUnauthenticated(key, childVsNode,
+				fmt.Sprintf("AIMCPRoutePolicy %s/%s authRef %q not found",
+					policy.Namespace, policy.Name, policy.Spec.AuthRef.Name))
 		}
 	}
 

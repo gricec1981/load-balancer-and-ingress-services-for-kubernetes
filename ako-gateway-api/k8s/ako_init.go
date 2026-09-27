@@ -34,6 +34,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
+	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/aigateway"
 	akogatewayapilib "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/lib"
 	akogatewayapinodes "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/nodes"
 	akogatewayapistatus "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/status"
@@ -254,6 +255,16 @@ func (c *GatewayController) FullSyncK8s(sync bool) error {
 	if c.DisableSync {
 		utils.AviLog.Infof("Sync disabled, skipping full sync")
 		return nil
+	}
+
+	// A route translated before the AI policy store holds its policies is
+	// built without SSO policy / DataScripts and served unauthenticated.
+	// Start waits for the store; refuse rather than build on a partial one.
+	if lib.IsAIGatewayEnabled() && !aigateway.PolicyStoreSynced() {
+		err := fmt.Errorf("AI gateway policy store not yet populated (%s); refusing to translate routes",
+			strings.Join(aigateway.PolicyStoreUnsyncedKinds(), ", "))
+		utils.AviLog.Errorf("%v", err)
+		return err
 	}
 
 	// GatewayClass Section

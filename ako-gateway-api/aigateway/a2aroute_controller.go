@@ -15,10 +15,8 @@
 package aigateway
 
 import (
-	"context"
 	"fmt"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
@@ -45,27 +43,32 @@ func (s *PolicyStore) GetA2ARoutePoliciesForRoute(routeNsName string) []*AIA2ARo
 }
 
 // upsertA2ARoutePolicy stores the policy and updates route→policy mappings.
-func (s *PolicyStore) upsertA2ARoutePolicy(p *AIA2ARoutePolicy) {
+// It returns the targetRef name the policy left, or "".
+func (s *PolicyStore) upsertA2ARoutePolicy(p *AIA2ARoutePolicy) (movedFrom string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pNsName := p.Namespace + "/" + p.Name
+	var prevTarget *string
+	if prev := s.a2aRoutePolicyByNsName[pNsName]; prev != nil {
+		prevTarget = &prev.Spec.TargetRef.Name
+	}
 	s.a2aRoutePolicyByNsName[pNsName] = p
-	routeNsName := p.Namespace + "/" + p.Spec.TargetRef.Name
-	s.routeToA2ARoutePolicies[routeNsName] = addUnique(s.routeToA2ARoutePolicies[routeNsName], pNsName)
+	return indexPolicyRoute(s.routeToA2ARoutePolicies, p.Namespace, pNsName, prevTarget, p.Spec.TargetRef.Name)
 }
 
 // deleteA2ARoutePolicy removes the policy and cleans route→policy mappings.
-func (s *PolicyStore) deleteA2ARoutePolicy(ns, name string) {
+// It returns the removed policy, or nil if it was not stored.
+func (s *PolicyStore) deleteA2ARoutePolicy(ns, name string) *AIA2ARoutePolicy {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pNsName := ns + "/" + name
 	p, ok := s.a2aRoutePolicyByNsName[pNsName]
 	if !ok {
-		return
+		return nil
 	}
-	routeNsName := p.Namespace + "/" + p.Spec.TargetRef.Name
-	s.routeToA2ARoutePolicies[routeNsName] = removeElem(s.routeToA2ARoutePolicies[routeNsName], pNsName)
+	unindexPolicyRoute(s.routeToA2ARoutePolicies, p.Namespace+"/"+p.Spec.TargetRef.Name, pNsName)
 	delete(s.a2aRoutePolicyByNsName, pNsName)
+	return p
 }
 
 // ─── Event handlers ───────────────────────────────────────────────────────────
@@ -85,26 +88,26 @@ func SetupA2ARoutePolicyEventHandlers(
 			if !ok {
 				return
 			}
-			p, err := parseA2ARoutePolicy(dynamicClient, u.GetNamespace(), u.GetName())
+			p, err := parseA2ARoutePolicy(dynamicClient, u)
 			if err != nil {
 				utils.AviLog.Warnf("AIA2ARoutePolicy add: failed to parse %s/%s: %v", u.GetNamespace(), u.GetName(), err)
 				return
 			}
-			SharedPolicyStore().upsertA2ARoutePolicy(p)
-			enqueueTargetRoute(p.Namespace, p.Spec.TargetRef.Name, lib.AIA2ARoutePolicy, workqueues, numWorkers)
+			movedFrom := SharedPolicyStore().upsertA2ARoutePolicy(p)
+			enqueuePolicyRoutes(p.Namespace, p.Spec.TargetRef.Name, movedFrom, lib.AIA2ARoutePolicy, workqueues, numWorkers)
 		},
 		UpdateFunc: func(_, newObj interface{}) {
 			u, ok := toUnstructured(newObj)
 			if !ok {
 				return
 			}
-			p, err := parseA2ARoutePolicy(dynamicClient, u.GetNamespace(), u.GetName())
+			p, err := parseA2ARoutePolicy(dynamicClient, u)
 			if err != nil {
 				utils.AviLog.Warnf("AIA2ARoutePolicy update: failed to parse %s/%s: %v", u.GetNamespace(), u.GetName(), err)
 				return
 			}
-			SharedPolicyStore().upsertA2ARoutePolicy(p)
-			enqueueTargetRoute(p.Namespace, p.Spec.TargetRef.Name, lib.AIA2ARoutePolicy, workqueues, numWorkers)
+			movedFrom := SharedPolicyStore().upsertA2ARoutePolicy(p)
+			enqueuePolicyRoutes(p.Namespace, p.Spec.TargetRef.Name, movedFrom, lib.AIA2ARoutePolicy, workqueues, numWorkers)
 		},
 		DeleteFunc: func(obj interface{}) {
 			u, ok := toUnstructured(obj)
@@ -120,31 +123,24 @@ func SetupA2ARoutePolicyEventHandlers(
 				}
 			}
 			ns, name := u.GetNamespace(), u.GetName()
-			ps := SharedPolicyStore()
-			pNsName := ns + "/" + name
-			ps.mu.RLock()
-			p := ps.a2aRoutePolicyByNsName[pNsName]
-			ps.mu.RUnlock()
-			if p != nil {
+			// Remove first, then re-enqueue the route the removed policy
+			// targeted: the rebuild must not see the policy.
+			if p := SharedPolicyStore().deleteA2ARoutePolicy(ns, name); p != nil {
 				enqueueTargetRoute(ns, p.Spec.TargetRef.Name, lib.AIA2ARoutePolicy, workqueues, numWorkers)
 			}
-			ps.deleteA2ARoutePolicy(ns, name)
 		},
 	}
-	informer.Informer().AddEventHandler(handler)
+	// Tracked so startup can wait until this handler has put every
+	// existing policy in the store before any route is translated.
+	reg, err := informer.Informer().AddEventHandler(handler)
+	trackPolicyHandler(lib.AIA2ARoutePolicy, reg, err)
 }
 
 // ─── Parsing ──────────────────────────────────────────────────────────────────
 
 // parseA2ARoutePolicy fetches and parses an AIA2ARoutePolicy from the API server.
-func parseA2ARoutePolicy(client dynamic.Interface, ns, name string) (*AIA2ARoutePolicy, error) {
-	obj, err := client.Resource(AIA2ARoutePolicyGVR).Namespace(ns).Get(
-		context.TODO(), name, metav1.GetOptions{},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("get AIA2ARoutePolicy %s/%s: %w", ns, name, err)
-	}
-	return unstructuredToA2ARoutePolicy(obj)
+func parseA2ARoutePolicy(client dynamic.Interface, u *unstructured.Unstructured) (*AIA2ARoutePolicy, error) {
+	return unstructuredToA2ARoutePolicy(livePolicyObject(client, AIA2ARoutePolicyGVR, lib.AIA2ARoutePolicy, u))
 }
 
 // unstructuredToA2ARoutePolicy converts an unstructured object to AIA2ARoutePolicy.
@@ -169,10 +165,9 @@ func unstructuredToA2ARoutePolicy(obj *unstructured.Unstructured) (*AIA2ARoutePo
 		p.Spec.TargetRef.Name = v
 	}
 
-	// authRef
-	if v, _, _ := unstructured.NestedString(spec, "authRef", "name"); v != "" {
-		p.Spec.AuthRef = &AuthPolicyRef{Name: v}
-	}
+	// authRef: a declared authRef survives even with an empty name, so the
+	// policy fails validation and the route fails closed (see authRefFromSpec).
+	p.Spec.AuthRef = authRefFromSpec(spec)
 
 	// agentCard
 	if ac, found, _ := unstructured.NestedMap(spec, "agentCard"); found {

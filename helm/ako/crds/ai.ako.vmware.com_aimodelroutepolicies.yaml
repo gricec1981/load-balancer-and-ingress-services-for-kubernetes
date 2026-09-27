@@ -107,6 +107,74 @@ spec:
                           - Service
                         name:
                           type: string
+                        namespace:
+                          description: |-
+                            Namespace of the backend; defaults to the policy namespace.
+                            Service backends only (InferencePool tiers stay in the policy
+                            namespace). A namespace other than the policy's is honoured only
+                            when a Gateway API ReferenceGrant in that namespace allows
+                            from {group: ai.ako.vmware.com, kind: AIModelRoutePolicy,
+                            namespace: <policy namespace>} to {group: "", kind: Service} (optionally
+                            naming the Service); without one the tier is skipped.
+                          type: string
+                    backendTLS:
+                      description: |-
+                        backendTLS makes the tier pool speak TLS — optionally mutual TLS —
+                        to its backend: AKO sets the pool's SSL profile (System-Standard),
+                        SNI, a PKI profile built from the CA bundle, and the client
+                        certificate as the pool's SSL key and certificate. Service tiers
+                        only; rejected (tier skipped) on provider, remote and InferencePool
+                        tiers. A tier whose Secrets, keys or ReferenceGrants do not resolve
+                        is skipped: no plaintext pool is ever built for it. Secrets in a
+                        namespace other than the policy's need a ReferenceGrant there to
+                        {group: "", kind: Secret}.
+                      type: object
+                      properties:
+                        sni:
+                          description: |-
+                            Server name sent in the TLS ClientHello (the pool's server_name).
+                            Omitted, the Service Engine sends the incoming Host header.
+                          type: string
+                        hostCheck:
+                          description: |-
+                            Verify the backend certificate's names against sni (requires
+                            sni). Default false: chain validation only.
+                          type: boolean
+                          default: false
+                        caSecretRef:
+                          description: |-
+                            Secret holding the PEM CA bundle the backend's server certificate
+                            must chain to. Every certificate in it is trusted, as is every
+                            intermediate that follows the leaf in the client certificate's
+                            tls.crt. Omitted, the server certificate is not validated.
+                          type: object
+                          required:
+                          - name
+                          properties:
+                            name:
+                              type: string
+                            namespace:
+                              description: Defaults to the backend's namespace.
+                              type: string
+                            key:
+                              description: Secret data key of the PEM bundle. Default ca.crt.
+                              type: string
+                              default: ca.crt
+                        clientCertificateSecretRef:
+                          description: |-
+                            kubernetes.io/tls Secret whose tls.crt (the leaf, optionally
+                            followed by its chain) and tls.key the Service Engine presents to
+                            the backend (mutual TLS). Rotating the Secret re-programs the Avi
+                            certificate objects.
+                          type: object
+                          required:
+                          - name
+                          properties:
+                            name:
+                              type: string
+                            namespace:
+                              description: Defaults to the backend's namespace.
+                              type: string
                     provider:
                       description: |-
                         provider routes this tier to an external OpenAI-compatible API

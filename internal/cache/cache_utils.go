@@ -42,6 +42,11 @@ type AviPoolCache struct {
 	LastModified         string
 	InvalidData          bool
 	HasReference         bool
+	// SSLKeyCertUUID is the pool's ssl_key_and_certificate_ref (the client
+	// certificate the SE presents to the servers, e.g. an AI Gateway backendTLS
+	// tier), "" when none. VS cache population folds it, with its CA chain, into
+	// the owning VS's SSLKeyCertCollection.
+	SSLKeyCertUUID string
 }
 
 type AviDSCache struct {

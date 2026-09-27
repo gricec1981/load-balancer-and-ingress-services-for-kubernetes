@@ -105,6 +105,7 @@ func (rest *RestOperations) AviPoolBuild(pool_meta *nodes.AviPoolNode, cache_obj
 		SslKeyAndCertificateRef: pool_meta.SslKeyAndCertificateRef,
 		PkiProfileRef:           pool_meta.PkiProfileRef,
 		HostCheckEnabled:        pool_meta.HostCheckEnabled,
+		ServerName:              pool_meta.ServerName,
 		//TODO: Deprecated in 31.2.1, replace with GracefulDisableTimeoutSeconds which is currently not supported by AVI SDK
 		GracefulDisableTimeout: proto.Int32(1),
 		PlacementNetworks:      placementNetworks,
@@ -335,6 +336,9 @@ func (rest *RestOperations) AviPoolCacheAdd(rest_op *utils.RestOp, vsKey avicach
 		}
 		if lastModifiedStr == "" {
 			pool_cache_obj.InvalidData = true
+		}
+		if sslRef, ok := resp["ssl_key_and_certificate_ref"].(string); ok && sslRef != "" {
+			pool_cache_obj.SSLKeyCertUUID = avicache.ExtractUUID(sslRef, "sslkeyandcertificate-.*.#")
 		}
 
 		rest.cache.PoolCache.AviCacheAdd(k, &pool_cache_obj)

@@ -313,6 +313,57 @@ func (c *AviObjCache) MarkReference(vsCacheObj *AviVsCache) {
 	}
 }
 
+// appendPoolClientCertKeys appends to sslKeys the SSL key-and-certificate each
+// of poolKeys presents to its servers (the pool's ssl_key_and_certificate_ref)
+// and that certificate's CA chain, skipping keys already present. Those
+// certificates are authored with the VS that owns the pools (AI Gateway
+// backendTLS tiers), so they must count as its references: MarkReference then
+// keeps them out of the stale-object sweep — which the Controller would refuse
+// anyway while a pool refers to them, failing the sweep — and a later model
+// without them deletes them.
+func (c *AviObjCache) appendPoolClientCertKeys(sslKeys, poolKeys []NamespaceName, tenant string) []NamespaceName {
+	has := func(k NamespaceName) bool {
+		for _, e := range sslKeys {
+			if e == k {
+				return true
+			}
+		}
+		return false
+	}
+	for _, poolKey := range poolKeys {
+		intf, found := c.PoolCache.AviCacheGet(poolKey)
+		if !found {
+			continue
+		}
+		poolObj, ok := intf.(*AviPoolCache)
+		if !ok || poolObj.SSLKeyCertUUID == "" {
+			continue
+		}
+		uuid := poolObj.SSLKeyCertUUID
+		// Leaf, then each issuer; bounded in case of a CA reference cycle.
+		for depth := 0; uuid != "" && depth < 8; depth++ {
+			name, found := c.SSLKeyCache.AviCacheGetNameByUuid(uuid)
+			if !found {
+				break
+			}
+			key := NamespaceName{Namespace: tenant, Name: name.(string)}
+			if !has(key) {
+				sslKeys = append(sslKeys, key)
+			}
+			sslIntf, found := c.SSLKeyCache.AviCacheGet(key)
+			if !found {
+				break
+			}
+			sslObj, ok := sslIntf.(*AviSSLCache)
+			if !ok {
+				break
+			}
+			uuid = sslObj.CACertUUID
+		}
+	}
+	return sslKeys
+}
+
 // DeleteUnmarked : Adds non referenced cached objects to a Dummy VS, which
 // would be used later to delete these objects from AVI Controller
 func (c *AviObjCache) DeleteUnmarked(childCollection map[string][]string) {
@@ -617,7 +668,7 @@ func (c *AviObjCache) AviPopulateAllPkiPRofiles(client *clients.AviClient, pkiDa
 			Name:             *pki.Name,
 			Uuid:             *pki.UUID,
 			Tenant:           getTenantFromTenantRef(*pki.TenantRef),
-			CloudConfigCksum: lib.SSLKeyCertChecksum(*pki.Name, string(*pki.CaCerts[0].Certificate), "", emptyIngestionMarkers, pki.Markers, true),
+			CloudConfigCksum: lib.SSLKeyCertChecksum(*pki.Name, lib.PKICACertsChecksumInput(pki.CaCerts), "", emptyIngestionMarkers, pki.Markers, true),
 		}
 		*pkiData = append(*pkiData, pkiCacheObj)
 
@@ -703,6 +754,9 @@ func (c *AviObjCache) AviPopulateAllPools(client *clients.AviClient, cloud strin
 			PersistenceProfile:   persistentProfileKey,
 			ServiceMetadataObj:   svc_mdata_obj,
 			LastModified:         *pool.LastModified,
+		}
+		if pool.SslKeyAndCertificateRef != nil {
+			poolCacheObj.SSLKeyCertUUID = ExtractUUID(*pool.SslKeyAndCertificateRef, "sslkeyandcertificate-.*.#")
 		}
 		*poolData = append(*poolData, poolCacheObj)
 	}
@@ -1234,7 +1288,7 @@ func (c *AviObjCache) AviPopulateOnePKICache(client *clients.AviClient,
 			Name:             *pkikey.Name,
 			Tenant:           tenant,
 			Uuid:             *pkikey.UUID,
-			CloudConfigCksum: lib.SSLKeyCertChecksum(*pkikey.Name, *pkikey.CaCerts[0].Certificate, "", emptyIngestionMarkers, pkikey.Markers, true),
+			CloudConfigCksum: lib.SSLKeyCertChecksum(*pkikey.Name, lib.PKICACertsChecksumInput(pkikey.CaCerts), "", emptyIngestionMarkers, pkikey.Markers, true),
 		}
 		k := NamespaceName{Namespace: tenant, Name: *pkikey.Name}
 		c.SSLKeyCache.AviCacheAdd(k, &sslCacheObj)
@@ -1367,6 +1421,9 @@ func (c *AviObjCache) AviPopulateOnePoolCache(client *clients.AviClient,
 			PersistenceProfile:   persistenceKey,
 			ServiceMetadataObj:   svc_mdata_obj,
 			LastModified:         *pool.LastModified,
+		}
+		if pool.SslKeyAndCertificateRef != nil {
+			poolCacheObj.SSLKeyCertUUID = ExtractUUID(*pool.SslKeyAndCertificateRef, "sslkeyandcertificate-.*.#")
 		}
 		k := NamespaceName{Namespace: tenant, Name: *pool.Name}
 		c.PoolCache.AviCacheAdd(k, &poolCacheObj)
@@ -2657,6 +2714,10 @@ func (c *AviObjCache) AviObjVSCachePopulate(client *clients.AviClient, cloud str
 					}
 				}
 
+				// Client certificates the VS's pools present to their servers belong to
+				// this VS too: kept by the stale sweep, deleted with it.
+				sslKeys = c.appendPoolClientCertKeys(sslKeys, poolKeys, tenant)
+
 				// Populate the vscache meta object here.
 				vsMetaObj := AviVsCache{
 					Name:                     vs["name"].(string),
@@ -2963,6 +3024,10 @@ func (c *AviObjCache) AviObjOneVSCachePopulate(client *clients.AviClient, cloud 
 						}
 					}
 				}
+				// Client certificates the VS's pools present to their servers belong to
+				// this VS too: kept by the stale sweep, deleted with it.
+				sslKeys = c.appendPoolClientCertKeys(sslKeys, poolKeys, tenant)
+
 				// Populate the vscache meta object here.
 				vsMetaObj := AviVsCache{
 					Name:                     vs["name"].(string),

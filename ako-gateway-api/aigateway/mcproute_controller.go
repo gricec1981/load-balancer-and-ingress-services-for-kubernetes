@@ -15,10 +15,8 @@
 package aigateway
 
 import (
-	"context"
 	"fmt"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
@@ -54,27 +52,32 @@ func (s *PolicyStore) GetAuthPolicyByNsName(ns, name string) *AIGatewayAuthPolic
 }
 
 // upsertMCPRoutePolicy stores the policy and updates route→policy mappings.
-func (s *PolicyStore) upsertMCPRoutePolicy(p *AIMCPRoutePolicy) {
+// It returns the targetRef name the policy left, or "".
+func (s *PolicyStore) upsertMCPRoutePolicy(p *AIMCPRoutePolicy) (movedFrom string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pNsName := p.Namespace + "/" + p.Name
+	var prevTarget *string
+	if prev := s.mcpRoutePolicyByNsName[pNsName]; prev != nil {
+		prevTarget = &prev.Spec.TargetRef.Name
+	}
 	s.mcpRoutePolicyByNsName[pNsName] = p
-	routeNsName := p.Namespace + "/" + p.Spec.TargetRef.Name
-	s.routeToMCPRoutePolicies[routeNsName] = addUnique(s.routeToMCPRoutePolicies[routeNsName], pNsName)
+	return indexPolicyRoute(s.routeToMCPRoutePolicies, p.Namespace, pNsName, prevTarget, p.Spec.TargetRef.Name)
 }
 
 // deleteMCPRoutePolicy removes the policy and cleans route→policy mappings.
-func (s *PolicyStore) deleteMCPRoutePolicy(ns, name string) {
+// It returns the removed policy, or nil if it was not stored.
+func (s *PolicyStore) deleteMCPRoutePolicy(ns, name string) *AIMCPRoutePolicy {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pNsName := ns + "/" + name
 	p, ok := s.mcpRoutePolicyByNsName[pNsName]
 	if !ok {
-		return
+		return nil
 	}
-	routeNsName := p.Namespace + "/" + p.Spec.TargetRef.Name
-	s.routeToMCPRoutePolicies[routeNsName] = removeElem(s.routeToMCPRoutePolicies[routeNsName], pNsName)
+	unindexPolicyRoute(s.routeToMCPRoutePolicies, p.Namespace+"/"+p.Spec.TargetRef.Name, pNsName)
 	delete(s.mcpRoutePolicyByNsName, pNsName)
+	return p
 }
 
 // ─── Event handlers ────────────────────────────────────────────────────────────
@@ -94,26 +97,26 @@ func SetupMCPRoutePolicyEventHandlers(
 			if !ok {
 				return
 			}
-			p, err := parseMCPRoutePolicy(dynamicClient, u.GetNamespace(), u.GetName())
+			p, err := parseMCPRoutePolicy(dynamicClient, u)
 			if err != nil {
 				utils.AviLog.Warnf("AIMCPRoutePolicy add: failed to parse %s/%s: %v", u.GetNamespace(), u.GetName(), err)
 				return
 			}
-			SharedPolicyStore().upsertMCPRoutePolicy(p)
-			enqueueTargetRoute(p.Namespace, p.Spec.TargetRef.Name, lib.AIMCPRoutePolicy, workqueues, numWorkers)
+			movedFrom := SharedPolicyStore().upsertMCPRoutePolicy(p)
+			enqueuePolicyRoutes(p.Namespace, p.Spec.TargetRef.Name, movedFrom, lib.AIMCPRoutePolicy, workqueues, numWorkers)
 		},
 		UpdateFunc: func(_, newObj interface{}) {
 			u, ok := toUnstructured(newObj)
 			if !ok {
 				return
 			}
-			p, err := parseMCPRoutePolicy(dynamicClient, u.GetNamespace(), u.GetName())
+			p, err := parseMCPRoutePolicy(dynamicClient, u)
 			if err != nil {
 				utils.AviLog.Warnf("AIMCPRoutePolicy update: failed to parse %s/%s: %v", u.GetNamespace(), u.GetName(), err)
 				return
 			}
-			SharedPolicyStore().upsertMCPRoutePolicy(p)
-			enqueueTargetRoute(p.Namespace, p.Spec.TargetRef.Name, lib.AIMCPRoutePolicy, workqueues, numWorkers)
+			movedFrom := SharedPolicyStore().upsertMCPRoutePolicy(p)
+			enqueuePolicyRoutes(p.Namespace, p.Spec.TargetRef.Name, movedFrom, lib.AIMCPRoutePolicy, workqueues, numWorkers)
 		},
 		DeleteFunc: func(obj interface{}) {
 			u, ok := toUnstructured(obj)
@@ -129,32 +132,38 @@ func SetupMCPRoutePolicyEventHandlers(
 				}
 			}
 			ns, name := u.GetNamespace(), u.GetName()
-			ps := SharedPolicyStore()
-			pNsName := ns + "/" + name
-			ps.mu.RLock()
-			p := ps.mcpRoutePolicyByNsName[pNsName]
-			ps.mu.RUnlock()
-			if p != nil {
-				// Re-enqueue before deleting so the translator sees the last targetRef.
+			// Remove first, then re-enqueue the route the removed policy
+			// targeted: the rebuild must not see the policy.
+			if p := SharedPolicyStore().deleteMCPRoutePolicy(ns, name); p != nil {
 				enqueueTargetRoute(ns, p.Spec.TargetRef.Name, lib.AIMCPRoutePolicy, workqueues, numWorkers)
 			}
-			ps.deleteMCPRoutePolicy(ns, name)
 		},
 	}
-	informer.Informer().AddEventHandler(handler)
+	// Tracked so startup can wait until this handler has put every
+	// existing policy in the store before any route is translated.
+	reg, err := informer.Informer().AddEventHandler(handler)
+	trackPolicyHandler(lib.AIMCPRoutePolicy, reg, err)
 }
 
 // ─── Parsing ───────────────────────────────────────────────────────────────────
 
 // parseMCPRoutePolicy fetches and parses an AIMCPRoutePolicy from the API server.
-func parseMCPRoutePolicy(client dynamic.Interface, ns, name string) (*AIMCPRoutePolicy, error) {
-	obj, err := client.Resource(AIMCPRoutePolicyGVR).Namespace(ns).Get(
-		context.TODO(), name, metav1.GetOptions{},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("get AIMCPRoutePolicy %s/%s: %w", ns, name, err)
+func parseMCPRoutePolicy(client dynamic.Interface, u *unstructured.Unstructured) (*AIMCPRoutePolicy, error) {
+	return unstructuredToMCPRoutePolicy(livePolicyObject(client, AIMCPRoutePolicyGVR, lib.AIMCPRoutePolicy, u))
+}
+
+// authRefFromSpec returns the authRef an MCP/A2A route policy spec declares, or
+// nil when the spec has no authRef key at all. A declared authRef is kept even
+// when its name is empty, missing or not a string (authRef: {name: ""},
+// authRef: {}): the policy asked for auth, so Validate must reject it and the
+// route must fail closed, rather than the parser turning it into "no auth" and
+// the route serving unauthenticated.
+func authRefFromSpec(spec map[string]interface{}) *AuthPolicyRef {
+	if _, declared := spec["authRef"]; !declared {
+		return nil
 	}
-	return unstructuredToMCPRoutePolicy(obj)
+	name, _, _ := unstructured.NestedString(spec, "authRef", "name")
+	return &AuthPolicyRef{Name: name}
 }
 
 // unstructuredToMCPRoutePolicy converts an unstructured object to AIMCPRoutePolicy.
@@ -180,9 +189,7 @@ func unstructuredToMCPRoutePolicy(obj *unstructured.Unstructured) (*AIMCPRoutePo
 	}
 
 	// authRef
-	if v, _, _ := unstructured.NestedString(spec, "authRef", "name"); v != "" {
-		p.Spec.AuthRef = &AuthPolicyRef{Name: v}
-	}
+	p.Spec.AuthRef = authRefFromSpec(spec)
 
 	// session
 	if sess, found, _ := unstructured.NestedMap(spec, "session"); found {

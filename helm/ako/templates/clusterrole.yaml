@@ -75,6 +75,10 @@ rules:
   - apiGroups: ["ai.ako.vmware.com"]
     resources: ["aigatewayauthpolicies","aigatewayauthpolicies/status","aitokenratelimitpolicies","aitokenratelimitpolicies/status","aimodelroutepolicies","aimodelroutepolicies/status","aimcproutepolicies","aimcproutepolicies/status","aiguardrailpolicies","aiguardrailpolicies/status","aia2aroutepolicies","aia2aroutepolicies/status"]
     verbs: ["get","watch","list","patch","update"]
+  # ReferenceGrants gate cross-namespace AIModelRoutePolicy Service backends and backendTLS Secrets (read-only).
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["referencegrants"]
+    verbs: ["get","watch","list"]
 {{- end }}
 {{- if .Values.rbac.pspEnable }}
   - apiGroups: ["policy", "extensions"]

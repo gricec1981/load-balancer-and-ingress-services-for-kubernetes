@@ -20,6 +20,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	akogatewayapiaigateway "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/aigateway"
 	akogatewayapilib "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/lib"
 	akogatewayapiobjects "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/objects"
 	"github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/internal/lib"
@@ -173,14 +174,23 @@ func DequeueIngestion(key string, fullsync bool) {
 
 			childVSes := make(map[string]struct{}, 0)
 
+			// The AI Gateway fail-closed auth guard is rebuilt with the route: the
+			// pass records every child VS the rebuild denies, and the sweep below
+			// lifts the guard from rebuilt children nothing denied (their auth
+			// requirement went away), before the model is saved and published.
+			// The pass is an instance, not keyed state: this key can be rebuilt
+			// concurrently (quick sync on the full-sync thread).
+			guardPass := akogatewayapiaigateway.BeginAuthGuardPass(key)
 			switch objType {
 			case lib.HTTPRoute:
 				model.ProcessL7Routes(key, routeModel, gatewayNsName, childVSes, fullsync)
 			default:
+				akogatewayapiaigateway.EndAuthGuardPass(guardPass, nil)
 				utils.AviLog.Warnf("key: %s, msg: route of type %s not supported", key, objType)
 				continue
 			}
 			model.DeleteStaleChildVSes(key, routeModel, childVSes, fullsync)
+			model.endAuthGuardPass(guardPass, childVSes)
 		}
 		if !akogatewayapilib.IsGatewayInDedicatedMode(parentNs, parentName) {
 			model.AddDefaultHTTPPolicySet(key)
@@ -477,6 +487,26 @@ func (o *AviObjectGraph) ProcessRouteDeletionForDedicatedMode(key, parentNsName 
 	}
 
 	utils.AviLog.Infof("key: %s, msg: Completed route deletion for dedicated mode: %s/%s", key, routeModel.GetNamespace(), routeModel.GetName())
+}
+
+// endAuthGuardPass closes the AI Gateway auth guard pass opened for one route
+// rebuild, handing it the child VSes that rebuild produced (childVSes, as
+// filled by ProcessL7Routes) so their fail-closed guard is recomputed.
+func (o *AviObjectGraph) endAuthGuardPass(pass *akogatewayapiaigateway.AuthGuardPass, childVSes map[string]struct{}) {
+	o.Lock.Lock()
+	defer o.Lock.Unlock()
+	var rebuilt []nodes.AviVsEvhSniModel
+	if parents := o.GetAviEvhVS(); len(parents) > 0 && parents[0] != nil {
+		for _, child := range parents[0].EvhNodes {
+			if child == nil {
+				continue
+			}
+			if _, ok := childVSes[child.Name]; ok {
+				rebuilt = append(rebuilt, child)
+			}
+		}
+	}
+	akogatewayapiaigateway.EndAuthGuardPass(pass, rebuilt)
 }
 
 func (o *AviObjectGraph) DeleteStaleChildVSes(key string, routeModel RouteModel, childVSes map[string]struct{}, fullsync bool) {

@@ -77,6 +77,9 @@ type fqdnPoolSpec struct {
 	SeedIP string
 	// HealthMonitorRefs is optional; nil attaches no monitor.
 	HealthMonitorRefs []string
+	// Tier1LR is the Tier-1 (VPC) path of the VS the pool serves (see
+	// GatewayTier1LR); "" leaves the pool without one (non-NSX clouds).
+	Tier1LR string
 }
 
 // ensureFQDNPool creates or updates a pool whose single server is named, not
@@ -134,6 +137,12 @@ func fqdnPoolBody(spec fqdnPoolSpec) map[string]interface{} {
 			"resolve_server_by_dns": true,
 		}},
 	}
+	// NSX-T / VPC clouds require the Tier-1 (VPC) path on every pool; without it the
+	// Controller rejects the create with "Tier 1 cannot be derived from vrf". It is
+	// the Tier-1 of the VS the pool serves, resolved by the caller.
+	if spec.Tier1LR != "" {
+		pool["tier1_lr"] = spec.Tier1LR
+	}
 	if spec.TLS {
 		// Backend TLS; SNI is the server hostname (System-Standard is a stock profile).
 		pool["ssl_profile_ref"] = "/api/sslprofile/?name=System-Standard"
@@ -187,8 +196,9 @@ func remoteHealthMonitorBody(name, tenantRef, host, path string, tls bool) map[s
 
 // EnsureRemoteTier authors the FQDN Pool (+ health monitor) and Pool Group for a
 // remote-site tier and returns the runtime data the DataScript needs. Tenant is
-// resolved from the policy namespace (never GetTenant()).
-func EnsureRemoteTier(key string, policy *AIModelRoutePolicy, tier ModelTier) (*RemoteRuntime, error) {
+// resolved from the policy namespace (never GetTenant()). tier1LR is the Tier-1
+// (VPC) path of the child VS the tier serves (GatewayTier1LR of its Gateway).
+func EnsureRemoteTier(key string, policy *AIModelRoutePolicy, tier ModelTier, tier1LR string) (*RemoteRuntime, error) {
 	rem := tier.Remote
 	tenant := lib.GetTenantInNamespace(policy.Namespace)
 	client := avicache.SharedAVIClients(tenant).AviClient[0]
@@ -209,6 +219,7 @@ func EnsureRemoteTier(key string, policy *AIModelRoutePolicy, tier ModelTier) (*
 		}
 	}
 
+	noteSharedPoolTier1(key, tenant, poolName, tier1LR)
 	if err := ensureFQDNPool(client, fqdnPoolSpec{
 		Name:              poolName,
 		TenantRef:         tenantRef,
@@ -217,6 +228,7 @@ func EnsureRemoteTier(key string, policy *AIModelRoutePolicy, tier ModelTier) (*
 		Port:              rem.EffectivePort(),
 		TLS:               rem.EffectiveTLS(),
 		HealthMonitorRefs: hmRefs,
+		Tier1LR:           tier1LR,
 	}); err != nil {
 		return nil, err
 	}
@@ -252,6 +264,7 @@ func DeleteRemoteTiers(key string, policy *AIModelRoutePolicy) {
 		}
 		deleteAviObjectByName(key, client, "/api/poolgroup", remotePoolGroupName(policy.Namespace, policy.Name, t.Name))
 		deleteAviObjectByName(key, client, "/api/pool", remotePoolName(policy.Namespace, policy.Name, t.Name))
+		forgetSharedPoolTier1(remotePoolName(policy.Namespace, policy.Name, t.Name))
 		deleteAviObjectByName(key, client, "/api/healthmonitor", remoteHealthMonitorName(policy.Namespace, policy.Name, t.Name))
 	}
 }

@@ -224,12 +224,14 @@ func (rest *RestOperations) EvhNodeCU(sni_node *nodes.AviEvhVsNode, vs_cache_obj
 				rest_ops = append(rest_ops, restOp...)
 			}
 		}
-		rest_ops = rest.SSLKeyCertDelete(sslkey_cert_delete, namespace, rest_ops, key)
 		rest_ops = rest.HTTPPolicyDelete(http_policies_to_delete, namespace, rest_ops, key)
 		rest_ops = rest.DSDelete(ds_to_delete, namespace, rest_ops, key)
 		rest_ops = rest.StringGroupDelete(string_groups_to_delete, namespace, rest_ops, key)
 		rest_ops = rest.PoolGroupDelete(sni_pgs_to_delete, namespace, rest_ops, key)
 		rest_ops = rest.PoolDelete(sni_pools_to_delete, namespace, rest_ops, sni_cache_obj, key)
+		// Certificates go last: a pool may reference one (an AI Gateway tier client
+		// certificate, ssl_key_and_certificate_ref), so it is deleted after the pools.
+		rest_ops = rest.SSLKeyCertDelete(sslkey_cert_delete, namespace, rest_ops, key)
 		utils.AviLog.Debugf("key: %s, msg: the EVH VSes to be deleted are: %s", key, cache_sni_nodes)
 	} else {
 		utils.AviLog.Debugf("key: %s, msg: EVH child %s not found in cache and EVH parent also does not exist in cache", key, sni_node.Name)

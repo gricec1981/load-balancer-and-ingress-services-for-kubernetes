@@ -130,6 +130,92 @@ type ModelTier struct {
 	// apart from the Host header, and its response is metered normally.
 	// +optional
 	Remote *ModelRemote `json:"remote,omitempty"`
+
+	// BackendTLS makes the tier pool speak TLS (optionally mutual TLS) to its
+	// backend. Service tiers only: it is rejected (the tier is skipped) on
+	// provider, remote and InferencePool tiers, which have their own transport.
+	// A tier whose backendTLS cannot be resolved (missing Secret, key, or
+	// ReferenceGrant) is skipped — AKO never falls back to a plaintext pool.
+	// +optional
+	BackendTLS *ModelBackendTLS `json:"backendTLS,omitempty"`
+}
+
+// DefaultBackendTLSCAKey is the Secret data key read for the CA bundle when
+// caSecretRef.key is omitted.
+const DefaultBackendTLSCAKey = "ca.crt"
+
+// ModelBackendTLS configures TLS from the Service Engine to a Service tier's
+// endpoints: server-certificate validation against a CA bundle, an optional
+// client certificate (mTLS), SNI and an optional host-name check.
+type ModelBackendTLS struct {
+	// SNI is the server name sent in the TLS ClientHello (the pool's
+	// server_name). Omitted, the SE sends the incoming Host header.
+	// +optional
+	SNI string `json:"sni,omitempty"`
+
+	// HostCheck verifies the backend certificate's names against SNI. Requires
+	// sni. Defaults to false (chain validation only).
+	// +optional
+	HostCheck bool `json:"hostCheck,omitempty"`
+
+	// CASecretRef names the Secret holding the PEM CA bundle the backend's
+	// server certificate must chain to. Every certificate in it is trusted, as
+	// is every intermediate that follows the leaf in the client certificate's
+	// tls.crt. Omitted, the server certificate is not validated.
+	// +optional
+	CASecretRef *BackendTLSCASecretRef `json:"caSecretRef,omitempty"`
+
+	// ClientCertificateSecretRef names a kubernetes.io/tls Secret whose tls.crt
+	// (leaf, optionally followed by its chain) and tls.key the SE presents to
+	// the backend.
+	// +optional
+	ClientCertificateSecretRef *BackendTLSSecretRef `json:"clientCertificateSecretRef,omitempty"`
+}
+
+// BackendTLSCASecretRef references a CA bundle inside a Secret.
+type BackendTLSCASecretRef struct {
+	Name string `json:"name"`
+	// Namespace defaults to the backend's namespace. A namespace other than the
+	// policy's requires a ReferenceGrant there (to kind Secret).
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+	// Key defaults to "ca.crt".
+	// +optional
+	Key string `json:"key,omitempty"`
+}
+
+// BackendTLSSecretRef references a kubernetes.io/tls Secret.
+type BackendTLSSecretRef struct {
+	Name string `json:"name"`
+	// Namespace defaults to the backend's namespace. A namespace other than the
+	// policy's requires a ReferenceGrant there (to kind Secret).
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+}
+
+// EffectiveKey returns the CA bundle key (default "ca.crt").
+func (r *BackendTLSCASecretRef) EffectiveKey() string {
+	if r.Key != "" {
+		return r.Key
+	}
+	return DefaultBackendTLSCAKey
+}
+
+// EffectiveNamespace returns the CA Secret namespace (default backendNs).
+func (r *BackendTLSCASecretRef) EffectiveNamespace(backendNs string) string {
+	if r.Namespace != "" {
+		return r.Namespace
+	}
+	return backendNs
+}
+
+// EffectiveNamespace returns the client-certificate Secret namespace (default
+// backendNs).
+func (r *BackendTLSSecretRef) EffectiveNamespace(backendNs string) string {
+	if r.Namespace != "" {
+		return r.Namespace
+	}
+	return backendNs
 }
 
 // ModelRemote describes a peer AI Gateway at another site.
@@ -275,8 +361,25 @@ type ModelBackendRef struct {
 	// Kind is "InferencePool" or "Service".
 	Kind string `json:"kind"`
 
-	// Name is the backend name in the policy namespace.
+	// Name is the backend name.
 	Name string `json:"name"`
+
+	// Namespace is the backend's namespace; defaults to the policy namespace.
+	// Service tiers only (InferencePool tiers stay in the policy namespace). A
+	// namespace other than the policy's is honoured only when a Gateway API
+	// ReferenceGrant in that namespace allows
+	// from {group: ai.ako.vmware.com, kind: AIModelRoutePolicy, namespace: <policy ns>}
+	// to {group: "", kind: Service[, name]}; without one the tier is skipped.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+}
+
+// EffectiveNamespace returns the backend namespace, defaulting to policyNs.
+func (r ModelBackendRef) EffectiveNamespace(policyNs string) string {
+	if r.Namespace != "" {
+		return r.Namespace
+	}
+	return policyNs
 }
 
 // ModelEntitlements restricts tier access by the caller's verified group.

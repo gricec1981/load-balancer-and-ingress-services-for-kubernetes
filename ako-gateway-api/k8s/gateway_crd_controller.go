@@ -41,59 +41,6 @@ func (c *GatewayController) SetupCRDEventHandlers(numWorkers uint32) {
 		c.setupRouteBackendExtensionEventHandler(numWorkers)
 		c.setupApplicationProfileEventHandlers(numWorkers)
 	}
-
-	// Wire AI gateway policy event handlers when the feature is enabled.
-	if lib.IsAIGatewayEnabled() {
-		dynClient := akogatewayapilib.GetDynamicClientSet()
-		if c.dynamicInformers.AIGatewayAuthPolicyInformer != nil {
-			aigateway.SetupAuthPolicyEventHandlers(
-				c.dynamicInformers.AIGatewayAuthPolicyInformer,
-				dynClient,
-				c.workqueue,
-				numWorkers,
-			)
-		}
-		if c.dynamicInformers.AITokenRateLimitPolicyInformer != nil {
-			aigateway.SetupTokenRateLimitPolicyEventHandlers(
-				c.dynamicInformers.AITokenRateLimitPolicyInformer,
-				dynClient,
-				c.workqueue,
-				numWorkers,
-			)
-		}
-		if c.dynamicInformers.AIModelRoutePolicyInformer != nil {
-			aigateway.SetupModelRoutePolicyEventHandlers(
-				c.dynamicInformers.AIModelRoutePolicyInformer,
-				dynClient,
-				c.workqueue,
-				numWorkers,
-			)
-		}
-		if c.dynamicInformers.AIMCPRoutePolicyInformer != nil {
-			aigateway.SetupMCPRoutePolicyEventHandlers(
-				c.dynamicInformers.AIMCPRoutePolicyInformer,
-				dynClient,
-				c.workqueue,
-				numWorkers,
-			)
-		}
-		if c.dynamicInformers.AIGuardrailPolicyInformer != nil {
-			aigateway.SetupGuardrailPolicyEventHandlers(
-				c.dynamicInformers.AIGuardrailPolicyInformer,
-				dynClient,
-				c.workqueue,
-				numWorkers,
-			)
-		}
-		if c.dynamicInformers.AIA2ARoutePolicyInformer != nil {
-			aigateway.SetupA2ARoutePolicyEventHandlers(
-				c.dynamicInformers.AIA2ARoutePolicyInformer,
-				dynClient,
-				c.workqueue,
-				numWorkers,
-			)
-		}
-	}
 }
 
 func (c *GatewayController) setupL7CRDEventHandlers(numWorkers uint32) {
@@ -648,4 +595,70 @@ func (c *GatewayController) setupRouteBackendExtensionEventHandler(numWorkers ui
 		},
 	}
 	c.dynamicInformers.RouteBackendExtensionCRDInformer.Informer().AddEventHandler(RouteBackendExtensionCRDEventHandler)
+}
+
+// setupAIPolicyEventHandlers registers the handlers that populate the AI
+// gateway policy store (aigateway.SharedPolicyStore). It runs from Start,
+// before the caches are waited on, and Start also waits on these handler
+// registrations (aigateway.PolicyHandlersSynced): the store must hold every
+// existing policy before the boot full sync translates a single route.
+// Registered any later (as it used to be, from SetupCRDEventHandlers after
+// FullSyncK8s), every protected route was first pushed to Avi without its
+// SSO policy / DataScripts, i.e. unauthenticated, until the replayed Add
+// events re-enqueued it.
+//
+// Route keys the handlers enqueue during the initial replay sit in the
+// ingestion queue until it starts draining after the full sync.
+func (c *GatewayController) setupAIPolicyEventHandlers() {
+	ingestionQueue := utils.SharedWorkQueue().GetQueueByName(utils.ObjectIngestionLayer)
+	workqueues, numWorkers := ingestionQueue.Workqueue, ingestionQueue.NumWorkers
+	dynClient := akogatewayapilib.GetDynamicClientSet()
+	if c.dynamicInformers.AIGatewayAuthPolicyInformer != nil {
+		aigateway.SetupAuthPolicyEventHandlers(
+			c.dynamicInformers.AIGatewayAuthPolicyInformer,
+			dynClient,
+			workqueues,
+			numWorkers,
+		)
+	}
+	if c.dynamicInformers.AITokenRateLimitPolicyInformer != nil {
+		aigateway.SetupTokenRateLimitPolicyEventHandlers(
+			c.dynamicInformers.AITokenRateLimitPolicyInformer,
+			dynClient,
+			workqueues,
+			numWorkers,
+		)
+	}
+	if c.dynamicInformers.AIModelRoutePolicyInformer != nil {
+		aigateway.SetupModelRoutePolicyEventHandlers(
+			c.dynamicInformers.AIModelRoutePolicyInformer,
+			dynClient,
+			workqueues,
+			numWorkers,
+		)
+	}
+	if c.dynamicInformers.AIMCPRoutePolicyInformer != nil {
+		aigateway.SetupMCPRoutePolicyEventHandlers(
+			c.dynamicInformers.AIMCPRoutePolicyInformer,
+			dynClient,
+			workqueues,
+			numWorkers,
+		)
+	}
+	if c.dynamicInformers.AIGuardrailPolicyInformer != nil {
+		aigateway.SetupGuardrailPolicyEventHandlers(
+			c.dynamicInformers.AIGuardrailPolicyInformer,
+			dynClient,
+			workqueues,
+			numWorkers,
+		)
+	}
+	if c.dynamicInformers.AIA2ARoutePolicyInformer != nil {
+		aigateway.SetupA2ARoutePolicyEventHandlers(
+			c.dynamicInformers.AIA2ARoutePolicyInformer,
+			dynClient,
+			workqueues,
+			numWorkers,
+		)
+	}
 }

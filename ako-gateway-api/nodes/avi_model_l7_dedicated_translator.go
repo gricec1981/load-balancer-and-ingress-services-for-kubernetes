@@ -580,7 +580,15 @@ func (o *AviObjectGraph) BuildPGPoolForDedicatedMode(key string, vsNode *nodes.A
 
 		// Populate servers for the pool
 		serviceType := lib.GetServiceType()
-		if serviceType == lib.NodePortLocal {
+		if serviceType == lib.NodePortLocal && len(svcObj.Spec.Selector) == 0 {
+			// Selectorless Service = off-cluster backend via a hand-written EndpointSlice; NodePortLocal
+			// has no pods to map for it, so fall back to the endpoints (same as ClusterIP mode).
+			utils.AviLog.Infof("key: %s, msg: service %s/%s has no selector; populating servers from its endpoints instead of NodePortLocal", key, svcObj.ObjectMeta.Namespace, svcObj.ObjectMeta.Name)
+			servers := nodes.PopulateServers(poolNode, svcObj.ObjectMeta.Namespace, svcObj.ObjectMeta.Name, false, key)
+			if servers != nil {
+				poolNode.Servers = servers
+			}
+		} else if serviceType == lib.NodePortLocal {
 			servers := nodes.PopulateServersForNPL(poolNode, svcObj.ObjectMeta.Namespace, svcObj.ObjectMeta.Name, false, key)
 			if servers != nil {
 				poolNode.Servers = servers

@@ -30,6 +30,14 @@ inferenceExtension:
 ### enforcement on each targeted Virtual Service.
 aiGateway:
   enabled: false
+  ## Name of a Secret in the AKO namespace holding extra PEM CA certificates (any keys) that the
+  ## ako-gateway-api container must trust for outbound TLS, e.g. the JWKS endpoint of an internal
+  ## IdP signed by a private CA. Mounted at /etc/ai-gateway/ca and exposed via SSL_CERT_DIR.
+  caBundleSecret: ""
+  ## How often JWT-mode AIGatewayAuthPolicy routes are re-reconciled to refresh their JWKS snapshot (picks up
+  ## IdP key rotation and keeps the last-known-good fallback window alive). Go duration; empty = built-in default
+  ## (1h); "0" disables the periodic refresh.
+  jwksRefreshInterval: ""
 
 replicaCount: 1
 

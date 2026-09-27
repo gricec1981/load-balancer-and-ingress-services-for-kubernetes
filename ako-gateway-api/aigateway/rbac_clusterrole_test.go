@@ -54,3 +54,40 @@ func TestClusterRoleGrantsWatchedGVRs(t *testing.T) {
 		}
 	}
 }
+
+// TestClusterRoleGrantsReferenceGrants couples the ReferenceGrant informer
+// (ako-gateway-api/k8s InitGatewayAPIInformers, AI gateway only) to the Helm
+// ClusterRole. The informer is only created when AKO may list referencegrants,
+// so a missing grant no longer wedges Start — but it silently refuses every
+// cross-namespace AIModelRoutePolicy backend and backendTLS Secret. The rule
+// must be in the gateway.networking.k8s.io group with get, list and watch.
+func TestClusterRoleGrantsReferenceGrants(t *testing.T) {
+	data, err := os.ReadFile(filepath.Clean(clusterRoleTemplatePath))
+	if err != nil {
+		t.Fatalf("read ClusterRole template %s: %v", clusterRoleTemplatePath, err)
+	}
+	// Split into rules at each "- apiGroups:" item; a rule is its apiGroups,
+	// resources and verbs lines.
+	var rules []string
+	for _, line := range strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "- apiGroups:") {
+			rules = append(rules, "")
+		}
+		if len(rules) > 0 {
+			rules[len(rules)-1] += line + "\n"
+		}
+	}
+	for _, rule := range rules {
+		if !strings.Contains(rule, `"gateway.networking.k8s.io"`) || !strings.Contains(rule, `"referencegrants"`) {
+			continue
+		}
+		for _, verb := range []string{`"get"`, `"list"`, `"watch"`} {
+			if !strings.Contains(rule, verb) {
+				t.Errorf("ClusterRole grants referencegrants without %s:\n%s", verb, rule)
+			}
+		}
+		return
+	}
+	t.Errorf("ClusterRole %s does not grant gateway.networking.k8s.io referencegrants (get/list/watch); "+
+		"cross-namespace AIModelRoutePolicy tiers would be refused", clusterRoleTemplatePath)
+}

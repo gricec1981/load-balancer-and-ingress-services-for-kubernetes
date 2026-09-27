@@ -607,17 +607,29 @@ func PopulateServers(poolNode *AviPoolNode, ns string, serviceName string, ingre
 		port_match := false
 		var epProtocol v1.Protocol
 		for _, epp := range epSlice.Ports {
-			if (epp.Name != nil && poolNode.PortName == *epp.Name) || (epp.Port != nil && poolNode.TargetPort.IntVal == *epp.Port) {
+			// A nil port is valid in the API ("all ports") but gives no concrete member
+			// port; hand-written slices for off-cluster backends can carry one. Skip it
+			// instead of dereferencing nil and crashing the graph worker.
+			if epp.Port == nil {
+				continue
+			}
+			if (epp.Name != nil && poolNode.PortName == *epp.Name) || poolNode.TargetPort.IntVal == *epp.Port {
 				port_match = true
 				poolNode.Port = *epp.Port
-				epProtocol = *epp.Protocol
+				epProtocol = v1.ProtocolTCP
+				if epp.Protocol != nil {
+					epProtocol = *epp.Protocol
+				}
 				break
 			}
 		}
-		if len(epSliceIntList) == 1 && len(epSlice.Ports) == 1 {
+		if len(epSliceIntList) == 1 && len(epSlice.Ports) == 1 && epSlice.Ports[0].Port != nil {
 			port_match = true
 			poolNode.Port = *epSlice.Ports[0].Port
-			epProtocol = *epSlice.Ports[0].Protocol
+			epProtocol = v1.ProtocolTCP
+			if epSlice.Ports[0].Protocol != nil {
+				epProtocol = *epSlice.Ports[0].Protocol
+			}
 		}
 		if !port_match {
 			continue

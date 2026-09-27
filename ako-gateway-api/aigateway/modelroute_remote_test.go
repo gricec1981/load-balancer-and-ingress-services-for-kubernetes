@@ -334,3 +334,30 @@ func TestResolveSeedIP(t *testing.T) {
 		t.Error("an unresolvable peer must be an error, not a pool with a bad member")
 	}
 }
+
+// NSX-T / VPC clouds reject a pool without tier1_lr ("Tier 1 cannot be derived from
+// vrf"), so the FQDN pool must carry the Tier-1/VPC path of the VS it serves when
+// there is one — and must stay unchanged (no tier1_lr key) on clouds without one.
+// The path is the caller's resolution (GatewayTier1LR), used verbatim: the
+// AKO-wide NSXT_T1_LR must not override an AviInfraSetting's.
+func TestFQDNPoolBodyTier1(t *testing.T) {
+	spec := fqdnPoolSpec{Name: "p", TenantRef: "/api/tenant/?name=admin", CloudRef: "/api/cloud/?name=c",
+		Host: "generativelanguage.googleapis.com", Port: 443, TLS: true, SeedIP: "142.250.0.1"}
+
+	t.Setenv("NSXT_T1_LR", "")
+	if _, ok := fqdnPoolBody(spec)["tier1_lr"]; ok {
+		t.Fatalf("tier1_lr set without a Tier-1")
+	}
+
+	const vpc = "/orgs/default/projects/default/vpcs/pais_f5vbz"
+	spec.Tier1LR = vpc
+	if got := fqdnPoolBody(spec)["tier1_lr"]; got != vpc {
+		t.Fatalf("tier1_lr = %v, want %s", got, vpc)
+	}
+
+	// The Gateway's AviInfraSetting resolved to another VPC than the AKO-wide one.
+	t.Setenv("NSXT_T1_LR", "/orgs/default/projects/default/vpcs/ako-wide")
+	if got := fqdnPoolBody(spec)["tier1_lr"]; got != vpc {
+		t.Fatalf("tier1_lr = %v, want the serving VS's %s, not the AKO-wide path", got, vpc)
+	}
+}

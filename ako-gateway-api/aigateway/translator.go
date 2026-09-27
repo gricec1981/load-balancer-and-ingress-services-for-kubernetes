@@ -65,24 +65,28 @@ func ApplyAuthPolicy(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVs
 	// We use the OAuth resource-server flow instead: the SE validates the bearer
 	// token as an OAuth JWT access token and the DataScript reads claims via
 	// avi.http.oauth_get_claim(). See oauth_rest.go for the object graph.
-	poolName, firstIP, port, err := EnsureIssuerPool(key, policy)
+	// Any failure fails the route closed (see auth_failclosed.go) rather than
+	// publishing the VS without an SSO policy.
+	failClosed := func(what string, err error) {
+		DenyUnauthenticated(key, vsNode, fmt.Sprintf("AIGatewayAuthPolicy %s/%s: %s: %v",
+			policy.Namespace, policy.Name, what, err))
+	}
+	poolName, firstIP, port, err := EnsureIssuerPool(key, policy, VSTier1LR(key, vsNode))
 	if err != nil {
-		utils.AviLog.Errorf("key: %s, msg: AIGatewayAuthPolicy %s/%s: issuer Pool error: %v",
-			key, policy.Namespace, policy.Name, err)
+		failClosed("issuer Pool", err)
 		return
 	}
 	authProfileName, err := EnsureOAuthAuthProfile(key, policy, poolName, firstIP, port)
 	if err != nil {
-		utils.AviLog.Errorf("key: %s, msg: AIGatewayAuthPolicy %s/%s: OAuth AuthProfile error: %v",
-			key, policy.Namespace, policy.Name, err)
+		failClosed("OAuth AuthProfile", err)
 		return
 	}
 	ssoPolicyName, err := EnsureOAuthSSOPolicy(key, policy)
 	if err != nil {
-		utils.AviLog.Errorf("key: %s, msg: AIGatewayAuthPolicy %s/%s: OAuth SSOPolicy error: %v",
-			key, policy.Namespace, policy.Name, err)
+		failClosed("OAuth SSOPolicy", err)
 		return
 	}
+	clearAuthUnavailable(key, vsNode)
 
 	audience := "*"
 	if len(spec.JWT.Audiences) > 0 {
@@ -150,27 +154,27 @@ func ApplyAuthPolicy(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVs
 //     (avi.http.get_userid). Nothing in the URL, nothing forwarded.
 //
 // avi.http.oauth_get_claim is unavailable in both. See docs/gateway-api.
+//
+// Failure is closed, never open: if the object graph cannot be realized and
+// there is no last-known-good JWTServerProfile to fall back on, the VS gets the
+// fail-closed guard (DenyUnauthenticated) instead of being published without an
+// SSO policy. See auth_failclosed.go.
 func applyJWTAuth(key string, policy *AIGatewayAuthPolicy, vsNode nodes.AviVsEvhSniModel, mode AuthClaimMode) {
 	spec := policy.Spec
 
-	serverProfileName, err := EnsureJWTServerProfile(key, policy)
+	r, err := realizeJWTAuth(jwtAvi, key, policy)
 	if err != nil {
-		utils.AviLog.Errorf("key: %s, msg: AIGatewayAuthPolicy %s/%s: JWTServerProfile error: %v",
-			key, policy.Namespace, policy.Name, err)
+		DenyUnauthenticated(key, vsNode, fmt.Sprintf("AIGatewayAuthPolicy %s/%s could not be realized: %v",
+			policy.Namespace, policy.Name, err))
 		return
 	}
-	authProfileName, err := EnsureJWTAuthProfile(key, policy, serverProfileName)
-	if err != nil {
-		utils.AviLog.Errorf("key: %s, msg: AIGatewayAuthPolicy %s/%s: JWT AuthProfile error: %v",
-			key, policy.Namespace, policy.Name, err)
-		return
+	clearAuthUnavailable(key, vsNode)
+	if r.StaleKeys {
+		// Serving on the last-known-good keyset; retry so rotated keys are picked
+		// up once the IdP is reachable again.
+		requestAuthRetry(key, vsNode)
 	}
-	ssoPolicyName, err := EnsureJWTSSOPolicy(key, policy, authProfileName)
-	if err != nil {
-		utils.AviLog.Errorf("key: %s, msg: AIGatewayAuthPolicy %s/%s: JWT SSOPolicy error: %v",
-			key, policy.Namespace, policy.Name, err)
-		return
-	}
+	ssoPolicyName := r.SSOPolicyName
 
 	audience := "*"
 	if len(spec.JWT.Audiences) > 0 {
@@ -322,7 +326,7 @@ func ApplyGuardrailPolicy(key string, policy *AIGuardrailPolicy, vsNode nodes.Av
 	// ── Semantic layer (ICAP classifier) — author the icapprofile AND the ──
 	// REQUEST_CHECK_ICAP HTTPPolicySet, then set both on the VS.
 	if policy.Spec.SemanticEnabled() {
-		refs, err := EnsureGuardrailIcap(key, policy)
+		refs, err := EnsureGuardrailIcap(key, policy, VSTier1LR(key, vsNode))
 		if err != nil {
 			utils.AviLog.Warnf("key: %s, msg: AIGuardrailPolicy %s/%s: semantic ICAP: %v", key, policy.Namespace, policy.Name, err)
 			return

@@ -89,8 +89,9 @@ func resolveProviderAuthValue(policyNs string, auth *ProviderAuth) (string, erro
 
 // EnsureProviderTier authors the FQDN Pool + Pool Group for a provider tier and
 // returns the runtime data the DataScript needs. Tenant is resolved from the
-// policy namespace (never GetTenant()).
-func EnsureProviderTier(key string, policy *AIModelRoutePolicy, tier ModelTier) (*ProviderRuntime, error) {
+// policy namespace (never GetTenant()). tier1LR is the Tier-1 (VPC) path of the
+// child VS the tier serves (GatewayTier1LR of its Gateway).
+func EnsureProviderTier(key string, policy *AIModelRoutePolicy, tier ModelTier, tier1LR string) (*ProviderRuntime, error) {
 	prov := tier.Provider
 	tenant := lib.GetTenantInNamespace(policy.Namespace)
 	client := avicache.SharedAVIClients(tenant).AviClient[0]
@@ -105,6 +106,7 @@ func EnsureProviderTier(key string, policy *AIModelRoutePolicy, tier ModelTier) 
 	// pinning. Remote-site tiers use the same builder for the same reason — see
 	// ensureFQDNPool in modelroute_remote_rest.go. No health monitor: a vendor API
 	// is not ours to probe, and there is nowhere to fail over to.
+	noteSharedPoolTier1(key, tenant, poolName, tier1LR)
 	if err := ensureFQDNPool(client, fqdnPoolSpec{
 		Name:      poolName,
 		TenantRef: tenantRef,
@@ -112,6 +114,7 @@ func EnsureProviderTier(key string, policy *AIModelRoutePolicy, tier ModelTier) 
 		Host:      prov.Host,
 		Port:      prov.EffectivePort(),
 		TLS:       prov.EffectiveTLS(),
+		Tier1LR:   tier1LR,
 	}); err != nil {
 		return nil, err
 	}
@@ -153,5 +156,6 @@ func DeleteProviderTiers(key string, policy *AIModelRoutePolicy) {
 		}
 		deleteAviObjectByName(key, client, "/api/poolgroup", providerPoolGroupName(policy.Namespace, policy.Name, t.Name))
 		deleteAviObjectByName(key, client, "/api/pool", providerPoolName(policy.Namespace, policy.Name, t.Name))
+		forgetSharedPoolTier1(providerPoolName(policy.Namespace, policy.Name, t.Name))
 	}
 }

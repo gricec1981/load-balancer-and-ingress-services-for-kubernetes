@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
+	akogatewayapiaigateway "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/aigateway"
 	akogatewayapiinference "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/inference"
 	akogatewayapilib "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/lib"
 	akogatewayapiobjects "github.com/vmware/load-balancer-and-ingress-services-for-kubernetes/ako-gateway-api/objects"
@@ -457,6 +458,25 @@ func HTTPRouteChanges(namespace, name, key string) ([]string, bool) {
 	for _, routeBackendExtensionNsName := range routeBackendExtensionNSNameList {
 		akogatewayapiobjects.GatewayApiLister().UpdateHTTPRouteToRouteBackendExtensionMapping(routeNSName, routeBackendExtensionNsName)
 		akogatewayapiobjects.GatewayApiLister().UpdateRouteBackendExtensionToHTTPRouteMapping(routeBackendExtensionNsName, routeNSName)
+	}
+
+	// AIModelRoutePolicy Service tiers are backends of this route too (the tier pools hang off
+	// its child VS). Register them like HTTPRoute backendRefs so Service / EndpointSlice /
+	// NodePortLocal events for a tier re-enqueue the route; without this, tier pool members
+	// went stale until the policy itself was touched. Provider and InferencePool tiers have
+	// their own event paths.
+	if lib.IsAIGatewayEnabled() {
+		for _, p := range akogatewayapiaigateway.SharedPolicyStore().GetModelRoutePoliciesForRoute(routeNSName) {
+			// Keyed by the backend's real namespace (a ReferenceGrant may admit a Service in
+			// another one), so NodePortLocal auto-annotation and that namespace's Service /
+			// EndpointSlice / Pod events reach this route. An ungranted cross-namespace tier
+			// is not registered: AKO neither watches nor annotates what it may not use.
+			for _, svcNsName := range akogatewayapiaigateway.ServiceTierBackendRefs(p) {
+				if !utils.HasElem(svcNsNameList, svcNsName) {
+					svcNsNameList = append(svcNsNameList, svcNsName)
+				}
+			}
+		}
 	}
 
 	// deletes the services, which are removed, from the gateway <-> service and route <-> service mappings

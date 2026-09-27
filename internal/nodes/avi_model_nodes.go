@@ -1721,6 +1721,9 @@ type AviPoolCommonFields struct {
 	EnableHttp2                      *bool
 	HostCheckEnabled                 *bool
 	DomainName                       []string
+	// ServerName is the TLS SNI name the SE sends to the pool's servers when
+	// SniEnabled (nil = the incoming Host header).
+	ServerName *string
 }
 
 func (v *AviPoolNode) GetCheckSum() uint32 {
@@ -1777,6 +1780,9 @@ func (v *AviPoolNode) CalculateCheckSum() {
 	}
 	if v.DomainName != nil {
 		checksumStringSlice = append(checksumStringSlice, utils.Stringify(v.DomainName))
+	}
+	if v.ServerName != nil {
+		checksumStringSlice = append(checksumStringSlice, "servername:"+*v.ServerName)
 	}
 
 	if len(v.ServiceMetadata.NamespaceServiceName) > 0 {

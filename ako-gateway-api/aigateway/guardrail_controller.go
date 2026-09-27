@@ -15,10 +15,8 @@
 package aigateway
 
 import (
-	"context"
 	"fmt"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
@@ -52,26 +50,33 @@ func (s *PolicyStore) GetGuardrailPoliciesForRoute(routeNsName string) []*AIGuar
 	return out
 }
 
-func (s *PolicyStore) upsertGuardrailPolicy(p *AIGuardrailPolicy) {
+// upsertGuardrailPolicy stores the policy and updates route→policy mappings.
+// It returns the targetRef name the policy left, or "".
+func (s *PolicyStore) upsertGuardrailPolicy(p *AIGuardrailPolicy) (movedFrom string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pNsName := p.Namespace + "/" + p.Name
+	var prevTarget *string
+	if prev := s.guardrailPolicyByNsName[pNsName]; prev != nil {
+		prevTarget = &prev.Spec.TargetRef.Name
+	}
 	s.guardrailPolicyByNsName[pNsName] = p
-	routeNsName := p.Namespace + "/" + p.Spec.TargetRef.Name
-	s.routeToGuardrailPolicies[routeNsName] = addUnique(s.routeToGuardrailPolicies[routeNsName], pNsName)
+	return indexPolicyRoute(s.routeToGuardrailPolicies, p.Namespace, pNsName, prevTarget, p.Spec.TargetRef.Name)
 }
 
-func (s *PolicyStore) deleteGuardrailPolicy(ns, name string) {
+// deleteGuardrailPolicy removes the policy and cleans route→policy mappings.
+// It returns the removed policy, or nil if it was not stored.
+func (s *PolicyStore) deleteGuardrailPolicy(ns, name string) *AIGuardrailPolicy {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pNsName := ns + "/" + name
 	p, ok := s.guardrailPolicyByNsName[pNsName]
 	if !ok {
-		return
+		return nil
 	}
-	routeNsName := p.Namespace + "/" + p.Spec.TargetRef.Name
-	s.routeToGuardrailPolicies[routeNsName] = removeElem(s.routeToGuardrailPolicies[routeNsName], pNsName)
+	unindexPolicyRoute(s.routeToGuardrailPolicies, p.Namespace+"/"+p.Spec.TargetRef.Name, pNsName)
 	delete(s.guardrailPolicyByNsName, pNsName)
+	return p
 }
 
 // ─── Event handlers ────────────────────────────────────────────────────────────
@@ -91,26 +96,26 @@ func SetupGuardrailPolicyEventHandlers(
 			if !ok {
 				return
 			}
-			p, err := parseGuardrailPolicy(dynamicClient, u.GetNamespace(), u.GetName())
+			p, err := parseGuardrailPolicy(dynamicClient, u)
 			if err != nil {
 				utils.AviLog.Warnf("AIGuardrailPolicy add: failed to parse %s/%s: %v", u.GetNamespace(), u.GetName(), err)
 				return
 			}
-			SharedPolicyStore().upsertGuardrailPolicy(p)
-			enqueueTargetRoute(p.Namespace, p.Spec.TargetRef.Name, lib.AIGuardrailPolicy, workqueues, numWorkers)
+			movedFrom := SharedPolicyStore().upsertGuardrailPolicy(p)
+			enqueuePolicyRoutes(p.Namespace, p.Spec.TargetRef.Name, movedFrom, lib.AIGuardrailPolicy, workqueues, numWorkers)
 		},
 		UpdateFunc: func(_, newObj interface{}) {
 			u, ok := toUnstructured(newObj)
 			if !ok {
 				return
 			}
-			p, err := parseGuardrailPolicy(dynamicClient, u.GetNamespace(), u.GetName())
+			p, err := parseGuardrailPolicy(dynamicClient, u)
 			if err != nil {
 				utils.AviLog.Warnf("AIGuardrailPolicy update: failed to parse %s/%s: %v", u.GetNamespace(), u.GetName(), err)
 				return
 			}
-			SharedPolicyStore().upsertGuardrailPolicy(p)
-			enqueueTargetRoute(p.Namespace, p.Spec.TargetRef.Name, lib.AIGuardrailPolicy, workqueues, numWorkers)
+			movedFrom := SharedPolicyStore().upsertGuardrailPolicy(p)
+			enqueuePolicyRoutes(p.Namespace, p.Spec.TargetRef.Name, movedFrom, lib.AIGuardrailPolicy, workqueues, numWorkers)
 		},
 		DeleteFunc: func(obj interface{}) {
 			u, ok := toUnstructured(obj)
@@ -126,36 +131,28 @@ func SetupGuardrailPolicyEventHandlers(
 				}
 			}
 			ns, name := u.GetNamespace(), u.GetName()
-			ps := SharedPolicyStore()
-			pNsName := ns + "/" + name
-			ps.mu.RLock()
-			p := ps.guardrailPolicyByNsName[pNsName]
-			ps.mu.RUnlock()
-			if p != nil {
-				// Re-enqueue (drops waf_policy_ref / ICAP refs off the VS), then
-				// delete the AKO-authored objects for both layers.
+			// Remove from the store first, then re-enqueue (the rebuild drops
+			// waf_policy_ref / ICAP refs off the VS only if it no longer sees the
+			// policy), then delete the AKO-authored objects for both layers.
+			if p := SharedPolicyStore().deleteGuardrailPolicy(ns, name); p != nil {
 				enqueueTargetRoute(ns, p.Spec.TargetRef.Name, lib.AIGuardrailPolicy, workqueues, numWorkers)
 				DeleteGuardrailWafPolicy("AIGuardrailPolicy/"+ns+"/"+name, p)
 				if p.Spec.SemanticEnabled() {
 					DeleteGuardrailIcap("AIGuardrailPolicy/"+ns+"/"+name, p)
 				}
 			}
-			ps.deleteGuardrailPolicy(ns, name)
 		},
 	}
-	informer.Informer().AddEventHandler(handler)
+	// Tracked so startup can wait until this handler has put every
+	// existing policy in the store before any route is translated.
+	reg, err := informer.Informer().AddEventHandler(handler)
+	trackPolicyHandler(lib.AIGuardrailPolicy, reg, err)
 }
 
 // ─── Parsing ───────────────────────────────────────────────────────────────────
 
-func parseGuardrailPolicy(client dynamic.Interface, ns, name string) (*AIGuardrailPolicy, error) {
-	obj, err := client.Resource(AIGuardrailPolicyGVR).Namespace(ns).Get(
-		context.TODO(), name, metav1.GetOptions{},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("get AIGuardrailPolicy %s/%s: %w", ns, name, err)
-	}
-	return unstructuredToGuardrailPolicy(obj)
+func parseGuardrailPolicy(client dynamic.Interface, u *unstructured.Unstructured) (*AIGuardrailPolicy, error) {
+	return unstructuredToGuardrailPolicy(livePolicyObject(client, AIGuardrailPolicyGVR, lib.AIGuardrailPolicy, u))
 }
 
 func unstructuredToGuardrailPolicy(obj *unstructured.Unstructured) (*AIGuardrailPolicy, error) {

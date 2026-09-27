@@ -124,11 +124,39 @@ func resolveIssuerServers(rawURL string) (ips []string, port int32, err error) {
 
 // ─── Issuer Pool ─────────────────────────────────────────────────────────────
 
+// issuerPoolBody builds the issuer pool payload. Split out from
+// EnsureIssuerPool so its shape can be asserted without an Avi Controller.
+func issuerPoolBody(poolName, tenant string, ips []string, port int32, tier1LR string) avimodels.Pool {
+	servers := make([]*avimodels.Server, 0, len(ips))
+	for i := range ips {
+		servers = append(servers, &avimodels.Server{
+			IP: &avimodels.IPAddr{Addr: proto.String(ips[i]), Type: proto.String("V4")},
+		})
+	}
+	// VRF is inherited from the VS/cloud context (set internally by pb-transform),
+	// so it is intentionally not set here — matching a standalone pool create.
+	pool := avimodels.Pool{
+		Name:              proto.String(poolName),
+		TenantRef:         proto.String("/api/tenant/?name=" + lib.GetEscapedValue(tenant)),
+		CloudRef:          proto.String("/api/cloud/?name=" + utils.CloudName),
+		DefaultServerPort: proto.Int32(port),
+		Servers:           servers,
+	}
+	// NSX-T / VPC clouds require the Tier-1 (VPC) path on every pool; without it the
+	// Controller rejects the create with "Tier 1 cannot be derived from vrf". It is
+	// the Tier-1 of the VS the pool serves (see tier1.go).
+	if tier1LR != "" {
+		pool.Tier1Lr = proto.String(tier1LR)
+	}
+	return pool
+}
+
 // EnsureIssuerPool creates/updates the Avi Pool the OAuth AuthProfile uses to
 // reach the issuer's JWKS endpoint. Returns the pool name and the first server
 // IP (used as the endpoint host so Avi's "endpoint host must be a pool server"
-// validation passes) plus the port.
-func EnsureIssuerPool(key string, policy *AIGatewayAuthPolicy) (poolName, firstIP string, port int32, err error) {
+// validation passes) plus the port. tier1LR is the Tier-1 (VPC) path of the VS
+// the policy is being applied to (VSTier1LR); "" leaves the pool without one.
+func EnsureIssuerPool(key string, policy *AIGatewayAuthPolicy, tier1LR string) (poolName, firstIP string, port int32, err error) {
 	jwksURI := policy.Spec.JWT.JwksUri
 	if jwksURI == "" {
 		return "", "", 0, fmt.Errorf("spec.jwt.jwksUri is required for OAuth resource-server auth")
@@ -142,27 +170,13 @@ func EnsureIssuerPool(key string, policy *AIGatewayAuthPolicy) (poolName, firstI
 	tenant := lib.GetTenantInNamespace(policy.Namespace)
 	client := avicache.SharedAVIClients(tenant).AviClient[0]
 
-	servers := make([]*avimodels.Server, 0, len(ips))
-	for i := range ips {
-		ipType := "V4"
-		servers = append(servers, &avimodels.Server{
-			IP: &avimodels.IPAddr{Addr: proto.String(ips[i]), Type: proto.String(ipType)},
-		})
-	}
-	// VRF is inherited from the VS/cloud context (set internally by pb-transform),
-	// so it is intentionally not set here — matching a standalone pool create.
-	pool := avimodels.Pool{
-		Name:              proto.String(poolName),
-		TenantRef:         proto.String("/api/tenant/?name=" + lib.GetEscapedValue(tenant)),
-		CloudRef:          proto.String("/api/cloud/?name=" + utils.CloudName),
-		DefaultServerPort: proto.Int32(port),
-		Servers:           servers,
-	}
+	pool := issuerPoolBody(poolName, tenant, ips, port, tier1LR)
 
 	var check struct {
 		Count   int `json:"count"`
 		Results []struct {
 			UUID    string `json:"uuid"`
+			Tier1LR string `json:"tier1_lr"`
 			Servers []struct {
 				IP struct {
 					Addr string `json:"addr"`
@@ -182,6 +196,13 @@ func EnsureIssuerPool(key string, policy *AIGatewayAuthPolicy) (poolName, firstI
 		if len(check.Results[0].Servers) > 0 && check.Results[0].Servers[0].IP.Addr != "" {
 			poolIP = check.Results[0].Servers[0].IP.Addr
 		}
+		// The pool is immutable, so a Tier-1 it was created with stays. Record what the
+		// Controller actually holds (not what this reconcile would have written) and say
+		// so when it differs from the VS's Tier-1, instead of failing silently later.
+		if have := check.Results[0].Tier1LR; have != tier1LR {
+			utils.AviLog.Warnf("key: %s, msg: issuer Pool %s exists with tier1_lr %q but the VS resolves to %q; the pool is immutable — delete and re-apply the AIGatewayAuthPolicy to rebuild it", key, poolName, have, tier1LR)
+		}
+		noteSharedPoolTier1(key, tenant, poolName, check.Results[0].Tier1LR)
 		utils.AviLog.Infof("key: %s, msg: issuer Pool %s already exists, using its server %s", key, poolName, poolIP)
 		return poolName, poolIP, port, nil
 	}
@@ -189,6 +210,7 @@ func EnsureIssuerPool(key string, policy *AIGatewayAuthPolicy) (poolName, firstI
 	if err := lib.AviPost(client, "/api/pool", pool, &resp); err != nil {
 		return "", "", 0, fmt.Errorf("issuer Pool POST %s: %w", poolName, err)
 	}
+	noteSharedPoolTier1(key, tenant, poolName, tier1LR)
 	utils.AviLog.Infof("key: %s, msg: issuer Pool %s created (%d servers, port %d)", key, poolName, len(ips), port)
 	return poolName, ips[0], port, nil
 }
@@ -320,4 +342,5 @@ func DeleteOAuthObjects(key string, policy *AIGatewayAuthPolicy) {
 	delByName("/api/ssopolicy", oauthSSOPolicyName(policy))
 	delByName("/api/authprofile", oauthAuthProfileName(policy))
 	delByName("/api/pool", issuerPoolName(policy))
+	forgetSharedPoolTier1(issuerPoolName(policy))
 }

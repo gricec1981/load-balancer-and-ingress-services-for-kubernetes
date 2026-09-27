@@ -43,7 +43,7 @@ spec:
       serviceAccountName: ako-sa
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      {{ if or .Values.persistentVolumeClaim .Values.AKOSettings.istioEnabled }}
+      {{ if or .Values.persistentVolumeClaim .Values.AKOSettings.istioEnabled .Values.aiGateway.caBundleSecret }}
       volumes:
       {{ if .Values.persistentVolumeClaim }}
       - name: ako-pv-storage
@@ -54,6 +54,11 @@ spec:
       - name: istio-certs
         emptyDir:
           medium: Memory
+      {{ end }}
+      {{ if .Values.aiGateway.caBundleSecret }}
+      - name: ai-gateway-ca
+        secret:
+          secretName: {{ .Values.aiGateway.caBundleSecret }}
       {{ end }}
       {{ end }}
       imagePullSecrets:
@@ -328,10 +333,17 @@ spec:
             periodSeconds: 10
         {{ if eq .Values.featureGates.GatewayAPI true }}
         - name: ako-gateway-api
-          {{ if .Values.persistentVolumeClaim }}
+          {{ if or .Values.persistentVolumeClaim .Values.aiGateway.caBundleSecret }}
           volumeMounts:
+          {{ if .Values.persistentVolumeClaim }}
           - mountPath: {{ .Values.mountPath }}
             name: ako-pv-storage
+          {{ end }}
+          {{ if .Values.aiGateway.caBundleSecret }}
+          - mountPath: /etc/ai-gateway/ca
+            name: ai-gateway-ca
+            readOnly: true
+          {{ end }}
           {{ end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
@@ -481,6 +493,16 @@ spec:
             value: "{{ .Values.inferenceExtension.betaTokenRate }}"
           - name: AI_GATEWAY_ENABLED
             value: "{{ .Values.aiGateway.enabled }}"
+          {{ if .Values.aiGateway.caBundleSecret }}
+          # Extra CAs for outbound TLS (JWKS from an internal IdP). Go reads the image's system
+          # bundle file AND every PEM in SSL_CERT_DIR, so public CAs stay trusted.
+          - name: SSL_CERT_DIR
+            value: /etc/ai-gateway/ca
+          {{ end }}
+          {{ if .Values.aiGateway.jwksRefreshInterval }}
+          - name: AI_GATEWAY_JWKS_REFRESH_INTERVAL
+            value: {{ .Values.aiGateway.jwksRefreshInterval | quote }}
+          {{ end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
         {{ end }}

@@ -604,10 +604,12 @@ func (rest *RestOperations) deleteSniVs(vsKey avicache.NamespaceName, vs_cache_o
 			rest_ops = append(rest_ops, rest_op)
 		}
 		rest_ops = rest.DSDelete(vs_cache_obj.DSKeyCollection, namespace, rest_ops, key)
-		rest_ops = rest.SSLKeyCertDelete(vs_cache_obj.SSLKeyCertCollection, namespace, rest_ops, key)
 		rest_ops = rest.HTTPPolicyDelete(vs_cache_obj.HTTPKeyCollection, namespace, rest_ops, key)
 		rest_ops = rest.PoolGroupDelete(vs_cache_obj.PGKeyCollection, namespace, rest_ops, key)
 		rest_ops = rest.PoolDelete(vs_cache_obj.PoolKeyCollection, namespace, rest_ops, nil, key)
+		// After the pools: a pool may reference a certificate (an AI Gateway tier
+		// client certificate), which the Controller will not delete while referred.
+		rest_ops = rest.SSLKeyCertDelete(vs_cache_obj.SSLKeyCertCollection, namespace, rest_ops, key)
 		rest_ops = rest.StringGroupDelete(vs_cache_obj.StringGroupKeyCollection, namespace, rest_ops, key)
 		success, _ := rest.ExecuteRestAndPopulateCache(rest_ops, vsKey, avimodel, key, false)
 		return success
@@ -1695,12 +1697,14 @@ func (rest *RestOperations) DatascriptCU(ds_nodes []*nodes.AviHTTPDataScriptNode
 					}
 				}
 			} else {
-				// If the DS Is not found - let's do a POST call.
-				for _, ds := range ds_nodes {
-					restOp := rest.AviDSBuild(ds, nil, key)
-					if restOp != nil {
-						rest_ops = append(rest_ops, restOp)
-					}
+				// This DS is not attached to the VS in the cache: build THIS one only.
+				// (It used to re-build every DS of the VS here, inside the per-DS loop, so a VS
+				// with a new DS sent duplicate ops in one macro — a second POST of the same new
+				// DS fails with 409 "already exists" and aborts the whole macro.) AviDSBuild
+				// turns this into a PUT when the DS already exists on the Controller.
+				restOp := rest.AviDSBuild(ds, nil, key)
+				if restOp != nil {
+					rest_ops = append(rest_ops, restOp)
 				}
 			}
 		}

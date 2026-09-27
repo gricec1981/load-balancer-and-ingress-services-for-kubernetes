@@ -227,14 +227,19 @@ func (rest *RestOperations) AviPkiProfileBuild(pki_node *nodes.AviPkiProfileNode
 	cr := lib.AKOUser
 	crlcheck := false
 
+	// A canonical multi-certificate bundle (root + intermediates) becomes one
+	// trusted CA per certificate; anything else stays the single entry it was.
+	for _, c := range lib.SplitPKICABundle(caCert) {
+		cert := c
+		caCerts = append(caCerts, &avimodels.SSLCertificate{Certificate: &cert})
+	}
+
 	pkiobject := avimodels.PKIprofile{
 		Name:      &name,
 		CreatedBy: &cr,
 		TenantRef: &tenant,
 		CrlCheck:  &crlcheck,
-		CaCerts: append(caCerts, &avimodels.SSLCertificate{
-			Certificate: &caCert,
-		}),
+		CaCerts:   caCerts,
 	}
 
 	pkiobject.Markers = lib.GetAllMarkers(pki_node.AviMarkers)
@@ -322,10 +327,10 @@ func (rest *RestOperations) AviPkiProfileAdd(rest_op *utils.RestOp, poolKey avic
 		var pkiMarkers []*avimodels.RoleFilterMatchLabel
 		switch rest_op.Obj.(type) {
 		case utils.AviRestObjMacro:
-			pkiCertificate = *rest_op.Obj.(utils.AviRestObjMacro).Data.(avimodels.PKIprofile).CaCerts[0].Certificate
+			pkiCertificate = lib.PKICACertsChecksumInput(rest_op.Obj.(utils.AviRestObjMacro).Data.(avimodels.PKIprofile).CaCerts)
 			pkiMarkers = rest_op.Obj.(utils.AviRestObjMacro).Data.(avimodels.PKIprofile).Markers
 		case avimodels.PKIprofile:
-			pkiCertificate = *rest_op.Obj.(avimodels.PKIprofile).CaCerts[0].Certificate
+			pkiCertificate = lib.PKICACertsChecksumInput(rest_op.Obj.(avimodels.PKIprofile).CaCerts)
 			pkiMarkers = rest_op.Obj.(avimodels.PKIprofile).Markers
 		}
 		emptyIngestionMarkers := utils.AviObjectMarkers{}

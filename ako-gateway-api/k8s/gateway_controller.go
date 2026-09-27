@@ -15,6 +15,7 @@
 package k8s
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"sync"
@@ -22,11 +23,14 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 	gatewayclientset "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
 	gatewayexternalversions "sigs.k8s.io/gateway-api/pkg/client/informers/externalversions"
 
@@ -46,6 +50,7 @@ import (
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gatewayclasses;gatewayclasses/status,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways;gateways/status,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes;httproutes/status,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=referencegrants,verbs=get;list;watch
 // +kubebuilder:rbac:groups=ako.vmware.com,resources=applicationprofiles;applicationprofiles/status,verbs=get;list;watch
 // +kubebuilder:rbac:groups=ako.vmware.com,resources=healthmonitors;healthmonitors/status,verbs=get;list;watch
 // +kubebuilder:rbac:groups=ako.vmware.com,resources=routebackendextensions;routebackendextensions/status,verbs=get;list;watch
@@ -76,11 +81,82 @@ func SharedGatewayController() *GatewayController {
 
 func (c *GatewayController) InitGatewayAPIInformers(cs gatewayclientset.Interface) {
 	gatewayFactory := gatewayexternalversions.NewSharedInformerFactory(cs, time.Second*30)
-	akogatewayapilib.AKOControlConfig().SetGatewayApiInformers(&akogatewayapilib.GatewayAPIInformers{
+	gwInformers := &akogatewayapilib.GatewayAPIInformers{
 		GatewayInformer:      gatewayFactory.Gateway().V1().Gateways(),
 		GatewayClassInformer: gatewayFactory.Gateway().V1().GatewayClasses(),
 		HTTPRouteInformer:    gatewayFactory.Gateway().V1().HTTPRoutes(),
-	})
+	}
+	// ReferenceGrants gate cross-namespace AIModelRoutePolicy Service backends and
+	// backendTLS Secrets. Watched only when the AI gateway is on, the cluster
+	// serves the resource and AKO may list it: an informer on a missing CRD, or
+	// one its ClusterRole forbids, would never sync and would hold up Start —
+	// and with it every route, not just the cross-namespace tiers.
+	if lib.IsAIGatewayEnabled() {
+		if ok, reason := referenceGrantWatchable(cs); ok {
+			gwInformers.ReferenceGrantInformer = gatewayFactory.Gateway().V1beta1().ReferenceGrants()
+		} else {
+			utils.AviLog.Warnf("gateway.networking.k8s.io/v1beta1 referencegrants %s; cross-namespace AIModelRoutePolicy backends and backendTLS Secrets will be refused", reason)
+		}
+	}
+	akogatewayapilib.AKOControlConfig().SetGatewayApiInformers(gwInformers)
+}
+
+// referenceGrantWatchable reports whether AKO can run a ReferenceGrant informer:
+// the API server serves gateway.networking.k8s.io/v1beta1 referencegrants
+// (discovery) and AKO's service account may list them (a one-item probe). When
+// it cannot, reason says why. A Forbidden / Unauthorized / NotFound probe means
+// the informer would never sync; any other probe error is treated as transient
+// and the informer is kept, since the reflector retries it like every other.
+func referenceGrantWatchable(cs gatewayclientset.Interface) (bool, string) {
+	if cs == nil || cs.Discovery() == nil {
+		return false, "not served (no clientset)"
+	}
+	list, err := cs.Discovery().ServerResourcesForGroupVersion(gatewayv1beta1.GroupVersion.String())
+	if err != nil || list == nil {
+		return false, "not served"
+	}
+	served := false
+	for _, r := range list.APIResources {
+		if r.Name == "referencegrants" {
+			served = true
+			break
+		}
+	}
+	if !served {
+		return false, "not served"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err = cs.GatewayV1beta1().ReferenceGrants(metav1.NamespaceAll).List(ctx, metav1.ListOptions{Limit: 1})
+	switch {
+	case err == nil:
+		return true, ""
+	case apierrors.IsForbidden(err), apierrors.IsUnauthorized(err):
+		return false, fmt.Sprintf("not readable by AKO (grant get/list/watch on referencegrants in the AKO ClusterRole): %v", err)
+	case apierrors.IsNotFound(err):
+		return false, fmt.Sprintf("not served: %v", err)
+	default:
+		utils.AviLog.Warnf("gateway.networking.k8s.io/v1beta1 referencegrants list probe failed, watching anyway: %v", err)
+		return true, ""
+	}
+}
+
+// referenceGrantChanged reports whether a ReferenceGrant update event carries a
+// real change. The Gateway API informer factory resyncs every 30 s, re-delivering
+// every grant as an update with the same ResourceVersion; re-translating the
+// routes behind it each time would re-run the whole route build (JWKS fetch,
+// auth-profile and FQDN-pool PUTs) for nothing. Only the spec decides which
+// references a grant admits, so metadata-only changes are ignored too.
+func referenceGrantChanged(old, cur interface{}) bool {
+	o, ok1 := old.(*gatewayv1beta1.ReferenceGrant)
+	c, ok2 := cur.(*gatewayv1beta1.ReferenceGrant)
+	if !ok1 || !ok2 {
+		return true
+	}
+	if o.ResourceVersion == c.ResourceVersion {
+		return false
+	}
+	return !reflect.DeepEqual(o.Spec, c.Spec)
 }
 
 func NewInfraSettingCRDInformer() {
@@ -116,6 +192,10 @@ func (c *GatewayController) Start(stopCh <-chan struct{}) {
 	informersList = append(informersList, akogatewayapilib.AKOControlConfig().GatewayApiInformers().GatewayInformer.Informer().HasSynced)
 	go akogatewayapilib.AKOControlConfig().GatewayApiInformers().HTTPRouteInformer.Informer().Run(stopCh)
 	informersList = append(informersList, akogatewayapilib.AKOControlConfig().GatewayApiInformers().HTTPRouteInformer.Informer().HasSynced)
+	if rgInformer := akogatewayapilib.AKOControlConfig().GatewayApiInformers().ReferenceGrantInformer; rgInformer != nil {
+		go rgInformer.Informer().Run(stopCh)
+		informersList = append(informersList, rgInformer.Informer().HasSynced)
+	}
 
 	if akogatewayapilib.AKOControlConfig().AviInfraSettingEnabled() {
 		go akogatewayapilib.AKOControlConfig().AviInfraSettingInformer().Informer().Run(stopCh)
@@ -152,9 +232,16 @@ func (c *GatewayController) Start(stopCh <-chan struct{}) {
 
 	// Start AI gateway policy informers when the AI gateway feature is enabled.
 	if lib.IsAIGatewayEnabled() {
+		// Register the store-populating handlers first, and wait below on the
+		// registrations as well as the informers: an informer's HasSynced
+		// does not mean its handler has seen the initial list.
+		c.setupAIPolicyEventHandlers()
 		if c.dynamicInformers.AIGatewayAuthPolicyInformer != nil {
 			go c.dynamicInformers.AIGatewayAuthPolicyInformer.Informer().Run(stopCh)
 			informersList = append(informersList, c.dynamicInformers.AIGatewayAuthPolicyInformer.Informer().HasSynced)
+			// Refetch JWT-mode keysets on a schedule (one loop per process,
+			// stopped with the informers); the informers never resync.
+			aigateway.StartJWKSRefresh(stopCh)
 		}
 		if c.dynamicInformers.AITokenRateLimitPolicyInformer != nil {
 			go c.dynamicInformers.AITokenRateLimitPolicyInformer.Informer().Run(stopCh)
@@ -176,6 +263,7 @@ func (c *GatewayController) Start(stopCh <-chan struct{}) {
 			go c.dynamicInformers.AIA2ARoutePolicyInformer.Informer().Run(stopCh)
 			informersList = append(informersList, c.dynamicInformers.AIA2ARoutePolicyInformer.Informer().HasSynced)
 		}
+		informersList = append(informersList, aigateway.PolicyHandlersSynced()...)
 	}
 
 	if !cache.WaitForCacheSync(stopCh, informersList...) {
@@ -529,6 +617,9 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 			}
 			bkt := utils.Bkt(namespace, numWorkers)
 			ValidateGatewayListenerWithSecret(key, namespace, name, false)
+			// AIModelRoutePolicy backendTLS Secrets (CA bundle, client cert): a rotation
+			// re-translates the routes whose tier pools present or trust them.
+			aigateway.HandleBackendTLSSecretEvent(namespace, name, c.workqueue, numWorkers)
 			c.workqueue[bkt].AddRateLimited(key)
 			utils.AviLog.Debugf("key: %s, msg: ADD", key)
 		},
@@ -558,6 +649,9 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 				}
 				bkt := utils.Bkt(namespace, numWorkers)
 				ValidateGatewayListenerWithSecret(key, namespace, name, true)
+				// AIModelRoutePolicy backendTLS Secrets (CA bundle, client cert): a rotation
+				// re-translates the routes whose tier pools present or trust them.
+				aigateway.HandleBackendTLSSecretEvent(namespace, name, c.workqueue, numWorkers)
 				c.workqueue[bkt].AddRateLimited(key)
 				utils.AviLog.Debugf("key: %s, msg: DELETE", key)
 			}
@@ -579,6 +673,9 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 					}
 					bkt := utils.Bkt(namespace, numWorkers)
 					ValidateGatewayListenerWithSecret(key, namespace, name, false)
+					// AIModelRoutePolicy backendTLS Secrets (CA bundle, client cert): a rotation
+					// re-translates the routes whose tier pools present or trust them.
+					aigateway.HandleBackendTLSSecretEvent(namespace, name, c.workqueue, numWorkers)
 					c.workqueue[bkt].AddRateLimited(key)
 					utils.AviLog.Debugf("key: %s, msg: UPDATE", key)
 				}
@@ -587,6 +684,34 @@ func (c *GatewayController) SetupEventHandlers(k8sinfo k8s.K8sinformers) {
 	}
 	if c.informers.SecretInformer != nil {
 		c.informers.SecretInformer.Informer().AddEventHandler(secretEventHandler)
+	}
+
+	// ReferenceGrants: a grant appearing, changing or going away in a namespace
+	// changes which cross-namespace AIModelRoutePolicy tiers are honoured, so the
+	// routes of policies reaching into that namespace are re-translated.
+	if rgInformer := akogatewayapilib.AKOControlConfig().GatewayApiInformers().ReferenceGrantInformer; rgInformer != nil {
+		rgHandler := func(obj interface{}) {
+			if c.DisableSync {
+				return
+			}
+			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+				obj = tombstone.Obj
+			}
+			grant, ok := obj.(*gatewayv1beta1.ReferenceGrant)
+			if !ok {
+				return
+			}
+			aigateway.HandleReferenceGrantEvent(grant.Namespace, c.workqueue, numWorkers)
+		}
+		rgInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc:    rgHandler,
+			UpdateFunc: func(old, cur interface{}) {
+				if referenceGrantChanged(old, cur) {
+					rgHandler(cur)
+				}
+			},
+			DeleteFunc: rgHandler,
+		})
 	}
 	c.SetupCRDEventHandlers(numWorkers)
 

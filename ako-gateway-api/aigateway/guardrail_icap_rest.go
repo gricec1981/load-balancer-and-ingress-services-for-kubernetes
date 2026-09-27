@@ -106,19 +106,9 @@ func resolveClassifierServers(policyNs string, ref GuardrailBackendRef) (ips []s
 
 // ─── ICAP Pool + PoolGroup ───────────────────────────────────────────────────
 
-// ensureICAPPoolGroup creates/updates the Avi Pool (classifier endpoints) and a
-// PoolGroup wrapping it (icapprofile requires a pool_group_ref, not a pool_ref).
-func ensureICAPPoolGroup(key string, policy *AIGuardrailPolicy, tenant string) (string, error) {
-	sem := policy.Spec.Semantic
-	ips, port, err := resolveClassifierServers(policy.Namespace, sem.Classifier.BackendRef)
-	if err != nil {
-		return "", err
-	}
-	client := avicache.SharedAVIClients(tenant).AviClient[0]
-	cloudRef := "/api/cloud/?name=" + utils.CloudName
-	tenantRef := "/api/tenant/?name=" + lib.GetEscapedValue(tenant)
-
-	poolName := icapPoolName(policy)
+// icapPoolBody builds the classifier pool payload. Split out from
+// ensureICAPPoolGroup so its shape can be asserted without an Avi Controller.
+func icapPoolBody(poolName, tenantRef, cloudRef string, ips []string, port int32, tier1LR string) avimodels.Pool {
 	servers := make([]*avimodels.Server, 0, len(ips))
 	for i := range ips {
 		servers = append(servers, &avimodels.Server{
@@ -133,6 +123,31 @@ func ensureICAPPoolGroup(key string, policy *AIGuardrailPolicy, tenant string) (
 		DefaultServerPort: proto.Int32(port),
 		Servers:           servers,
 	}
+	// NSX-T / VPC clouds require the Tier-1 (VPC) path on every pool; without it the
+	// Controller rejects the create with "Tier 1 cannot be derived from vrf". It is
+	// the Tier-1 of the VS the pool serves (see tier1.go).
+	if tier1LR != "" {
+		pool.Tier1Lr = proto.String(tier1LR)
+	}
+	return pool
+}
+
+// ensureICAPPoolGroup creates/updates the Avi Pool (classifier endpoints) and a
+// PoolGroup wrapping it (icapprofile requires a pool_group_ref, not a pool_ref).
+// tier1LR is the Tier-1 (VPC) path of the VS the policy is applied to.
+func ensureICAPPoolGroup(key string, policy *AIGuardrailPolicy, tenant, tier1LR string) (string, error) {
+	sem := policy.Spec.Semantic
+	ips, port, err := resolveClassifierServers(policy.Namespace, sem.Classifier.BackendRef)
+	if err != nil {
+		return "", err
+	}
+	client := avicache.SharedAVIClients(tenant).AviClient[0]
+	cloudRef := "/api/cloud/?name=" + utils.CloudName
+	tenantRef := "/api/tenant/?name=" + lib.GetEscapedValue(tenant)
+
+	poolName := icapPoolName(policy)
+	pool := icapPoolBody(poolName, tenantRef, cloudRef, ips, port, tier1LR)
+	noteSharedPoolTier1(key, tenant, poolName, tier1LR)
 	if err := postOrPut(client, "/api/pool", poolName, pool); err != nil {
 		return "", err
 	}
@@ -240,8 +255,9 @@ type GuardrailIcapRefs struct {
 // EnsureGuardrailIcap authors the full ICAP object graph (Pool → PoolGroup →
 // icapprofile, plus the REQUEST_CHECK_ICAP HTTPPolicySet) for a semantic policy
 // and returns the two refs the VS needs. Both are mandatory: the profile without
-// the security rule is a no-op (Spike-1).
-func EnsureGuardrailIcap(key string, policy *AIGuardrailPolicy) (*GuardrailIcapRefs, error) {
+// the security rule is a no-op (Spike-1). tier1LR is the Tier-1 (VPC) path of
+// the VS the policy is applied to (VSTier1LR), for the classifier pool.
+func EnsureGuardrailIcap(key string, policy *AIGuardrailPolicy, tier1LR string) (*GuardrailIcapRefs, error) {
 	if !policy.Spec.SemanticEnabled() {
 		return nil, nil
 	}
@@ -250,7 +266,7 @@ func EnsureGuardrailIcap(key string, policy *AIGuardrailPolicy) (*GuardrailIcapR
 	}
 	tenant := lib.GetTenantInNamespace(policy.Namespace)
 
-	pgName, err := ensureICAPPoolGroup(key, policy, tenant)
+	pgName, err := ensureICAPPoolGroup(key, policy, tenant, tier1LR)
 	if err != nil {
 		return nil, err
 	}
@@ -294,6 +310,7 @@ func DeleteGuardrailIcap(key string, policy *AIGuardrailPolicy) {
 	delByName("/api/icapprofile", icapProfileName(policy))
 	delByName("/api/poolgroup", icapPoolGroupName(policy))
 	delByName("/api/pool", icapPoolName(policy))
+	forgetSharedPoolTier1(icapPoolName(policy))
 }
 
 // ─── helper ──────────────────────────────────────────────────────────────────

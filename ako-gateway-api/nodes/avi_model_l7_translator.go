@@ -183,6 +183,12 @@ func (o *AviObjectGraph) BuildChildVS(key string, routeModel RouteModel, parentN
 	// Apply Extension Ref
 	o.ApplyRuleExtensionRefs(key, childNode, routeModel, rule)
 
+	// A Gateway API child VS carries CACertRefs only for AIModelRoutePolicy tier
+	// client certificates (backendTLS), rebuilt below with the pools that use them.
+	// Reset them like the pools (BuildPGPool), so a tier that lost its backendTLS
+	// — or the policy — drops its certificates and the REST layer deletes them.
+	childNode.CACertRefs = nil
+
 	// Apply AI Gateway policies (auth + token rate limiting) when the feature is enabled.
 	if lib.IsAIGatewayEnabled() {
 		routeNsName := routeModel.GetNamespace() + "/" + routeModel.GetName()
@@ -558,14 +564,10 @@ func (o *AviObjectGraph) BuildPGPool(key, parentNsName string, childVsNode *node
 			poolNode.UpdatePoolNodeForIstio()
 		}
 
-		t1LR := lib.GetT1LRPath()
-		if found, infraSettingName := akogatewayapiobjects.GatewayApiLister().GetGatewayToAviInfraSetting(parentNsName); found {
-			if infraSetting, err := akogatewayapilib.AKOControlConfig().AviInfraSettingInformer().Lister().Get(infraSettingName); err != nil {
-				utils.AviLog.Warnf("key: %s, msg: failed to retrieve AviInfraSetting %s, err: %s", key, infraSettingName, err.Error())
-			} else if infraSetting != nil && infraSetting.Status.Status == lib.StatusAccepted && infraSetting.Spec.NSXSettings.T1LR != nil {
-				t1LR = *infraSetting.Spec.NSXSettings.T1LR
-			}
-		}
+		// The AKO-wide T1LR, overridden by an accepted AviInfraSetting bound to the
+		// Gateway. Shared with the AI Gateway's REST-authored pools, which must land
+		// on the same Tier-1 as this child VS.
+		t1LR := aigateway.GatewayTier1LR(key, parentNsName)
 
 		if t1LR != "" {
 			poolNode.T1Lr = t1LR
@@ -574,7 +576,16 @@ func (o *AviObjectGraph) BuildPGPool(key, parentNsName string, childVsNode *node
 		}
 		poolNode.NetworkPlacementSettings = lib.GetNodeNetworkMap()
 		serviceType := lib.GetServiceType()
-		if serviceType == lib.NodePortLocal {
+		if serviceType == lib.NodePortLocal && len(svcObj.Spec.Selector) == 0 {
+			// A selectorless Service describes an off-cluster backend through a hand-written
+			// EndpointSlice (e.g. the DGX Spark model tier). NodePortLocal has no pods to map for
+			// it, so the pool would come out empty; use the endpoints as-is, like ClusterIP mode.
+			utils.AviLog.Infof("key: %s, msg: service %s/%s has no selector; populating servers from its endpoints instead of NodePortLocal", key, svcObj.ObjectMeta.Namespace, svcObj.ObjectMeta.Name)
+			servers := nodes.PopulateServers(poolNode, svcObj.ObjectMeta.Namespace, svcObj.ObjectMeta.Name, false, key)
+			if servers != nil {
+				poolNode.Servers = servers
+			}
+		} else if serviceType == lib.NodePortLocal {
 			servers := nodes.PopulateServersForNPL(poolNode, svcObj.ObjectMeta.Namespace, svcObj.ObjectMeta.Name, false, key)
 			if servers != nil {
 				poolNode.Servers = servers
@@ -991,14 +1002,7 @@ func (o *AviObjectGraph) buildInferencePoolMembers(
 		}
 	}
 
-	t1LR := lib.GetT1LRPath()
-	if found, infraSettingName := akogatewayapiobjects.GatewayApiLister().GetGatewayToAviInfraSetting(parentNsName); found {
-		if infraSetting, err := akogatewayapilib.AKOControlConfig().AviInfraSettingInformer().Lister().Get(infraSettingName); err != nil {
-			utils.AviLog.Warnf("key: %s, msg: failed to retrieve AviInfraSetting %s, err: %s", key, infraSettingName, err.Error())
-		} else if infraSetting != nil && infraSetting.Status.Status == lib.StatusAccepted && infraSetting.Spec.NSXSettings.T1LR != nil {
-			t1LR = *infraSetting.Spec.NSXSettings.T1LR
-		}
-	}
+	t1LR := aigateway.GatewayTier1LR(key, parentNsName)
 
 	for _, wp := range weightedPods {
 		// Pool name encodes the pod IP so each pod gets its own Avi Pool.
