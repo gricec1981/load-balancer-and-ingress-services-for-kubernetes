@@ -27,8 +27,12 @@
 > (HTTP 500) on AKO's EVH-child-VS + PoolGroup topology** — verified live: a `tools/call`
 > carrying an `Mcp-Session-Id` 500s, the same call without one succeeds. AKO therefore
 > authors its own `pcall`-guarded equivalent (`GenerateMCPSessionScripts`) and does **not**
-> reference the system script. The application profile (`System-Secure-HTTP-MCP`) is still
-> Avi's. Read §2 and §6 with that correction in mind.
+> reference the system script. **Nor does it use the MCP application profile
+> (`System-Secure-HTTP-MCP`)**: on Avi 32.1.3 that profile makes the controller attach
+> `System-Standard-MCP` to the VS by itself, which brought the same 500 back on every request
+> carrying an `Mcp-Session-Id` (seen live on VCF, 2026-09-27). MCP routes stay on the ordinary
+> HTTP profile; streamable HTTP needs none of the profile's websocket/HTTP-2 features. Read §2
+> and §6 with that correction in mind.
 >
 > **On the live estate**, the four MCP servers (`web-search`, `k8s-logs`, `nmap-mcp`,
 > `rag`) sit behind a dedicated `mcp-gateway` with its own VIP, authenticated by an
@@ -112,10 +116,10 @@ the two scale, secure, and fail independently (the same separation rationale as 
 cross-site forwarder SE in [ai-gateway-multisite.md](ai-gateway-multisite.md) §4).
 
 A Gateway (or a specific listener) is **designated as MCP** with an annotation. AKO then
-configures the resulting VS with Avi's **built-in** MCP application profile (verified §2):
-it sets the VS `application_profile_ref` to **`System-Secure-HTTP-MCP`**, and adds its own
-`Mcp-Session-Id` session-persistence DataScripts, which mirror `System-Standard-MCP`'s
-tables and lifecycle but survive AKO's EVH-child topology (see the status block):
+adds its own `Mcp-Session-Id` session-persistence DataScripts to the resulting VS, which
+mirror `System-Standard-MCP`'s tables and lifecycle but survive AKO's EVH-child topology.
+The VS stays on the ordinary HTTP application profile, not `System-Secure-HTTP-MCP`, because
+on Avi 32.1.3 that profile pulls in the failing system script (see the status block):
 
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1
@@ -569,13 +573,14 @@ Mirrors how `AIModelRoutePolicy` was wired (commits `c05fc5bc` → `a2e7b995` �
    [`controller.go`](../../ako-gateway-api/aigateway/controller.go).
 5. **Translator — ✅ done, with one deviation.**
    [`ApplyMCPRoutePolicy`](../../ako-gateway-api/nodes/avi_mcp_route.go) is invoked from the
-   same per-child-VS hook as `ApplyAuthPolicy` / `ApplyModelRoutePolicy`. It sets the VS
-   `application_profile_ref` = `System-Secure-HTTP-MCP`, resolves `authRef` and applies that
-   `AIGatewayAuthPolicy`'s OAuth graph, and attaches the tool-authz DataScript set (only when
-   `toolAccess` is set). **Deviation:** it does *not* reference the `System-Standard-MCP`
-   DataScriptSet. That script's `avi.pool.select(name, ip)` raises on an EVH child VS behind a
-   PoolGroup — a `tools/call` with an `Mcp-Session-Id` returns 500 — so AKO attaches its own
-   `pcall`-guarded `GenerateMCPSessionScripts` instead.
+   same per-child-VS hook as `ApplyAuthPolicy` / `ApplyModelRoutePolicy`. It resolves
+   `authRef` and applies that `AIGatewayAuthPolicy`'s OAuth graph, and attaches the tool-authz
+   DataScript set (only when `toolAccess` is set). **Deviation:** it does *not* reference the
+   `System-Standard-MCP` DataScriptSet. That script's `avi.pool.select(name, ip)` raises on an
+   EVH child VS behind a PoolGroup — a `tools/call` with an `Mcp-Session-Id` returns 500 — so
+   AKO attaches its own `pcall`-guarded `GenerateMCPSessionScripts` instead. For the same
+   reason it leaves the VS on the ordinary HTTP profile: on Avi 32.1.3,
+   `System-Secure-HTTP-MCP` makes the controller attach `System-Standard-MCP` itself.
 6. **Gateway annotation — ⬜ not built.** `ai.ako.vmware.com/mcp: "true"` is not read
    anywhere. The MCP application profile is applied **per route by the policy**, which is
    sufficient for every route deployed so far; a Gateway-wide switch would only matter for a

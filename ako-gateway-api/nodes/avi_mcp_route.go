@@ -23,20 +23,23 @@ import (
 )
 
 // ApplyMCPRoutePolicy translates an AIMCPRoutePolicy onto the given MCP child EVH
-// VS. Per the verified Avi 32.1.1 object model (docs/gateway-api/ai-gateway-mcp.md
-// §2), it reuses Avi's built-in MCP objects rather than generating session logic:
+// VS (docs/gateway-api/ai-gateway-mcp.md §2):
 //
-//   - sets the VS application profile to System-Secure-HTTP-MCP
-//     (APPLICATION_PROFILE_TYPE_HTTP, app_service_type APP_SERVICE_TYPE_HTTP_MCP);
-//   - references the system DataScriptSet System-Standard-MCP for Mcp-Session-Id
-//     session persistence (create-on-response, delete-on-DELETE);
+//   - attaches AKO's own pcall-guarded Mcp-Session-Id session-affinity DataScripts
+//     (HTTP_REQ re-pin, HTTP_RESP capture/forget);
 //   - shares the LLM gateway's identity provider by resolving spec.authRef to an
 //     AIGatewayAuthPolicy and applying its OAuth graph to this VS;
 //   - attaches the AKO-generated per-role tool-authorization DataScript
 //     (HTTP_REQ buffer-enable + HTTP_REQ_DATA gate on the JSON-RPC tool).
 //
-// The tool-authz script runs in HTTP_REQ_DATA, a different event from the system
-// session DataScript (HTTP_REQ/HTTP_RESP), so the two coexist on the same VS.
+// It deliberately leaves the VS on the ordinary HTTP application profile rather than
+// Avi's System-Secure-HTTP-MCP. On Avi 32.1.3 the controller attaches the system
+// System-Standard-MCP DataScriptSet to any VS on an MCP-service-type profile, and that
+// script's unguarded avi.pool.select raises on AKO's EVH-child + PoolGroup topology —
+// verified live on mcp-01: every request carrying an Mcp-Session-Id 500s with
+// "System-Standard-MCP:13: server [...] not found in pool". AKO's session scripts
+// already do its job, and the profile's other features (websockets, HTTP/2) are not
+// used by MCP's streamable-HTTP transport.
 func ApplyMCPRoutePolicy(key string, policy *akogatewayapiaigateway.AIMCPRoutePolicy, childVsNode *nodes.AviEvhVsNode, authHost, routePrefix string, mode akogatewayapiaigateway.AuthClaimMode) {
 	if policy == nil {
 		return
@@ -53,21 +56,19 @@ func ApplyMCPRoutePolicy(key string, policy *akogatewayapiaigateway.AIMCPRoutePo
 		return
 	}
 
-	// 1. MCP application profile (native, Avi 32.1.1).
-	childVsNode.ApplicationProfile = akogatewayapiaigateway.MCPApplicationProfile
-
-	// 2. MCP session affinity. The system System-Standard-MCP DataScript pins a
+	// 1. MCP session affinity. The system System-Standard-MCP DataScript pins a
 	// session to its backend via avi.pool.select(name, ip), which RAISES (HTTP 500)
 	// on AKO's EVH-child-VS + PoolGroup topology — verified live (a tools/call with
 	// an Mcp-Session-Id 500s; the same call without it succeeds). Author our own
-	// pcall-guarded equivalent instead of referencing the system script.
+	// pcall-guarded equivalent instead, and keep the VS off the MCP application
+	// profile so the controller does not attach the system script for us (above).
 	sess := akogatewayapiaigateway.GenerateMCPSessionScripts()
 	attachModelRouteDS(childVsNode, akogatewayapiaigateway.DSMCPSessReqName(childVsNode.Name),
 		akogatewayapiaigateway.DSEvtHTTPReq, sess.ReqScript, nil)
 	attachModelRouteDS(childVsNode, akogatewayapiaigateway.DSMCPSessRespName(childVsNode.Name),
 		akogatewayapiaigateway.DSEvtHTTPResp, sess.RespScript, nil)
 
-	// 3. Share the LLM IdP: resolve authRef and apply its OAuth graph to this VS.
+	// 2. Share the LLM IdP: resolve authRef and apply its OAuth graph to this VS.
 	if policy.Spec.AuthRef != nil && policy.Spec.AuthRef.Name != "" {
 		authPolicy := akogatewayapiaigateway.SharedPolicyStore().GetAuthPolicyByNsName(policy.Namespace, policy.Spec.AuthRef.Name)
 		if authPolicy != nil {
@@ -82,7 +83,7 @@ func ApplyMCPRoutePolicy(key string, policy *akogatewayapiaigateway.AIMCPRoutePo
 		}
 	}
 
-	// 4. Per-role tool authorization DataScript (only when toolAccess is set).
+	// 3. Per-role tool authorization DataScript (only when toolAccess is set).
 	scripts := akogatewayapiaigateway.GenerateMCPToolAuthScripts(policy, mode)
 	if scripts.ReqDataScript != "" {
 		vsName := childVsNode.Name
@@ -92,7 +93,6 @@ func ApplyMCPRoutePolicy(key string, policy *akogatewayapiaigateway.AIMCPRoutePo
 			akogatewayapiaigateway.DSEvtHTTPReqData, scripts.ReqDataScript, nil)
 	}
 
-	utils.AviLog.Infof("key: %s, msg: AIMCPRoutePolicy %s/%s: attached MCP gateway config on VS %s (app profile %s, session DS %s, tool-authz=%v)",
-		key, policy.Namespace, policy.Name, childVsNode.Name,
-		akogatewayapiaigateway.MCPApplicationProfile, akogatewayapiaigateway.MCPSessionDataScript, scripts.ReqDataScript != "")
+	utils.AviLog.Infof("key: %s, msg: AIMCPRoutePolicy %s/%s: attached MCP gateway config on VS %s (AKO session DataScripts, tool-authz=%v)",
+		key, policy.Namespace, policy.Name, childVsNode.Name, scripts.ReqDataScript != "")
 }

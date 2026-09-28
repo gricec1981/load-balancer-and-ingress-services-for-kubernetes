@@ -31,9 +31,11 @@ var AIMCPRoutePolicyGVR = schema.GroupVersionResource{
 	Resource: "aimcproutepolicies",
 }
 
-// Built-in Avi 32.1.1 MCP objects the translator reuses (verified live — see
-// docs/gateway-api/ai-gateway-mcp.md §2). AKO references these system objects on
-// the MCP VS rather than generating its own session logic.
+// Built-in Avi 32.1.x MCP objects (docs/gateway-api/ai-gateway-mcp.md §2). AKO uses
+// NEITHER on the MCP VS: the system session script raises on AKO's EVH + PoolGroup
+// topology, so AKO authors its own (GenerateMCPSessionScripts), and on 32.1.3 the
+// MCP application profile makes the controller attach that script anyway. Named here
+// so tests and logs can assert their absence.
 const (
 	// MCPApplicationProfile is the system HTTP application profile with
 	// app_service_type APP_SERVICE_TYPE_HTTP_MCP (websockets + HTTP/2).

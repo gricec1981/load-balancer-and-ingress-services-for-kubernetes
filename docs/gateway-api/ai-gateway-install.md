@@ -1146,12 +1146,17 @@ the WAF-vs-`jwtQuery` conflict fixed by commit `591de2438` (`!ARGS:jwt` exclusio
 guardrail's built-in `jwt` secret-signature matches the bearer token riding in the query string.
 Verify your AKO image includes this commit; no CRD or manifest change is needed once it does.
 
-**MCP route policy never attaches / VS not programmed** — the MCP application profile
-(`System-Secure-HTTP-MCP`) is a native **Avi 32.1.1+** object; on an older controller the VS
-build fails. Confirm the controller version. Note that AKO does **not** use Avi's
+**MCP route policy never attaches / VS not programmed** — `AIMCPRoutePolicy` needs Avi
+**32.1.1+**; confirm the controller version. Note that AKO does **not** use Avi's
 `System-Standard-MCP` session DataScript: that script's `avi.pool.select(name, ip)` raises on
 an EVH child VS behind a PoolGroup (a `tools/call` carrying an `Mcp-Session-Id` returns **500**,
 while the same call without one succeeds), so AKO attaches its own `pcall`-guarded equivalent.
+
+**MCP calls with an `Mcp-Session-Id` return 500, without one 200** — the VS is on the
+`System-Secure-HTTP-MCP` application profile, and the controller (32.1.3) has attached
+`System-Standard-MCP` to it; the Avi log shows `System-Standard-MCP:13: server [...] not found
+in pool`. Current AKO keeps MCP routes on the ordinary HTTP profile, which stops the controller
+attaching it. Upgrade AKO; no manifest change is needed.
 If you see 500s only on session-carrying MCP calls, you are running a build that still
 references the system script.
 

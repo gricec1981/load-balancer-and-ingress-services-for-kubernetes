@@ -63,10 +63,43 @@ func TestApplyMCPRoutePolicyInvalidWithAuthRefFailsClosed(t *testing.T) {
 			if !hasAuthGuard(vs) {
 				t.Fatalf("invalid policy with an authRef must fail the VS closed; DataScripts: %d", len(vs.HTTPDSrefs))
 			}
-			if vs.ApplicationProfile != "" {
-				t.Errorf("the rest of an invalid policy must still be skipped (app profile %q)", vs.ApplicationProfile)
+			if len(vs.HTTPDSrefs) != 1 {
+				t.Errorf("the rest of an invalid policy must still be skipped: only the guard may be attached, got %d DataScripts",
+					len(vs.HTTPDSrefs))
 			}
 		})
+	}
+}
+
+// A valid MCP policy attaches AKO's own session scripts and leaves the VS on its
+// ordinary HTTP profile: on Avi 32.1.3 an MCP-service-type profile makes the
+// controller attach System-Standard-MCP, which 500s every Mcp-Session-Id request.
+func TestApplyMCPRoutePolicyKeepsHTTPProfile(t *testing.T) {
+	p := &akogatewayapiaigateway.AIMCPRoutePolicy{}
+	p.Namespace, p.Name = "tools", "mcp"
+	p.Spec.TargetRef.Name = "mcp-route"
+	vs := authRefTestVS()
+	vs.ApplicationProfile = "System-HTTP"
+	ApplyMCPRoutePolicy("key", p, vs, "", "/", akogatewayapiaigateway.ClaimModeJWTHeader)
+	if vs.ApplicationProfile != "System-HTTP" {
+		t.Errorf("app profile changed to %q; an MCP-service-type profile brings the failing system script", vs.ApplicationProfile)
+	}
+	want := map[string]bool{
+		akogatewayapiaigateway.DSMCPSessReqName(vs.Name):  false,
+		akogatewayapiaigateway.DSMCPSessRespName(vs.Name): false,
+	}
+	for _, ds := range vs.HTTPDSrefs {
+		if _, ok := want[ds.Name]; ok {
+			want[ds.Name] = true
+		}
+		if ds.Name == akogatewayapiaigateway.MCPSessionDataScript {
+			t.Errorf("the system %s DataScript must not be referenced", ds.Name)
+		}
+	}
+	for name, found := range want {
+		if !found {
+			t.Errorf("session DataScript %s not attached", name)
+		}
 	}
 }
 
