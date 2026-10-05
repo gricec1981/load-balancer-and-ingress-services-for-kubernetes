@@ -43,6 +43,20 @@ const (
 	// UsageRecPrefix is the per-record key prefix: UsageRecPrefix .. <seq>.
 	UsageRecPrefix = "ai_urec:"
 
+	// UsageReqIDHeader is the RESPONSE header a settling backend stamps to name
+	// the turn it is about to generate. The Service Engine cannot measure a
+	// streamed completion — buffering the response to count it collapses the
+	// stream into one delivery (probed live; see streaming.go) — so a streamed
+	// row is the admission reservation, recorded quality "estimated". Settling
+	// it means someone downstream who DID see the whole stream reporting what it
+	// actually produced, and that join needs a key both ends agree on.
+	//
+	// The backend mints the id rather than the SE, because the SE has no cheap
+	// per-request unique value in the request phase and the backend needs one
+	// anyway to key its own record. It travels back on the response head, which
+	// arrives before the body streams and is readable in HTTP_RESP.
+	UsageReqIDHeader = "X-AI-Req-Id"
+
 	// UsageRingTTLSeconds is how long a record survives on the SE. It only has
 	// to outlive the collector's poll interval by a wide margin — long enough to
 	// ride out a collector restart, short enough that the SE never becomes a
@@ -220,11 +234,13 @@ end`
 // builds this string per response, and _safe has already guaranteed every field
 // is free of the delimiter. The collector splits it.
 //
-//	ts | identity | model | tier | prompt | completion | cached | reasoning | quality | route | chain
+//	ts | identity | model | tier | prompt | completion | cached | reasoning | quality | route | chain | reqid
 //
 // `chain` is the W3C trace id carried in by the request (see buildChainIDBlock);
-// empty when the caller sent none. Appended last so a collector that knows only
-// ten fields still parses the first ten.
+// empty when the caller sent none. `reqid` is the settling backend's id for
+// this turn (UsageReqIDHeader), empty when nothing downstream stamped one.
+// Both are appended rather than inserted, so a collector that knows only the
+// first ten or eleven fields still parses what it knows.
 //
 // Only responses the meter actually saw are recorded (`meter_quality ~= "none"`),
 // so a health check or a non-JSON response costs nothing here. Penalty rows ARE
@@ -252,6 +268,13 @@ do
     seq = seq + 1
     avi.vs.table_remove(%q)
     avi.vs.table_insert(%q, inst .. ":" .. seq, %d)
+    -- The settling backend's id for this turn, if there is one. pcall because
+    -- this block also runs in HTTP_RESP_DATA, and a header read that is not
+    -- available in a phase must cost an empty field, never an error that drops
+    -- the whole record.
+    local _rid = ""
+    do local _ok_rid, _v = pcall(function() return avi.http.get_header(%q) end)
+       if _ok_rid and _v then _rid = _v end end
     local rec = tostring(now)
       .. "|" .. _safe(identity, 96)
       .. "|" .. _safe(model_name, 64)
@@ -263,11 +286,12 @@ do
       .. "|" .. meter_quality
       .. "|" .. %q
       .. "|" .. _safe(avi.http.get_reqvar("ai_chain") or "", 32)
+      .. "|" .. _safe(_rid, 64)
     avi.vs.table_remove(%q .. seq)
     avi.vs.table_insert(%q .. seq, rec, %d)
   end
 end`, buildSafeFieldHelper(), UsageSeqKey, UsageSeqKey, UsageSeqKey, UsageSeqTTLSeconds,
-		safeRouteName(route), UsageRecPrefix, UsageRecPrefix, UsageRingTTLSeconds)
+		UsageReqIDHeader, safeRouteName(route), UsageRecPrefix, UsageRecPrefix, UsageRingTTLSeconds)
 }
 
 // safeRouteName reduces the HTTPRoute name to the same character set _safe
